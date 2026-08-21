@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
+from streamlit_lightweight_charts import renderLightweightCharts
 
 # ==========================================
 # 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
@@ -290,7 +291,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
 
     # --- ACTIVE TRADE LOCK / ANTI-OVERLAP CHECK ---
-    # Check karein ke kya is specific coin ki pehle se koi trade "PENDING" chal rahi hai?
     has_active_trade_for_coin = any(
         t["symbol"] == selected_symbol and t.get("outcome") == "PENDING" 
         for t in st.session_state.trade_history_log
@@ -299,7 +299,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     if paper_trading_mode and direction != "NEUTRAL":
         existing_trade_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
         
-        # Sirf tab naya signal save hoga jab is coin par koi active/pending trade na ho
         if trade_id not in existing_trade_ids and not has_active_trade_for_coin:
             new_trade = {
                 "trade_id": trade_id,
@@ -376,7 +375,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     </div>
     """, unsafe_allow_html=True)
 
-    # Agar is coin par active trade chal rahi hai toh alert show karein
     if has_active_trade_for_coin:
         st.warning(f"🔒 **Position Locked:** {selected_symbol} par pehle se aik active/pending trade chal rahi hai. Jab tak TP ya SL hit nahi hota, naya signal CSV mein save nahi hoga.")
 
@@ -409,30 +407,42 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
     # ==========================================
-    # 9. CHART & MICROSTRUCTURE SECTION
+    # 9. CHART & MICROSTRUCTURE SECTION (TradingView Lightweight Charts)
     # ==========================================
     col_chart, col_risk_panel = st.columns([2.5, 1])
     with col_chart:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
-        time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
-        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
+        st.subheader(f"Price Trajectory & Levels ({selected_symbol}) - TradingView Style")
+        
+        # Format dataframe for streamlit-lightweight-charts
+        chart_df = df.copy()
+        # Lightweight charts expects Unix timestamp or 'YYYY-MM-DD' format for 'time'
+        chart_df['time'] = chart_df['Time'].astype('int64') // 10**9
+        chart_data = chart_df[['time', 'Open', 'High', 'Low', 'Close']].rename(
+            columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}
+        ).to_dict('records')
 
-        if direction == "LONG":
-            forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
-        elif direction == "SHORT":
-            forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
-        else:
-            forecast_prices = [close_p] * forecast_horizon
-
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
-        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
-        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
-        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
-        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
-        fig.update_layout(template="plotly_dark", height=420, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        chartOptions = {
+            "layout": {"background": {"color": "#111622"}, "textColor": "#d1d4dc"},
+            "grid": {"vertLines": {"color": "#1e2638"}, "horzLines": {"color": "#1e2638"}},
+            "crosshair": {"mode": 0},
+            "priceScale": {"borderColor": "#1e2638"},
+            "timeScale": {"borderColor": "#1e2638", "timeVisible": True, "secondsVisible": False},
+        }
+        
+        seriesCandlestickChart = [
+            {
+                "type": 'Candlestick',
+                "data": chart_data,
+                "options": {
+                    "upColor": "#00e676", "downColor": "#ff5252",
+                    "borderVisible": False, "wickUpColor": "#00e676", "wickDownColor": "#ff5252"
+                }
+            }
+        ]
+        
+        renderLightweightCharts([
+            {"chart": chartOptions, "series": seriesCandlestickChart}
+        ], 'candlestick')
 
     with col_risk_panel:
         st.subheader("Market Microstructure & OB")
