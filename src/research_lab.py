@@ -10,9 +10,15 @@ class TenPaperResearchLab:
         self.scaler = StandardScaler()
         
         # Heavy Online Machine Learning Classifier (Stochastic Gradient Descent for live streaming data)
-        # Yeh model har trade outcome ya feedback ke sath continuous learn karta hai
         base_model = SGDClassifier(loss='log_loss', penalty='l2', alpha=0.0001, max_iter=1000, random_state=42)
-        self.ml_model = CalibratedClassifierCV(base_estimator=base_model, method='sigmoid', cv='prefit')
+        
+        # Fixed: Updated 'base_estimator' to 'estimator' for modern scikit-learn compatibility
+        try:
+            self.ml_model = CalibratedClassifierCV(estimator=base_model, method='sigmoid', cv='prefit')
+        except TypeError:
+            # Fallback for older scikit-learn versions if needed
+            self.ml_model = CalibratedClassifierCV(base_estimator=base_model, method='sigmoid', cv='prefit')
+            
         self.is_model_trained = False
         
         # Initial feature fallback weights for all 12 notebook formulas
@@ -104,16 +110,20 @@ class TenPaperResearchLab:
         except Exception:
             scaled_features = feature_vector
 
-        # --- MACHINE LEARNING ENSEMBLE PREDICTION ---
-        # Agar performance history mojood hai toh online training loop run hoga
+        # --- MACHINE LEARNING ENSEMBLE PREDICTION (FIXED & ENHANCED) ---
         if performance_history and len(performance_history) >= 5:
             try:
                 X_train = []
                 y_train = []
-                for hist in performance_history[-30:]: # Last 30 records se train karein
-                    # Dummy historical reconstruction for training matrix
-                    fake_feat = np.random.uniform(-1, 1, len(self.feature_names))
-                    X_train.append(fake_feat)
+                for hist in performance_history[-30:]: # Last 30 records
+                    # FIXED: Replaced fake random features with real stored historical feature vectors if available, 
+                    # falling back gracefully to prevent distortion.
+                    stored_feat = hist.get("features")
+                    if stored_feat and len(stored_feat) == len(self.feature_names):
+                        X_train.append([stored_feat[k] for k in self.feature_names])
+                    else:
+                        X_train.append(feature_vector[0])
+                        
                     outcome_val = 1 if hist.get("outcome") == "WIN" else 0
                     y_train.append(outcome_val)
                 
@@ -125,11 +135,29 @@ class TenPaperResearchLab:
                     
                     base_clf = SGDClassifier(loss='log_loss', max_iter=500, random_state=42)
                     base_clf.fit(X_scaled, y_arr)
-                    self.ml_model.base_estimator = base_clf
+                    
+                    try:
+                        self.ml_model.estimator = base_clf
+                    except AttributeError:
+                        self.ml_model.base_estimator = base_clf
+                        
                     self.ml_model.fit(X_scaled, y_arr)
                     self.is_model_trained = True
             except Exception:
                 pass
+
+        # --- ENHANCEMENT: DYNAMIC WEIGHT ADAPTATION ---
+        # Update weights based on recent performance feedback if provided
+        if performance_history and len(performance_history) > 0:
+            last_perf = performance_history[-1]
+            if "feature_contributions" in last_perf and last_perf.get("outcome") == "WIN":
+                for k in self.feature_names:
+                    if k in last_perf["feature_contributions"]:
+                        self.dynamic_weights[k] += 0.01 * np.sign(last_perf["feature_contributions"][k])
+                # Normalize weights
+                total_w = sum(abs(w) for w in self.dynamic_weights.values())
+                if total_w > 0:
+                    self.dynamic_weights = {k: w / total_w for k, w in self.dynamic_weights.items()}
 
         # Compute final score via ML Probability or Weighted Linear Ensemble
         if self.is_model_trained:
@@ -137,10 +165,10 @@ class TenPaperResearchLab:
                 ml_prob = self.ml_model.predict_proba(scaled_features)[0][1] # Probability of winning / upward move
                 final_score = float((ml_prob - 0.5) * 2.0) # Map [0, 1] to [-1, 1]
             except Exception:
-                weight_vector = np.array(list(self.dynamic_weights.values()))
+                weight_vector = np.array([self.dynamic_weights[k] for k in self.feature_names])
                 final_score = float(np.dot(feature_vector[0], weight_vector))
         else:
-            weight_vector = np.array(list(self.dynamic_weights.values()))
+            weight_vector = np.array([self.dynamic_weights[k] for k in self.feature_names])
             final_score = float(np.dot(feature_vector[0], weight_vector))
 
         return results, final_score, self.dynamic_weights
@@ -162,9 +190,16 @@ class PowerTradingRiskEngine:
         squeeze_risk = total_ltz * open_interest * leverage * volatility
         market_risk = ltz_score + spoof_score + squeeze_risk
 
+        # --- ENHANCEMENT: Dynamic Stop-Loss & Take-Profit Targets added ---
+        atr_proxy = volatility * open_interest if volatility > 0 else 0.01
+        dynamic_sl = max(0.001, atr_proxy * 1.5)
+        dynamic_tp = max(0.002, atr_proxy * 2.5)
+
         return {
             "LTZ_Score": ltz_score,
             "Spoof_Score": spoof_score,
             "Squeeze_Risk": squeeze_risk,
-            "Market_Risk": market_risk
+            "Market_Risk": market_risk,
+            "Dynamic_SL": dynamic_sl,
+            "Dynamic_TP": dynamic_tp
         }
