@@ -53,7 +53,7 @@ if "trade_history_log" not in st.session_state:
     st.session_state.trade_history_log = load_persistent_history()
 
 # ============================================================
-# 2. TRI LINE ENGINE & DATACLASS (COMPLETED)
+# 2. TRI LINE ENGINE & DATACLASS 
 # ============================================================
 @dataclass
 class TRILineLevels:
@@ -81,7 +81,7 @@ class TRILineEngine:
         self.colors = {
             "MONTHLY": "#ff5252",   # Red
             "WEEKLY": "#00e676",    # Green
-            "DAILY": "#ffffff",     # White/Black
+            "DAILY": "#ffffff",     # White
             "4H": "#ffa726",        # Orange
             "1H": "#ab47bc",        # Purple
         }
@@ -218,8 +218,8 @@ st.markdown("""
     section[data-testid="stSidebar"] { background-color: #0d1117 !important; border-right: 1px solid #161b22; }
     .metric-card { background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px; }
     .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
-    .metric-val-green { font-size: 18px; font-weight: 700; color: #00e676; }
-    .metric-val-red { font-size: 18px; font-weight: 700; color: #ff5252; }
+    .metric-val-green { font-size: 18px; font-weight: 700; color: #00C853; }
+    .metric-val-red { font-size: 18px; font-weight: 700; color: #D50000; }
     .metric-val-blue { font-size: 18px; font-weight: 700; color: #38bdf8; }
     .top-status-bar { background: #111622; border: 1px solid #1e2638; border-radius: 10px; padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px; }
 </style>
@@ -230,7 +230,6 @@ st.markdown("""
 # ==========================================
 COINS_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"]
 
-# ADDED 5m, 1d, 1w, 1M timeframes here
 TIMEFRAME_MAP = {
     "1m (Scalping)": ("1m", 1),
     "5m (Scalping)": ("5m", 5),
@@ -398,7 +397,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     # ==========================================
     # 8. TOP HEADER STATUS BAR
     # ==========================================
-    dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    dir_color = "#00C853" if direction == "LONG" else ("#D50000" if direction == "SHORT" else "#38bdf8")
     mins_rem, secs_rem = divmod(time_remaining, 60)
 
     st.markdown(f"""
@@ -455,16 +454,24 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             forecast_prices = [close_p] * forecast_horizon
 
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+        
+        # ---> Yahan maine Candles ko Pure Normal Red / Green kar diya hai <---
+        fig.add_trace(go.Candlestick(
+            x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], 
+            name="Candles", 
+            increasing_line_color="#00C853", increasing_fillcolor="#00C853",  # Green color (fill & border)
+            decreasing_line_color="#D50000", decreasing_fillcolor="#D50000"   # Red color (fill & border)
+        ))
+        
         fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
         
-        # Original BEAM/BASE/SL Lines
-        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}", opacity=0.5)
-        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}", opacity=0.5)
-        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}", opacity=0.5)
+        # Original BEAM/BASE/SL Lines (Opacity set to 0.4 taake candles disturb na hon)
+        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00C853", annotation_text=f"BEAM: ${beam_level:,.2f}", opacity=0.4)
+        fig.add_hline(y=base_level, line_dash="dash", line_color="#D50000", annotation_text=f"BASE: ${base_level:,.2f}", opacity=0.4)
+        fig.add_hline(y=sl_val, line_dash="dot", line_color="#D50000", annotation_text=f"SL: ${sl_val:,.2f}", opacity=0.4)
 
         # ----------------------------------------------------
-        # TRI ENGINE CHART INTEGRATION
+        # TRI ENGINE CHART INTEGRATION (Candles k upar draw hongi)
         # ----------------------------------------------------
         if enable_tri_lines:
             tri_engine = TRILineEngine(selected_symbol)
@@ -472,12 +479,16 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             
             for tf_name, data in tri_levels.items():
                 color = tri_engine.colors.get(tf_name, "#ffffff")
-                # Plot Body 50
-                fig.add_hline(y=data.body_50, line_dash="solid", line_width=1, line_color=color, opacity=0.6, annotation_text=f"{tf_name} Body 50", annotation_position="top left", annotation_font=dict(color=color, size=9))
-                # Plot Upper 50
-                fig.add_hline(y=data.upper_50, line_dash="dot", line_width=1, line_color=color, opacity=0.3, annotation_text=f"{tf_name} Upper 50", annotation_position="bottom left", annotation_font=dict(color=color, size=9))
-                # Plot Lower 50
-                fig.add_hline(y=data.lower_50, line_dash="dot", line_width=1, line_color=color, opacity=0.3, annotation_text=f"{tf_name} Lower 50", annotation_position="bottom left", annotation_font=dict(color=color, size=9))
+                
+                # Plot Body 50 (Solid line)
+                fig.add_hline(y=data.body_50, line_dash="solid", line_width=1.5, line_color=color, opacity=0.8, 
+                              annotation_text=f"{tf_name} Body 50", annotation_position="top left", annotation_font=dict(color=color, size=10))
+                # Plot Upper 50 (Dotted)
+                fig.add_hline(y=data.upper_50, line_dash="dot", line_width=1, line_color=color, opacity=0.5, 
+                              annotation_text=f"{tf_name} Upper 50", annotation_position="bottom left", annotation_font=dict(color=color, size=9))
+                # Plot Lower 50 (Dotted)
+                fig.add_hline(y=data.lower_50, line_dash="dot", line_width=1, line_color=color, opacity=0.5, 
+                              annotation_text=f"{tf_name} Lower 50", annotation_position="bottom left", annotation_font=dict(color=color, size=9))
 
         fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
@@ -491,11 +502,11 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
         st.markdown(f"""
         <div class="metric-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00C853;">{bid_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#D50000;">{ask_vol_sum:,.2f}</b></div>
             <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
             <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
-            <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
+            <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00C853;">LOW-MEDIUM</b></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -581,13 +592,13 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         with p2:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Closed Trades</div><div class="metric-val-blue">{closed_trades}</div></div>', unsafe_allow_html=True)
         with p3:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Wins / Losses</div><div style="font-size:16px; font-weight:750; color:#00e676;">{wins}W / {losses}L</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Wins / Losses</div><div style="font-size:16px; font-weight:750; color:#00C853;">{wins}W / {losses}L</div></div>', unsafe_allow_html=True)
         with p4:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Pending</div><div class="metric-val-blue">{pending}</div></div>', unsafe_allow_html=True)
         with p5:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Profit Factor</div><div class="metric-val-blue">{profit_factor:.2f}</div></div>', unsafe_allow_html=True)
         with p6:
-            pnl_color = "#00e676" if net_pnl >= 0 else "#ff5252"
+            pnl_color = "#00C853" if net_pnl >= 0 else "#D50000"
             st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
 
         st.markdown("##### Detailed Trade History Table")
