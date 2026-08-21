@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
-from streamlit_autorefresh import st_autorefresh  # <-- 1. Yahan library import ki hai
+from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
 # 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# <-- 2. Yahan Auto-Refresh lagaya hai (Har 5 seconds / 5000ms baad page rerun hoga)
+# Auto-Refresh (Har 5 seconds / 5000ms baad page rerun hoga)
 count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
 CSV_FILE = "signal_history.csv"
@@ -59,7 +59,6 @@ class TenPaperResearchLab:
         self.target_vol = target_vol
         self.scaler = StandardScaler()
         
-        # 12 Quantitative Papers & Metrics Formulas
         self.feature_names = [
             "HAWKES", "BOOK_IMB", "TAKER_FLOW", "QUANT_IMPLY", 
             "BAYESIAN", "QUANTILES", "TARGET_INV", "ADAPT_CONF", 
@@ -80,59 +79,47 @@ class TenPaperResearchLab:
         returns_h = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / (df["Close"].iloc[-5] + 1e-8)
         delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
 
-        # 1. Hawkes Intensity Process
         vol_changes = df["Volume"].pct_change().dropna().values
         hawkes_intensity = (np.mean(vol_changes[-3:]) / (np.mean(vol_changes[-15:]) + 1e-8)) if len(vol_changes) >= 15 else 1.0
         results["HAWKES"] = np.clip((hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1)
 
-        # 2. Book Imbalance
         results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
 
-        # 3. Taker Flow
         taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
         taker_sell = df["Volume"].iloc[-1] * (1.0 if delta_p <= 0 else 0.3)
         results["TAKER_FLOW"] = (taker_buy - taker_sell) / (taker_buy + taker_sell + 1e-8)
 
-        # 4. Quantities Imply
         depth_skew = (bids[0, 1] - asks[0, 1]) / (bids[0, 1] + asks[0, 1] + 1e-8)
         results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
 
-        # 5. Bayesian Probability
         prior = 0.745
         likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
         posterior = (likelihood * prior) / ((likelihood * prior) + ((1 - likelihood) * (1 - prior)) + 1e-8)
         results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
 
-        # 6. Quantiles Imply
         q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
         q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
         results["QUANTILES"] = np.clip((returns_h - q10) / (q90 - q10 + 1e-8) * 2.0 - 1.0, -1, 1)
 
-        # 7. Target versus Invalidation Threshold
         target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
         results["TARGET_INV"] = 1.0 if target_diff >= 0.0006 else (-1.0 if target_diff <= -0.0006 else 0.0)
 
-        # 8. Adaptive Conformal Band Crosses Zero
         ma_fast = df["Close"].rolling(3).mean().iloc[-1]
         ma_slow = df["Close"].rolling(10).mean().iloc[-1]
         results["ADAPT_CONF"] = np.clip((ma_fast - ma_slow) / (realized_vol * mid_price + 1e-8), -1, 1)
 
-        # 9. Fractional Kelly Risk
         win_prob = 0.55 + (0.15 * np.sign(results["BOOK_IMB"]))
         kelly_fraction = win_prob - ((1 - win_prob) / 1.5)
         results["FRAC_KELLY"] = np.clip(kelly_fraction * 2.0 * np.sign(returns_h), -1, 1)
 
-        # 10. RMT Market Dominance
         rmt_dom = (abs(returns_h) / (realized_vol * np.sqrt(5) + 1e-8)) / 3.0
         results["RMT_DOM"] = np.clip(rmt_dom * np.sign(returns_h), -1, 1)
 
-        # 11. Conformal Interval Crosses Zero
         conformal_spread = realized_vol * 1.96
         upper_b = mid_price * (1 + conformal_spread)
         lower_b = mid_price * (1 - conformal_spread)
         results["CONF_CROSS"] = 1.0 if mid_price > (upper_b + lower_b) / 2 else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
 
-        # 12. Quantiles Reward / Risk Filter
         rr_ratio = abs(q90) / (abs(q10) + 1e-8)
         results["REWARD_RISK"] = 1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
 
@@ -302,9 +289,18 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     
     trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
 
+    # --- ACTIVE TRADE LOCK / ANTI-OVERLAP CHECK ---
+    # Check karein ke kya is specific coin ki pehle se koi trade "PENDING" chal rahi hai?
+    has_active_trade_for_coin = any(
+        t["symbol"] == selected_symbol and t.get("outcome") == "PENDING" 
+        for t in st.session_state.trade_history_log
+    )
+
     if paper_trading_mode and direction != "NEUTRAL":
         existing_trade_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
-        if trade_id not in existing_trade_ids:
+        
+        # Sirf tab naya signal save hoga jab is coin par koi active/pending trade na ho
+        if trade_id not in existing_trade_ids and not has_active_trade_for_coin:
             new_trade = {
                 "trade_id": trade_id,
                 "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -326,6 +322,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             st.session_state.trade_history_log.insert(0, new_trade)
             save_persistent_history(st.session_state.trade_history_log)
 
+    # Update Pending Trades Outcome (TP / SL Hit check)
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING" and trade["symbol"] == selected_symbol:
             curr_price = close_p
@@ -378,6 +375,10 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
     </div>
     """, unsafe_allow_html=True)
+
+    # Agar is coin par active trade chal rahi hai toh alert show karein
+    if has_active_trade_for_coin:
+        st.warning(f"🔒 **Position Locked:** {selected_symbol} par pehle se aik active/pending trade chal rahi hai. Jab tak TP ya SL hit nahi hota, naya signal CSV mein save nahi hoga.")
 
     # ==========================================
     # 8. TRADE SIGNAL PANEL & METRICS
