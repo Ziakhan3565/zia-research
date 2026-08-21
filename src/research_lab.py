@@ -94,9 +94,16 @@ class TenPaperResearchLab:
         lower_b = mid_price * (1 - conformal_spread)
         results["CONF_CROSS"] = 1.0 if mid_price > (upper_b + lower_b) / 2 else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
 
-        # 12. Quantiles Reward / Risk Below 1.2 Filter
+        # 12. Quantiles Reward / Risk Updated (1:2 and 1:3 Thresholds)
         rr_ratio = abs(q90) / (abs(q10) + 1e-8)
-        results["REWARD_RISK"] = 1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
+        if rr_ratio >= 3.0:
+            results["REWARD_RISK"] = 1.0       # Excellent (1:3 or better)
+        elif rr_ratio >= 2.0:
+            results["REWARD_RISK"] = 0.5       # Good (1:2)
+        elif rr_ratio < 1.0:
+            results["REWARD_RISK"] = -1.0      # Unfavorable
+        else:
+            results["REWARD_RISK"] = 0.0       # Neutral
 
         return results
 
@@ -116,8 +123,6 @@ class TenPaperResearchLab:
                 X_train = []
                 y_train = []
                 for hist in performance_history[-30:]: # Last 30 records
-                    # FIXED: Replaced fake random features with real stored historical feature vectors if available, 
-                    # falling back gracefully to prevent distortion.
                     stored_feat = hist.get("features")
                     if stored_feat and len(stored_feat) == len(self.feature_names):
                         X_train.append([stored_feat[k] for k in self.feature_names])
@@ -147,14 +152,12 @@ class TenPaperResearchLab:
                 pass
 
         # --- ENHANCEMENT: DYNAMIC WEIGHT ADAPTATION ---
-        # Update weights based on recent performance feedback if provided
         if performance_history and len(performance_history) > 0:
             last_perf = performance_history[-1]
             if "feature_contributions" in last_perf and last_perf.get("outcome") == "WIN":
                 for k in self.feature_names:
                     if k in last_perf["feature_contributions"]:
                         self.dynamic_weights[k] += 0.01 * np.sign(last_perf["feature_contributions"][k])
-                # Normalize weights
                 total_w = sum(abs(w) for w in self.dynamic_weights.values())
                 if total_w > 0:
                     self.dynamic_weights = {k: w / total_w for k, w in self.dynamic_weights.items()}
@@ -162,8 +165,8 @@ class TenPaperResearchLab:
         # Compute final score via ML Probability or Weighted Linear Ensemble
         if self.is_model_trained:
             try:
-                ml_prob = self.ml_model.predict_proba(scaled_features)[0][1] # Probability of winning / upward move
-                final_score = float((ml_prob - 0.5) * 2.0) # Map [0, 1] to [-1, 1]
+                ml_prob = self.ml_model.predict_proba(scaled_features)[0][1]
+                final_score = float((ml_prob - 0.5) * 2.0)
             except Exception:
                 weight_vector = np.array([self.dynamic_weights[k] for k in self.feature_names])
                 final_score = float(np.dot(feature_vector[0], weight_vector))
@@ -190,7 +193,6 @@ class PowerTradingRiskEngine:
         squeeze_risk = total_ltz * open_interest * leverage * volatility
         market_risk = ltz_score + spoof_score + squeeze_risk
 
-        # --- ENHANCEMENT: Dynamic Stop-Loss & Take-Profit Targets added ---
         atr_proxy = volatility * open_interest if volatility > 0 else 0.01
         dynamic_sl = max(0.001, atr_proxy * 1.5)
         dynamic_tp = max(0.002, atr_proxy * 2.5)
