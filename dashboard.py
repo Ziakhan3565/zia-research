@@ -1,196 +1,113 @@
-from __future__ import annotations
-
-import time
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional
-
+import streamlit as st
+import plotly.graph_objects as go
 import requests
+from tri_line_engine import TRILineEngine
 
+st.set_page_config(page_title="TRI Line Research Dashboard", layout="wide")
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+st.title("📊 Price Trajectory & Tri-Line Levels Dashboard")
 
-BINANCE_API = "https://api.binance.com/api/v3/klines"
+# Sidebar Controls
+selected_crypto = st.sidebar.selectbox("Select Cryptocurrency", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], index=0)
+limit = st.sidebar.slider("Candle Limit", 50, 500, 100)
 
-DEFAULT_SYMBOL = "BTCUSDT"
+# Wrap engine calculation in try-except to prevent app crash/black screen
+try:
+    with st.spinner("Calculating Tri-Line Levels..."):
+        engine = TRILineEngine(symbol=selected_crypto, timeout=5)
+        tri_data = engine.calculate_all_dict()
+except Exception as e:
+    st.error(f"Engine Error: {e}")
+    tri_data = {}
 
-SUPPORTED_TIMEFRAMES = {
-    "YEARLY": "1y",
-    "MONTHLY": "1M",
-    "WEEKLY": "1w",
-    "DAILY": "1d",
-    "4H": "4h",
-    "1H": "1h",
-    "30M": "30m",
-    "15M": "15m",
-}
-
-
-# ============================================================
-# DATA CLASS
-# ============================================================
-
-@dataclass
-class TRILineLevels:
-    timeframe: str
-
-    open: float
-    high: float
-    low: float
-    close: float
-
-    body_high: float
-    body_low: float
-
-    body_50: float
-    upper_50: float
-    lower_50: float
-
-    candle_time: int
-
-
-# ============================================================
-# TRI LINE ENGINE
-# ============================================================
-
-class TRILineEngine:
-
-    def __init__(
-        self,
-        symbol: str = DEFAULT_SYMBOL,
-        enabled_timeframes: Optional[Dict[str, bool]] = None,
-        timeout: int = 10,
-    ):
-
-        self.symbol = symbol.upper()
-        self.timeout = timeout
-
-        self.enabled = {
-            "YEARLY": True,
-            "MONTHLY": True,
-            "WEEKLY": True,
-            "DAILY": True,
-            "4H": True,
-            "1H": True,
-            "30M": True,
-            "15M": True,
-        }
-
-        if enabled_timeframes:
-            self.enabled.update(enabled_timeframes)
-
-        self.colors = {
-            "YEARLY": "deepskyblue",
-            "MONTHLY": "red",
-            "WEEKLY": "green",
-            "DAILY": "black",
-            "4H": "orange",
-            "1H": "purple",
-            "30M": "darkgreen",
-            "15M": "blue",
-        }
-
-    def set_symbol(self, symbol: str):
-        self.symbol = symbol.upper()
-
-    def set_timeframe(self, timeframe: str, enabled: bool):
-        timeframe = timeframe.upper()
-        if timeframe not in SUPPORTED_TIMEFRAMES:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-        self.enabled[timeframe] = enabled
-
-    def set_color(self, timeframe: str, color: str):
-        timeframe = timeframe.upper()
-        if timeframe not in SUPPORTED_TIMEFRAMES:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-        self.colors[timeframe] = color
-
-    def get_klines(self, interval: str, limit: int = 5):
-        params = {
-            "symbol": self.symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        response = requests.get(
-            BINANCE_API,
-            params=params,
-            timeout=self.timeout,
-        )
+# Fetch historical candles safely
+@st.cache_data(ttl=60)
+def fetch_klines(symbol, limit):
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": "1d", "limit": limit}
+        response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         return response.json()
+    except Exception as e:
+        return None
 
-    def get_previous_candle(self, interval: str):
-        candles = self.get_klines(interval=interval, limit=5)
-        if len(candles) < 2:
-            raise RuntimeError(f"Not enough candle data for {interval}")
+raw_candles = fetch_klines(selected_crypto, limit)
 
-        candle = candles[-2]
+if not raw_candles:
+    st.warning("⚠️ Failed to fetch chart data from Binance API. Please check your internet connection or try again.")
+else:
+    # Parse candlestick data safely
+    import pandas as pd
+    df = pd.DataFrame(raw_candles, columns=[
+        'time', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+    ])
+    
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
 
-        return {
-            "time": int(candle[0]),
-            "open": float(candle[1]),
-            "high": float(candle[2]),
-            "low": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5]),
-        }
+    # Create Plotly Candlestick Figure
+    fig = go.Figure(data=[go.Candlestick(
+        x=df['time'],
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name="Candles"
+    )])
 
-    def calculate_levels(self, timeframe: str) -> TRILineLevels:
-        timeframe = timeframe.upper()
-        if timeframe not in SUPPORTED_TIMEFRAMES:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
+    # ============================================================
+    # ADD TRI-LINE LEVELS TO THE PLOTLY CHART
+    # ============================================================
+    for timeframe, data in tri_data.items():
+        if not isinstance(data, dict) or "error" in data:
+            continue
+        
+        color = data.get("color", "gray")
+        
+        # Body 50% Line
+        if "body_50" in data:
+            fig.add_hline(
+                y=data["body_50"],
+                line_dash="dash",
+                line_color=color,
+                annotation_text=f"{timeframe} Body 50%",
+                annotation_position="bottom right"
+            )
+        
+        # Upper Wick 50% Line
+        if "upper_50" in data:
+            fig.add_hline(
+                y=data["upper_50"],
+                line_dash="dot",
+                line_color=color,
+                annotation_text=f"{timeframe} Upper 50%"
+            )
+        
+        # Lower Wick 50% Line
+        if "lower_50" in data:
+            fig.add_hline(
+                y=data["lower_50"],
+                line_dash="dot",
+                line_color=color,
+                annotation_text=f"{timeframe} Lower 50%"
+            )
 
-        interval = SUPPORTED_TIMEFRAMES[timeframe]
-        candle = self.get_previous_candle(interval)
+    fig.update_layout(
+        title=f"Price Trajectory & Multi-Timeframe Tri-Lines ({selected_crypto})",
+        xaxis_title="Date",
+        yaxis_title="Price (USDT)",
+        template="plotly_dark",
+        height=600,
+        xaxis_rangeslider_visible=False
+    )
 
-        o = candle["open"]
-        h = candle["high"]
-        l = candle["low"]
-        c = candle["close"]
+    st.plotly_chart(fig, use_container_width=True)
 
-        body_high = max(o, c)
-        body_low = min(o, c)
-
-        body_50 = (body_high + body_low) / 2.0
-        upper_50 = (h + body_high) / 2.0
-        lower_50 = (l + body_low) / 2.0
-
-        return TRILineLevels(
-            timeframe=timeframe,
-            open=o,
-            high=h,
-            low=l,
-            close=c,
-            body_high=body_high,
-            body_low=body_low,
-            body_50=body_50,
-            upper_50=upper_50,
-            lower_50=lower_50,
-            candle_time=candle["time"],
-        )
-
-    def calculate_all(self):
-        results = {}
-        for timeframe in SUPPORTED_TIMEFRAMES:
-            if not self.enabled.get(timeframe, False):
-                continue
-            try:
-                levels = self.calculate_levels(timeframe)
-                results[timeframe] = levels
-            except Exception as error:
-                results[timeframe] = {"error": str(error)}
-        return results
-
-    def calculate_all_dict(self):
-        results = self.calculate_all()
-        output = {}
-        for timeframe, value in results.items():
-            if isinstance(value, TRILineLevels):
-                output[timeframe] = {
-                    "color": self.colors[timeframe],
-                    **asdict(value),
-                }
-            else:
-                output[timeframe] = value
-        return output
+# Debug / Data view in expander
+with st.expander("🔍 View Calculated Tri-Line Values"):
+    st.json(tri_data)
