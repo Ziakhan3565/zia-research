@@ -1,147 +1,530 @@
-# ============================================================
-# TRI QUANT TRADING DASHBOARD
-# Complete Streamlit Dashboard
-# ============================================================
+import os
+import time
+import uuid
+import datetime as dt
 
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import requests
 import plotly.graph_objects as go
+import streamlit as st
 
-from datetime import datetime, timezone
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-
 st.set_page_config(
-    page_title="TRI Quant Trading Terminal",
-    page_icon="📊",
+    page_title="Quant Research Trading Terminal",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-
-# ============================================================
-# CUSTOM CSS
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-
-    .stApp {
-        background: #080b11;
-        color: #ffffff;
-    }
-
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-        max-width: 1600px;
-    }
-
-    h1, h2, h3, h4 {
-        color: #f8fafc;
-    }
-
-    .metric-card {
-        background: #111622;
-        border: 1px solid #202938;
-        border-radius: 12px;
-        padding: 14px;
-        margin-bottom: 10px;
-    }
-
-    .metric-title {
-        color: #94a3b8;
-        font-size: 13px;
-        margin-bottom: 5px;
-    }
-
-    .metric-value {
-        color: #f8fafc;
-        font-size: 20px;
-        font-weight: 700;
-    }
-
-    .ob-card {
-        background: #111622;
-        border: 1px solid #202938;
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 12px;
-    }
-
-    .ob-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 9px;
-        font-size: 14px;
-    }
-
-    .ob-label {
-        color: #cbd5e1;
-    }
-
-    .section-title {
-        font-size: 26px;
-        font-weight: 700;
-        margin-bottom: 10px;
-    }
-
-    .tri-box {
-        background: #111622;
-        border: 1px solid #202938;
-        border-radius: 10px;
-        padding: 10px 14px;
-        margin-bottom: 10px;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+st.markdown("""
+<style>
+html, body, [class*="css"] {
+    font-family: Inter, Arial, sans-serif;
+}
+.stApp {
+    background: #080a0f;
+    color: #e2e8f0;
+}
+section[data-testid="stSidebar"] {
+    background: #0d1117 !important;
+    border-right: 1px solid #1e2638;
+}
+.card {
+    background: #111622;
+    border: 1px solid #1e2638;
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 10px;
+}
+.label {
+    color: #8b949e;
+    font-size: 12px;
+}
+.value {
+    font-size: 21px;
+    font-weight: 700;
+}
+.green { color: #00e676; }
+.red { color: #ff5252; }
+.blue { color: #38bdf8; }
+.orange { color: #f59e0b; }
+.small { font-size: 11px; color: #8b949e; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ============================================================
-# BINANCE API
+# CONFIG
 # ============================================================
+COINS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "NEARUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT", "PEPEUSDT",
+]
 
-BINANCE_KLINES_URL = (
-    "https://data-api.binance.vision/api/v3/klines"
-)
-
-BINANCE_BOOK_URL = (
-    "https://data-api.binance.vision/api/v3/depth"
-)
-
-
-# ============================================================
-# SYMBOL MAP
-# ============================================================
-
-SYMBOLS = {
-    "BTCUSDT": "BTCUSDT",
-    "ETHUSDT": "ETHUSDT",
-    "BNBUSDT": "BNBUSDT",
-    "SOLUSDT": "SOLUSDT",
-    "XRPUSDT": "XRPUSDT",
-    "DOGEUSDT": "DOGEUSDT",
-    "ADAUSDT": "ADAUSDT",
-    "AVAXUSDT": "AVAXUSDT",
+TIMEFRAMES = {
+    "1m": ("1m", 1),
+    "15m": ("15m", 15),
+    "30m": ("30m", 30),
+    "1h": ("1h", 60),
+    "4h": ("4h", 240),
 }
 
+HISTORY_FILE = "trade_history.csv"
+
 
 # ============================================================
-# TRI TIMEFRAMES
+# EXACT 12-FEATURE ENGINE + RISK ENGINE
+# ============================================================
+class TenPaperResearchLab:
+    def __init__(self, target_vol=0.15):
+        self.target_vol = target_vol
+        self.scaler = StandardScaler()
+
+        base_model = SGDClassifier(
+            loss="log_loss",
+            penalty="l2",
+            alpha=0.0001,
+            max_iter=1000,
+            random_state=42
+        )
+
+        # Compatible with newer sklearn versions.
+        try:
+            self.ml_model = CalibratedClassifierCV(
+                estimator=base_model,
+                method="sigmoid",
+                cv="prefit"
+            )
+        except TypeError:
+            self.ml_model = CalibratedClassifierCV(
+                base_estimator=base_model,
+                method="sigmoid",
+                cv="prefit"
+            )
+
+        self.is_model_trained = False
+
+        self.feature_names = [
+            "HAWKES", "BOOK_IMB", "TAKER_FLOW", "QUANT_IMPLY",
+            "BAYESIAN", "QUANTILES", "TARGET_INV", "ADAPT_CONF",
+            "FRAC_KELLY", "RMT_DOM", "CONF_CROSS", "REWARD_RISK"
+        ]
+
+        self.dynamic_weights = {
+            k: 1.0 / len(self.feature_names)
+            for k in self.feature_names
+        }
+
+    def extract_features(self, df, bids, asks):
+        results = {}
+
+        if len(bids) == 0 or len(asks) == 0 or df.empty or len(df) < 15:
+            return {k: 0.0 for k in self.feature_names}
+
+        bid_vol = np.sum(bids[:, 1])
+        ask_vol = np.sum(asks[:, 1])
+        mid_price = (bids[0, 0] + asks[0, 0]) / 2
+
+        returns = df["Close"].pct_change().dropna()
+        realized_vol = returns.std() + 1e-8
+
+        returns_h = (
+            (df["Close"].iloc[-1] - df["Close"].iloc[-5])
+            / (df["Close"].iloc[-5] + 1e-8)
+        )
+
+        delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
+
+        # 1. Hawkes-type intensity
+        vol_changes = df["Volume"].pct_change().dropna().values
+
+        if len(vol_changes) >= 15:
+            denominator = np.mean(vol_changes[-15:]) + 1e-8
+            hawkes_intensity = np.mean(vol_changes[-3:]) / denominator
+        else:
+            hawkes_intensity = 1.0
+
+        results["HAWKES"] = np.clip(
+            (hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1
+        )
+
+        # 2. Book imbalance
+        results["BOOK_IMB"] = (
+            (bid_vol - ask_vol)
+            / (bid_vol + ask_vol + 1e-8)
+        )
+
+        # 3. Taker-flow estimate
+        last_volume = df["Volume"].iloc[-1]
+
+        taker_buy = last_volume * (1.0 if delta_p > 0 else 0.3)
+        taker_sell = last_volume * (1.0 if delta_p <= 0 else 0.3)
+
+        results["TAKER_FLOW"] = (
+            (taker_buy - taker_sell)
+            / (taker_buy + taker_sell + 1e-8)
+        )
+
+        # 4. Quantity imply
+        depth_skew = (
+            (bids[0, 1] - asks[0, 1])
+            / (bids[0, 1] + asks[0, 1] + 1e-8)
+        )
+
+        results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
+
+        # 5. Bayesian probability
+        prior = 0.745
+        likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
+
+        posterior = (
+            likelihood * prior
+        ) / (
+            likelihood * prior
+            + (1 - likelihood) * (1 - prior)
+            + 1e-8
+        )
+
+        results["BAYESIAN"] = np.clip(
+            (posterior - 0.5) * 2.0, -1, 1
+        )
+
+        # 6. Quantiles
+        q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
+        q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
+
+        results["QUANTILES"] = np.clip(
+            ((returns_h - q10) / (q90 - q10 + 1e-8)) * 2.0 - 1.0,
+            -1,
+            1
+        )
+
+        # 7. Target / invalidation threshold
+        target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
+
+        results["TARGET_INV"] = (
+            1.0 if target_diff >= 0.0006
+            else (-1.0 if target_diff <= -0.0006 else 0.0)
+        )
+
+        # 8. Adaptive conformal-style MA signal
+        ma_fast = df["Close"].rolling(3).mean().iloc[-1]
+        ma_slow = df["Close"].rolling(10).mean().iloc[-1]
+
+        results["ADAPT_CONF"] = np.clip(
+            (ma_fast - ma_slow)
+            / (realized_vol * mid_price + 1e-8),
+            -1,
+            1
+        )
+
+        # 9. Fractional Kelly
+        win_prob = 0.55 + (
+            0.15 * np.sign(results["BOOK_IMB"])
+        )
+
+        kelly_fraction = win_prob - (
+            (1 - win_prob) / 1.5
+        )
+
+        results["FRAC_KELLY"] = np.clip(
+            kelly_fraction * 2.0 * np.sign(returns_h),
+            -1,
+            1
+        )
+
+        # 10. RMT market dominance
+        rmt_dom = (
+            abs(returns_h)
+            / (realized_vol * np.sqrt(5) + 1e-8)
+        ) / 3.0
+
+        results["RMT_DOM"] = np.clip(
+            rmt_dom * np.sign(returns_h),
+            -1,
+            1
+        )
+
+        # 11. Conformal interval
+        conformal_spread = realized_vol * 1.96
+        upper_b = mid_price * (1 + conformal_spread)
+        lower_b = mid_price * (1 - conformal_spread)
+
+        # The center of these symmetric bands is mid_price,
+        # so this remains neutral unless the implementation is
+        # replaced with an actual interval-crossing condition.
+        band_center = (upper_b + lower_b) / 2
+
+        results["CONF_CROSS"] = (
+            1.0 if mid_price > band_center
+            else (-1.0 if mid_price < band_center else 0.0)
+        )
+
+        # 12. Quantile reward/risk
+        rr_ratio = abs(q90) / (abs(q10) + 1e-8)
+
+        results["REWARD_RISK"] = (
+            1.0 if rr_ratio >= 1.2
+            else (-1.0 if rr_ratio < 0.8 else 0.0)
+        )
+
+        return results
+
+    def calculate_all_signals(
+        self,
+        df,
+        bids,
+        asks,
+        current_inventory=0,
+        performance_history=None
+    ):
+        results = self.extract_features(df, bids, asks)
+
+        feature_vector = np.array(
+            [results[k] for k in self.feature_names]
+        ).reshape(1, -1)
+
+        try:
+            scaled_features = self.scaler.partial_fit(
+                feature_vector
+            ).transform(feature_vector)
+        except Exception:
+            scaled_features = feature_vector
+
+        # IMPORTANT:
+        # Historical training is only enabled if actual saved
+        # feature vectors are available in trade history.
+        # We do NOT train on random fake features.
+        if performance_history:
+            X_train = []
+            y_train = []
+
+            for hist in performance_history[-30:]:
+                features = hist.get("features")
+
+                if (
+                    isinstance(features, dict)
+                    and all(k in features for k in self.feature_names)
+                    and hist.get("outcome") in {"WIN", "LOSS"}
+                ):
+                    X_train.append([
+                        float(features[k])
+                        for k in self.feature_names
+                    ])
+                    y_train.append(
+                        1 if hist["outcome"] == "WIN" else 0
+                    )
+
+            if len(X_train) >= 5 and len(set(y_train)) > 1:
+                try:
+                    X_arr = np.asarray(X_train, dtype=float)
+                    y_arr = np.asarray(y_train, dtype=int)
+
+                    self.scaler.fit(X_arr)
+                    X_scaled = self.scaler.transform(X_arr)
+
+                    base_clf = SGDClassifier(
+                        loss="log_loss",
+                        penalty="l2",
+                        alpha=0.0001,
+                        max_iter=500,
+                        random_state=42
+                    )
+
+                    base_clf.fit(X_scaled, y_arr)
+
+                    try:
+                        self.ml_model = CalibratedClassifierCV(
+                            estimator=base_clf,
+                            method="sigmoid",
+                            cv="prefit"
+                        )
+                    except TypeError:
+                        self.ml_model = CalibratedClassifierCV(
+                            base_estimator=base_clf,
+                            method="sigmoid",
+                            cv="prefit"
+                        )
+
+                    # CalibratedClassifierCV with prefit model.
+                    self.ml_model.fit(X_scaled, y_arr)
+                    self.is_model_trained = True
+
+                except Exception:
+                    self.is_model_trained = False
+
+        if self.is_model_trained:
+            try:
+                ml_prob = self.ml_model.predict_proba(
+                    scaled_features
+                )[0][1]
+
+                final_score = float(
+                    (ml_prob - 0.5) * 2.0
+                )
+
+            except Exception:
+                weight_vector = np.array(
+                    list(self.dynamic_weights.values())
+                )
+                final_score = float(
+                    np.dot(feature_vector[0], weight_vector)
+                )
+        else:
+            weight_vector = np.array(
+                list(self.dynamic_weights.values())
+            )
+
+            final_score = float(
+                np.dot(feature_vector[0], weight_vector)
+            )
+
+        return results, final_score, self.dynamic_weights
+
+
+class PowerTradingRiskEngine:
+    def __init__(self):
+        pass
+
+    def calculate_risk_metrics(
+        self,
+        liquidation_volumes,
+        displayed_vol,
+        cancelled_vol,
+        time_exists,
+        obs_window,
+        open_interest,
+        leverage,
+        volatility
+    ):
+        total_ltz = (
+            np.sum(liquidation_volumes)
+            if len(liquidation_volumes) > 0
+            else 0.0
+        )
+
+        max_ltz = (
+            np.max(liquidation_volumes)
+            if len(liquidation_volumes) > 0
+            else 0.0
+        )
+
+        ltz_score = (
+            max_ltz / (total_ltz + 1e-8)
+        ) * 100
+
+        spoof_ratio = (
+            cancelled_vol
+            / (displayed_vol + 1e-8)
+        )
+
+        persistence = min(
+            max(time_exists / (obs_window + 1e-8), 0),
+            1
+        )
+
+        spoof_score = spoof_ratio * (1 - persistence)
+
+        squeeze_risk = (
+            total_ltz
+            * open_interest
+            * leverage
+            * volatility
+        )
+
+        market_risk = (
+            ltz_score
+            + spoof_score
+            + squeeze_risk
+        )
+
+        return {
+            "LTZ_Score": float(ltz_score),
+            "Spoof_Score": float(spoof_score),
+            "Squeeze_Risk": float(squeeze_risk),
+            "Market_Risk": float(market_risk),
+        }
+
+
+# ============================================================
+# DATA FUNCTIONS
+# ============================================================
+@st.cache_data(ttl=10)
+def fetch_klines(symbol, interval, limit=150):
+    url = (
+        "https://data-api.binance.vision/api/v3/klines"
+        f"?symbol={symbol}&interval={interval}&limit={limit}"
+    )
+
+    try:
+        data = requests.get(url, timeout=5).json()
+
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            data,
+            columns=[
+                "Open_Time", "Open", "High", "Low", "Close",
+                "Volume", "Close_Time", "QAV", "NAT",
+                "TBBAV", "TBQAV", "Ignore"
+            ]
+        )
+
+        df["Time"] = pd.to_datetime(
+            df["Open_Time"], unit="ms"
+        )
+
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df[
+            ["Time", "Open", "High", "Low", "Close", "Volume"]
+        ].dropna()
+
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3)
+def fetch_order_book(symbol, limit=20):
+    url = (
+        "https://data-api.binance.vision/api/v3/depth"
+        f"?symbol={symbol}&limit={limit}"
+    )
+
+    try:
+        data = requests.get(url, timeout=5).json()
+
+        if "bids" not in data or "asks" not in data:
+            return np.empty((0, 2)), np.empty((0, 2))
+
+        bids = np.asarray(data["bids"], dtype=float)
+        asks = np.asarray(data["asks"], dtype=float)
+
+        return bids, asks
+
+    except Exception:
+        return np.empty((0, 2)), np.empty((0, 2))
+
+
+# ============================================================
+# HISTORY
 # ============================================================
 
+
+# ============================================================
+# TRI LINE ANALYSIS
+# ============================================================
 TRI_TIMEFRAMES = {
-    "YEARLY": "YEARLY",
     "MONTHLY": "1M",
     "WEEKLY": "1w",
     "DAILY": "1d",
@@ -151,708 +534,669 @@ TRI_TIMEFRAMES = {
     "15M": "15m",
 }
 
-
-# ============================================================
-# TRI COLORS
-# ============================================================
-
 TRI_COLORS = {
-
-    "YEARLY": "#87CEEB",     # Sky blue
-
-    "MONTHLY": "#FF0000",    # Red
-
-    "WEEKLY": "#00C853",     # Green
-
-    "DAILY": "#FFFFFF",      # White
-
-    "4H": "#FFA500",         # Orange
-
-    "1H": "#A855F7",         # Purple
-
-    "30M": "#006400",        # Dark green
-
-    "15M": "#2196F3",        # Blue
+    "YEARLY": "#87CEEB",
+    "MONTHLY": "#FF0000",
+    "WEEKLY": "#00C853",
+    "DAILY": "#FFFFFF",
+    "4H": "#FFA500",
+    "1H": "#A855F7",
+    "30M": "#006400",
+    "15M": "#2196F3",
 }
 
 
-# ============================================================
-# FETCH KLINES
-# ============================================================
-
-@st.cache_data(ttl=15)
-def fetch_klines(symbol, interval, limit=200):
-
-    try:
-
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-
-        response = requests.get(
-            BINANCE_KLINES_URL,
-            params=params,
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not isinstance(data, list):
-            return None
-
-        if len(data) < 10:
-            return None
-
-        columns = [
-            "Open_Time",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Close_Time",
-            "Quote_Volume",
-            "Trades",
-            "Taker_Buy_Base",
-            "Taker_Buy_Quote",
-            "Ignore",
-        ]
-
-        df = pd.DataFrame(
-            data,
-            columns=columns
-        )
-
-        df["Time"] = pd.to_datetime(
-            df["Open_Time"],
-            unit="ms",
-            utc=True
-        )
-
-        numeric_columns = [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]
-
-        for col in numeric_columns:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
-        return df
-
-    except Exception as e:
-
-        st.warning(
-            f"Market data error: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# FETCH PREVIOUS COMPLETED CANDLE
-# ============================================================
-
 @st.cache_data(ttl=30)
-def fetch_tri_candle(symbol, interval):
-
-    try:
-
-        df = fetch_klines(
-            symbol,
-            interval,
-            5
-        )
-
-        if df is None:
-            return None
-
-        if len(df) < 2:
-            return None
-
-        # Previous completed candle
-        return df.iloc[-2]
-
-    except Exception:
-
+def fetch_tri_previous_candle(symbol, interval):
+    """Return the previous completed candle for a TRI timeframe."""
+    data = fetch_klines(symbol, interval, 5)
+    if data.empty or len(data) < 2:
         return None
+    return data.iloc[-2]
 
-
-# ============================================================
-# YEARLY CANDLE
-# ============================================================
 
 @st.cache_data(ttl=60)
-def fetch_tri_yearly_candle(symbol):
-
-    try:
-
-        monthly = fetch_klines(
-            symbol,
-            "1M",
-            60
-        )
-
-        if monthly is None:
-            return None
-
-        if len(monthly) < 13:
-            return None
-
-        monthly = monthly.copy()
-
-        monthly["Year"] = (
-            monthly["Time"]
-            .dt.year
-        )
-
-        yearly = (
-            monthly
-            .groupby("Year")
-            .agg(
-                Open=("Open", "first"),
-                High=("High", "max"),
-                Low=("Low", "min"),
-                Close=("Close", "last"),
-            )
-            .dropna()
-        )
-
-        if len(yearly) < 2:
-            return None
-
-        # Previous completed year
-        previous_year = yearly.iloc[-2]
-
-        return previous_year
-
-    except Exception:
-
+def fetch_tri_previous_year(symbol):
+    """Build the previous completed yearly candle from monthly data."""
+    data = fetch_klines(symbol, "1M", 60)
+    if data.empty or len(data) < 13:
         return None
 
+    yearly = data.copy()
+    yearly["Year"] = yearly["Time"].dt.year
 
-# ============================================================
-# CALCULATE TRI LEVELS
-# ============================================================
+    grouped = yearly.groupby("Year", sort=True).agg(
+        Open=("Open", "first"),
+        High=("High", "max"),
+        Low=("Low", "min"),
+        Close=("Close", "last"),
+    ).dropna()
+
+    if len(grouped) < 2:
+        return None
+
+    return grouped.iloc[-2]
+
 
 def calculate_tri_levels(candle):
-
+    """Calculate Body 50%, Upper Wick 50%, and Lower Wick 50%."""
     if candle is None:
         return None
 
     try:
-
         o = float(candle["Open"])
         h = float(candle["High"])
         l = float(candle["Low"])
         c = float(candle["Close"])
 
-        # ----------------------------------------------------
-        # BODY
-        # ----------------------------------------------------
-
-        body_high = max(
-            o,
-            c
-        )
-
-        body_low = min(
-            o,
-            c
-        )
-
-        # ----------------------------------------------------
-        # BODY 50%
-        # ----------------------------------------------------
-
-        body_50 = (
-            body_high +
-            body_low
-        ) / 2.0
-
-        # ----------------------------------------------------
-        # UPPER WICK 50%
-        # ----------------------------------------------------
-
-        upper_50 = (
-            h +
-            body_high
-        ) / 2.0
-
-        # ----------------------------------------------------
-        # LOWER WICK 50%
-        # ----------------------------------------------------
-
-        lower_50 = (
-            l +
-            body_low
-        ) / 2.0
+        body_high = max(o, c)
+        body_low = min(o, c)
 
         return {
-
-            "body_50": body_50,
-
-            "upper_50": upper_50,
-
-            "lower_50": lower_50,
-
+            "body_50": (body_high + body_low) / 2.0,
+            "upper_50": (h + body_high) / 2.0,
+            "lower_50": (l + body_low) / 2.0,
         }
-
-    except Exception:
-
+    except (TypeError, ValueError, KeyError):
         return None
 
 
-# ============================================================
-# GET ALL TRI LEVELS
-# ============================================================
-
+@st.cache_data(ttl=30)
 def get_all_tri_levels(symbol):
-
     levels = {}
 
-    # --------------------------------------------------------
-    # YEARLY
-    # --------------------------------------------------------
-
-    yearly_candle = fetch_tri_yearly_candle(
-        symbol
+    # Previous completed yearly candle.
+    yearly = calculate_tri_levels(
+        fetch_tri_previous_year(symbol)
     )
+    if yearly is not None:
+        levels["YEARLY"] = yearly
 
-    yearly_levels = calculate_tri_levels(
-        yearly_candle
-    )
-
-    if yearly_levels is not None:
-
-        levels["YEARLY"] = yearly_levels
-
-    # --------------------------------------------------------
-    # OTHER TIMEFRAMES
-    # --------------------------------------------------------
-
+    # Previous completed Monthly / Weekly / Daily / intraday candles.
     for name, interval in TRI_TIMEFRAMES.items():
-
-        if name == "YEARLY":
-            continue
-
-        candle = fetch_tri_candle(
-            symbol,
-            interval
+        candle = fetch_tri_previous_candle(
+            symbol, interval
         )
-
-        tri = calculate_tri_levels(
-            candle
-        )
-
+        tri = calculate_tri_levels(candle)
         if tri is not None:
-
             levels[name] = tri
 
     return levels
 
 
-# ============================================================
-# ORDER BOOK
-# ============================================================
+def add_tri_lines(fig, tri_levels):
+    """Add TRI horizontal levels without annotations or side labels."""
+    for tri_tf, tri in tri_levels.items():
+        color = TRI_COLORS.get(tri_tf, "#38bdf8")
 
-@st.cache_data(ttl=5)
-def fetch_orderbook(symbol, limit=50):
+        # Body 50% — thick solid line.
+        fig.add_hline(
+            y=tri["body_50"],
+            line_color=color,
+            line_width=3,
+            line_dash="solid",
+            opacity=0.95,
+            layer="above",
+        )
+
+        # Upper Wick 50% — thin dotted line.
+        fig.add_hline(
+            y=tri["upper_50"],
+            line_color=color,
+            line_width=1,
+            line_dash="dot",
+            opacity=0.75,
+            layer="above",
+        )
+
+        # Lower Wick 50% — thin dotted line.
+        fig.add_hline(
+            y=tri["lower_50"],
+            line_color=color,
+            line_width=1,
+            line_dash="dot",
+            opacity=0.75,
+            layer="above",
+        )
+
+    return fig
+
+
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return []
 
     try:
+        df = pd.read_csv(HISTORY_FILE)
 
-        params = {
-            "symbol": symbol,
-            "limit": limit,
-        }
+        if "outcome" not in df.columns:
+            df["outcome"] = "PENDING"
 
-        response = requests.get(
-            BINANCE_BOOK_URL,
-            params=params,
-            timeout=5
-        )
+        records = df.to_dict("records")
 
-        response.raise_for_status()
+        for r in records:
+            if "features" not in r:
+                r["features"] = None
 
-        data = response.json()
-
-        bids = data.get(
-            "bids",
-            []
-        )
-
-        asks = data.get(
-            "asks",
-            []
-        )
-
-        if not bids or not asks:
-            return None
-
-        bids = [
-            (
-                float(price),
-                float(volume)
-            )
-            for price, volume in bids
-        ]
-
-        asks = [
-            (
-                float(price),
-                float(volume)
-            )
-            for price, volume in asks
-        ]
-
-        bid_volume = sum(
-            volume
-            for _, volume in bids
-        )
-
-        ask_volume = sum(
-            volume
-            for _, volume in asks
-        )
-
-        total_volume = (
-            bid_volume +
-            ask_volume
-        )
-
-        if total_volume > 0:
-
-            obi = (
-                bid_volume -
-                ask_volume
-            ) / total_volume
-
-        else:
-
-            obi = 0.0
-
-        best_bid = bids[0][0]
-
-        best_ask = asks[0][0]
-
-        mid_price = (
-            best_bid +
-            best_ask
-        ) / 2.0
-
-        spread = (
-            best_ask -
-            best_bid
-        )
-
-        spread_pct = (
-            spread /
-            mid_price *
-            100
-        )
-
-        return {
-
-            "bid_volume": bid_volume,
-
-            "ask_volume": ask_volume,
-
-            "obi": obi,
-
-            "best_bid": best_bid,
-
-            "best_ask": best_ask,
-
-            "mid_price": mid_price,
-
-            "spread": spread,
-
-            "spread_pct": spread_pct,
-
-        }
+        return records
 
     except Exception:
+        return []
 
+
+def save_history(history):
+    if not history:
+        return
+
+    rows = []
+
+    for item in history:
+        row = dict(item)
+
+        features = row.pop("features", None)
+
+        if isinstance(features, dict):
+            for key, value in features.items():
+                row[f"F_{key}"] = value
+
+        rows.append(row)
+
+    pd.DataFrame(rows).to_csv(
+        HISTORY_FILE,
+        index=False
+    )
+
+
+def load_ml_features_from_history():
+    """
+    Reconstruct saved F_* columns so the ML model can learn
+    from real historical feature values.
+    """
+    if not os.path.exists(HISTORY_FILE):
+        return []
+
+    try:
+        df = pd.read_csv(HISTORY_FILE)
+
+        feature_cols = [
+            f"F_{x}"
+            for x in TenPaperResearchLab().feature_names
+        ]
+
+        if not all(c in df.columns for c in feature_cols):
+            return []
+
+        records = []
+
+        for _, row in df.iterrows():
+            features = {
+                c[2:]: float(row[c])
+                for c in feature_cols
+                if pd.notna(row[c])
+            }
+
+            records.append({
+                "outcome": row.get("outcome", "PENDING"),
+                "features": features
+            })
+
+        return records
+
+    except Exception:
+        return []
+
+
+# ============================================================
+# TRADE LOGIC
+# ============================================================
+def signal_from_score(score):
+    if score >= 0.15:
+        return "LONG"
+    if score <= -0.15:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def create_trade(
+    symbol,
+    timeframe,
+    direction,
+    entry,
+    score,
+    confidence,
+    atr,
+    features
+):
+    # Simple ATR-based paper trade levels.
+    # The engine's directional score remains unchanged.
+    if direction == "LONG":
+        sl = entry - (1.0 * atr)
+        tp1 = entry + (1.5 * atr)
+        tp2 = entry + (2.0 * atr)
+
+    elif direction == "SHORT":
+        sl = entry + (1.0 * atr)
+        tp1 = entry - (1.5 * atr)
+        tp2 = entry - (2.0 * atr)
+
+    else:
         return None
 
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ============================================================
-# TRAJECTORY
-# ============================================================
+    return {
+        "trade_id": str(uuid.uuid4())[:8].upper(),
+        "timestamp": now,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "entry_price": float(entry),
+        "stop_loss": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "exit_price": np.nan,
+        "confidence": float(confidence),
+        "final_score": float(score),
+        "outcome": "PENDING",
+        "pnl_percent": 0.0,
+        "duration_minutes": 0.0,
+        "features": features,
+    }
 
-def create_trajectory(df, horizon):
 
-    if df is None:
-        return [], []
+def update_trade(trade, current_price):
+    if trade["outcome"] != "PENDING":
+        return trade
 
-    if len(df) < 20:
-        return [], []
+    direction = trade["direction"]
+    entry = float(trade["entry_price"])
+    sl = float(trade["stop_loss"])
+    tp2 = float(trade["tp2"])
 
-    close = float(
-        df["Close"].iloc[-1]
-    )
-
-    recent = df[
-        "Close"
-    ].tail(20)
-
-    returns = recent.pct_change().dropna()
-
-    if len(returns) == 0:
-        volatility = 0.001
-    else:
-        volatility = float(
-            returns.std()
-        )
-
-    if not np.isfinite(volatility):
-        volatility = 0.001
-
-    volatility = max(
-        volatility,
-        0.0005
-    )
-
-    # Simple directional trajectory
-    start = float(
-        recent.iloc[0]
-    )
-
-    end = float(
-        recent.iloc[-1]
-    )
-
-    if start == 0:
-        direction = 0
-    else:
-        direction = (
-            end -
-            start
-        ) / start
-
-    if direction >= 0:
-        drift = 1
-    else:
-        drift = -1
-
-    future_prices = []
-
-    price = close
-
-    for i in range(
-        1,
-        horizon + 1
-    ):
-
-        step = (
-            volatility *
-            0.35 *
-            drift
-        )
-
-        price = (
-            price *
-            (1 + step)
-        )
-
-        future_prices.append(
-            price
-        )
-
-    last_time = df[
-        "Time"
-    ].iloc[-1]
-
-    if len(df) >= 2:
-
-        candle_delta = (
-            df["Time"].iloc[-1] -
-            df["Time"].iloc[-2]
-        )
+    if direction == "LONG":
+        hit_sl = current_price <= sl
+        hit_tp = current_price >= tp2
 
     else:
+        hit_sl = current_price >= sl
+        hit_tp = current_price <= tp2
 
-        candle_delta = pd.Timedelta(
-            minutes=15
-        )
+    if hit_sl and hit_tp:
+        # If both are crossed in one polling interval,
+        # use conservative LOSS assumption.
+        trade["outcome"] = "LOSS"
+        trade["exit_price"] = float(sl)
 
-    future_times = []
+    elif hit_sl:
+        trade["outcome"] = "LOSS"
+        trade["exit_price"] = float(sl)
 
-    for i in range(
-        1,
-        horizon + 1
-    ):
+    elif hit_tp:
+        trade["outcome"] = "WIN"
+        trade["exit_price"] = float(tp2)
 
-        future_times.append(
-            last_time +
-            candle_delta * i
-        )
+    if trade["outcome"] in {"WIN", "LOSS"}:
+        exit_price = float(trade["exit_price"])
 
-    return (
-        future_times,
-        future_prices
+        if direction == "LONG":
+            trade["pnl_percent"] = (
+                (exit_price - entry) / entry
+            ) * 100
+
+        else:
+            trade["pnl_percent"] = (
+                (entry - exit_price) / entry
+            ) * 100
+
+        try:
+            start = dt.datetime.strptime(
+                trade["timestamp"],
+                "%Y-%m-%d %H:%M:%S"
+            )
+            trade["duration_minutes"] = (
+                dt.datetime.now() - start
+            ).total_seconds() / 60
+        except Exception:
+            trade["duration_minutes"] = 0.0
+
+    return trade
+
+
+def trade_statistics(history):
+    df = pd.DataFrame(history)
+
+    if df.empty:
+        return {
+            "total": 0,
+            "closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "pending": 0,
+            "win_rate": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "net_pnl": 0.0,
+            "profit_factor": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "expectancy": 0.0,
+        }
+
+    wins = int((df["outcome"] == "WIN").sum())
+    losses = int((df["outcome"] == "LOSS").sum())
+    pending = int((df["outcome"] == "PENDING").sum())
+
+    closed = wins + losses
+    total = len(df)
+
+    win_rate = (
+        wins / closed * 100
+        if closed > 0
+        else 0.0
     )
 
+    pnl = pd.to_numeric(
+        df.get("pnl_percent", 0),
+        errors="coerce"
+    ).fillna(0)
+
+    gross_profit = float(
+        pnl[pnl > 0].sum()
+    )
+
+    gross_loss = float(
+        pnl[pnl < 0].sum()
+    )
+
+    net_pnl = float(pnl.sum())
+
+    profit_factor = (
+        gross_profit / abs(gross_loss)
+        if gross_loss < 0
+        else 0.0
+    )
+
+    avg_win = (
+        gross_profit / wins
+        if wins > 0
+        else 0.0
+    )
+
+    avg_loss = (
+        abs(gross_loss) / losses
+        if losses > 0
+        else 0.0
+    )
+
+    win_prob = wins / closed if closed else 0
+    loss_prob = losses / closed if closed else 0
+
+    expectancy = (
+        win_prob * avg_win
+        - loss_prob * avg_loss
+    )
+
+    return {
+        "total": total,
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+        "win_rate": win_rate,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "net_pnl": net_pnl,
+        "profit_factor": profit_factor,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+    }
+
 
 # ============================================================
-# MAIN SIDEBAR
+# SESSION STATE
 # ============================================================
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = load_history()
 
-st.sidebar.markdown(
-    "## ⚡ Terminal Controls"
-)
+if "lab" not in st.session_state:
+    st.session_state.lab = TenPaperResearchLab()
 
-selected_symbol = st.sidebar.selectbox(
-    "Select Cryptocurrency",
-    list(SYMBOLS.keys()),
+if "last_trade_key" not in st.session_state:
+    st.session_state.last_trade_key = None
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.title("⚡ Terminal Controls")
+
+symbol = st.sidebar.selectbox(
+    "Cryptocurrency",
+    COINS,
     index=0
 )
 
-st.sidebar.markdown(
-    "### Select Timeframe"
+tf_label = st.sidebar.selectbox(
+    "Timeframe",
+    list(TIMEFRAMES.keys()),
+    index=1
 )
 
-timeframe_options = {
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "4h (Intraday)": "4h",
-    "1d": "1d",
-}
-
-selected_tf_label = st.sidebar.selectbox(
-    "",
-    list(timeframe_options.keys()),
-    index=3
+paper_mode = st.sidebar.toggle(
+    "Paper Trading",
+    value=True
 )
 
-selected_interval = (
-    timeframe_options[
-        selected_tf_label
-    ]
-)
-
-st.sidebar.markdown(
-    "### Forecast Horizon Candles"
+auto_refresh = st.sidebar.toggle(
+    "Auto Refresh",
+    value=True
 )
 
 forecast_horizon = st.sidebar.slider(
-    "",
-    min_value=5,
-    max_value=30,
-    value=15
+    "Forecast Candles",
+    5,
+    30,
+    15
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Paper trading only. This terminal does not place real orders."
 )
 
 
 # ============================================================
-# LOAD MARKET DATA
+# REFRESH
 # ============================================================
+# No browser-level hard refresh. This avoids the black-screen flash.
+
+# Streamlit native soft refresh (no full browser reload).
+# It reruns the app without navigating away from the page.
+if auto_refresh and hasattr(st, "fragment"):
+    @st.fragment(run_every="5s")
+    def _refresh_tick():
+        st.empty()
+    _refresh_tick()
+
+
+# ============================================================
+# FETCH DATA
+# ============================================================
+interval, tf_minutes = TIMEFRAMES[tf_label]
 
 df = fetch_klines(
-    selected_symbol,
-    selected_interval,
-    200
+    symbol,
+    interval,
+    150
+)
+
+bids, asks = fetch_order_book(
+    symbol,
+    20
 )
 
 
-# ============================================================
-# ERROR CHECK
-# ============================================================
-
-if df is None:
-
-    st.error(
-        "Unable to load market data."
-    )
-
+if df.empty or len(bids) == 0 or len(asks) == 0:
+    st.error("Unable to fetch live Binance market data.")
     st.stop()
 
 
 # ============================================================
-# CURRENT PRICE
+# ENGINE
 # ============================================================
+lab = st.session_state.lab
 
-close_price = float(
-    df["Close"].iloc[-1]
+training_history = load_ml_features_from_history()
+
+features, score, weights = lab.calculate_all_signals(
+    df,
+    bids,
+    asks,
+    current_inventory=0,
+    performance_history=training_history
 )
 
-previous_close = float(
-    df["Close"].iloc[-2]
-)
+direction = signal_from_score(score)
+
+current_price = float(df["Close"].iloc[-1])
+previous_price = float(df["Close"].iloc[-2])
 
 price_change = (
-    close_price -
-    previous_close
+    (current_price - previous_price)
+    / previous_price
+) * 100
+
+atr = float(
+    (df["High"] - df["Low"])
+    .rolling(14)
+    .mean()
+    .iloc[-1]
 )
 
-price_change_pct = (
-    price_change /
-    previous_close *
-    100
+if not np.isfinite(atr) or atr <= 0:
+    atr = current_price * 0.002
+
+confidence = min(
+    max(abs(score) * 100, 15),
+    95
 )
 
 
 # ============================================================
-# TOP HEADER
+# RISK ENGINE
 # ============================================================
+risk_engine = PowerTradingRiskEngine()
+
+liquidation_volumes = np.array([
+    1000.0,
+    2500.0,
+    500.0
+])
+
+displayed_vol = (
+    float(np.sum(asks[:, 1]))
+    if len(asks)
+    else 1.0
+)
+
+cancelled_vol = displayed_vol * 0.12
+
+volatility = float(
+    df["Close"].pct_change().std() + 1e-8
+)
+
+risk_metrics = risk_engine.calculate_risk_metrics(
+    liquidation_volumes=liquidation_volumes,
+    displayed_vol=displayed_vol,
+    cancelled_vol=cancelled_vol,
+    time_exists=15.0,
+    obs_window=60.0,
+    open_interest=150000.0,
+    leverage=20.0,
+    volatility=volatility
+)
+
+
+# ============================================================
+# CREATE / UPDATE PAPER TRADE
+# ============================================================
+if paper_mode and direction in {"LONG", "SHORT"}:
+    candle_key = (
+        f"{symbol}_{tf_label}_"
+        f"{df['Time'].iloc[-1]}_{direction}"
+    )
+
+    existing = [
+        x for x in st.session_state.trade_history
+        if x.get("trade_key") == candle_key
+    ]
+
+    if not existing:
+        trade = create_trade(
+            symbol=symbol,
+            timeframe=tf_label,
+            direction=direction,
+            entry=current_price,
+            score=score,
+            confidence=confidence,
+            atr=atr,
+            features=features
+        )
+
+        if trade:
+            trade["trade_key"] = candle_key
+            st.session_state.trade_history.insert(
+                0,
+                trade
+            )
+            save_history(
+                st.session_state.trade_history
+            )
+
+
+# Update every pending trade for the current symbol.
+changed = False
+
+for trade in st.session_state.trade_history:
+    if (
+        trade.get("symbol") == symbol
+        and trade.get("outcome") == "PENDING"
+    ):
+        before = trade.get("outcome")
+        update_trade(
+            trade,
+            current_price
+        )
+
+        if before != trade.get("outcome"):
+            changed = True
+
+if changed:
+    save_history(
+        st.session_state.trade_history
+    )
+
+
+# ============================================================
+# HEADER
+# ============================================================
+direction_class = (
+    "green" if direction == "LONG"
+    else "red" if direction == "SHORT"
+    else "blue"
+)
 
 st.markdown(
     f"""
-    <div style="
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        margin-bottom:15px;
-    ">
-
-        <div>
-
-            <h1 style="
-                margin:0;
-                font-size:30px;
-            ">
-                TRI Quant Trading Terminal
-            </h1>
-
-            <div style="
-                color:#94a3b8;
-                margin-top:4px;
-            ">
-                {selected_symbol} • {selected_interval}
-            </div>
-
+    <div class="card">
+        <div style="font-size:22px;font-weight:800;">
+            ⚡ Quant Research Trading Terminal
         </div>
-
-        <div style="
-            text-align:right;
-        ">
-
-            <div style="
-                font-size:28px;
-                font-weight:700;
-            ">
-                ${close_price:,.2f}
-            </div>
-
-            <div style="
-                color:{'#00e676' if price_change >= 0 else '#ff5252'};
-                font-weight:600;
-            ">
-                {price_change_pct:+.2f}%
-            </div>
-
+        <div class="small">
+            Live Binance Data • 12-Feature Research Engine •
+            Risk Engine • Paper Trade Tracker
         </div>
-
     </div>
     """,
     unsafe_allow_html=True
@@ -860,763 +1204,565 @@ st.markdown(
 
 
 # ============================================================
-# MAIN COLUMNS
+# TOP METRICS
 # ============================================================
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 
-left_col, right_col = st.columns(
-    [3.3, 1.2]
-)
-
-
-# ============================================================
-# LEFT: CHART
-# ============================================================
-
-with left_col:
-
+with m1:
     st.markdown(
         f"""
-        <div class="section-title">
-            Price Trajectory & Levels ({selected_symbol})
+        <div class="card">
+            <div class="label">{symbol}</div>
+            <div class="value green">
+                ${current_price:,.6f}
+            </div>
+            <div class="small">
+                {price_change:+.2f}%
+            </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    # --------------------------------------------------------
-    # TRAJECTORY
-    # --------------------------------------------------------
-
-    future_times, forecast_prices = (
-        create_trajectory(
-            df,
-            forecast_horizon
-        )
-    )
-
-    if forecast_prices:
-
-        if forecast_prices[-1] >= close_price:
-            dir_color = "#00e676"
-        else:
-            dir_color = "#ff5252"
-
-    else:
-
-        dir_color = "#38bdf8"
-
-
-    # --------------------------------------------------------
-    # CREATE FIGURE
-    # --------------------------------------------------------
-
-    fig = go.Figure()
-
-
-    # --------------------------------------------------------
-    # CANDLES
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df["Time"],
-
-            open=df["Open"],
-
-            high=df["High"],
-
-            low=df["Low"],
-
-            close=df["Close"],
-
-            name="Candles",
-
-            increasing_line_color="#00e676",
-
-            decreasing_line_color="#ff5252",
-
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # TRAJECTORY
-    # --------------------------------------------------------
-
-    if future_prices:
-
-        fig.add_trace(
-            go.Scatter(
-                x=[
-                    df["Time"].iloc[-1]
-                ] + future_times,
-
-                y=[
-                    close_price
-                ] + list(
-                    forecast_prices
-                ),
-
-                mode="lines+markers",
-
-                name="Trajectory",
-
-                line=dict(
-                    color=dir_color,
-                    width=2,
-                    dash="dot"
-                ),
-
-                marker=dict(
-                    size=4
-                )
-
-            )
-        )
-
-
-    # ========================================================
-    # TRI LINE ANALYSIS
-    # ========================================================
-
-    tri_levels = get_all_tri_levels(
-        selected_symbol
-    )
-
-
-    # --------------------------------------------------------
-    # ADD TRI HORIZONTAL LEVELS
-    # --------------------------------------------------------
-
-    for tri_tf, tri in tri_levels.items():
-
-        tri_color = TRI_COLORS.get(
-            tri_tf,
-            "#38bdf8"
-        )
-
-
-        # ----------------------------------------------------
-        # BODY 50%
-        # ----------------------------------------------------
-
-        fig.add_hline(
-            y=tri["body_50"],
-
-            line_color=tri_color,
-
-            line_width=3,
-
-            line_dash="solid",
-
-            opacity=0.95,
-
-            layer="above"
-        )
-
-
-        # ----------------------------------------------------
-        # UPPER WICK 50%
-        # ----------------------------------------------------
-
-        fig.add_hline(
-            y=tri["upper_50"],
-
-            line_color=tri_color,
-
-            line_width=1,
-
-            line_dash="dot",
-
-            opacity=0.70,
-
-            layer="above"
-        )
-
-
-        # ----------------------------------------------------
-        # LOWER WICK 50%
-        # ----------------------------------------------------
-
-        fig.add_hline(
-            y=tri["lower_50"],
-
-            line_color=tri_color,
-
-            line_width=1,
-
-            line_dash="dot",
-
-            opacity=0.70,
-
-            layer="above"
-        )
-
-
-    # ========================================================
-    # BEAM / BASE / SL
-    # ========================================================
-
-    # Simple levels based on recent price range
-    recent_high = float(
-        df["High"].tail(50).max()
-    )
-
-    recent_low = float(
-        df["Low"].tail(50).min()
-    )
-
-    beam_level = recent_high
-
-    base_level = recent_low
-
-    risk_range = (
-        recent_high -
-        recent_low
-    )
-
-    sl_val = close_price - (
-        risk_range * 0.10
-    )
-
-
-    # --------------------------------------------------------
-    # BEAM
-    # --------------------------------------------------------
-
-    fig.add_hline(
-        y=beam_level,
-
-        line_dash="dash",
-
-        line_color="#00e676",
-
-        opacity=0.8,
-
-        annotation_text=(
-            f"BEAM: ${beam_level:,.2f}"
-        ),
-
-        annotation_position="right",
-
-        annotation_font=dict(
-            size=9,
-            color="#00e676"
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # BASE
-    # --------------------------------------------------------
-
-    fig.add_hline(
-        y=base_level,
-
-        line_dash="dash",
-
-        line_color="#ff5252",
-
-        opacity=0.8,
-
-        annotation_text=(
-            f"BASE: ${base_level:,.2f}"
-        ),
-
-        annotation_position="right",
-
-        annotation_font=dict(
-            size=9,
-            color="#ff5252"
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # STOP LOSS
-    # --------------------------------------------------------
-
-    fig.add_hline(
-        y=sl_val,
-
-        line_dash="dot",
-
-        line_color="#ff5252",
-
-        opacity=0.65,
-
-        annotation_text=(
-            f"SL: ${sl_val:,.2f}"
-        ),
-
-        annotation_position="right",
-
-        annotation_font=dict(
-            size=9,
-            color="#ff5252"
-        )
-    )
-
-
-    # ========================================================
-    # TRI LEGEND
-    # ========================================================
-
-    tri_legend_parts = []
-
-    for tri_tf in tri_levels.keys():
-
-        tri_color = TRI_COLORS.get(
-            tri_tf,
-            "#38bdf8"
-        )
-
-        tri_legend_parts.append(
-            f"""
-            <span style="
-                color:{tri_color};
-                font-weight:700;
-                margin-right:10px;
-            ">
-                {tri_tf}
-            </span>
-            """
-        )
-
-
-    tri_legend_html = "".join(
-        tri_legend_parts
-    )
-
-
-    # --------------------------------------------------------
-    # LEGEND ABOVE CHART
-    # --------------------------------------------------------
-
+with m2:
     st.markdown(
         f"""
-        <div style="
-            background:#111622;
-            border:1px solid #202938;
-            border-radius:8px;
-            padding:8px 12px;
-            margin-bottom:8px;
-            font-size:11px;
-            white-space:nowrap;
-            overflow-x:auto;
-        ">
-
-            <span style="
-                color:#94a3b8;
-                margin-right:8px;
-            ">
-                TRI:
-            </span>
-
-            {tri_legend_html}
-
-            <span style="
-                color:#94a3b8;
-                margin-left:8px;
-            ">
-                ━ Body 50%
-            </span>
-
-            <span style="
-                color:#64748b;
-                margin-left:8px;
-            ">
-                ··· Wick 50%
-            </span>
-
+        <div class="card">
+            <div class="label">FINAL SCORE</div>
+            <div class="value {direction_class}">
+                {score:+.4f}
+            </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-
-    # ========================================================
-    # CHART DESIGN
-    # ========================================================
-
-    fig.update_layout(
-
-        template="plotly_dark",
-
-        height=560,
-
-        xaxis_rangeslider_visible=False,
-
-        paper_bgcolor="#111622",
-
-        plot_bgcolor="#111622",
-
-        margin=dict(
-            l=10,
-            r=95,
-            t=20,
-            b=10
-        ),
-
-        hovermode="x unified",
-
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.01,
-            xanchor="right",
-            x=1
-        ),
-
-        xaxis=dict(
-            showgrid=False
-        ),
-
-        yaxis=dict(
-            showgrid=True,
-            gridcolor="#202938",
-            fixedrange=False
-        )
-
-    )
-
-
-    # ========================================================
-    # DISPLAY CHART
-    # ========================================================
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "displaylogo": False,
-            "scrollZoom": True,
-            "displayModeBar": True
-        }
-    )
-
-
-# ============================================================
-# RIGHT SIDE
-# ============================================================
-
-with right_col:
-
+with m3:
     st.markdown(
-        """
-        <div class="section-title">
-            Market Microstructure & OB
+        f"""
+        <div class="card">
+            <div class="label">SIGNAL</div>
+            <div class="value {direction_class}">
+                {direction}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m4:
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="label">CONFIDENCE</div>
+            <div class="value blue">
+                {confidence:.1f}%
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m5:
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="label">TIMEFRAME</div>
+            <div class="value blue">
+                {tf_label}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m6:
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="label">ML STATUS</div>
+            <div class="value">
+                {"TRAINED" if lab.is_model_trained else "BASE"}
+            </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
 
-    # ========================================================
-    # ORDER BOOK
-    # ========================================================
-
-    orderbook = fetch_orderbook(
-        selected_symbol,
-        50
-    )
-
-
-    if orderbook is not None:
-
-        bid_volume = orderbook[
-            "bid_volume"
-        ]
-
-        ask_volume = orderbook[
-            "ask_volume"
-        ]
-
-        obi = orderbook[
-            "obi"
-        ]
-
-        best_bid = orderbook[
-            "best_bid"
-        ]
-
-        best_ask = orderbook[
-            "best_ask"
-        ]
-
-        spread = orderbook[
-            "spread"
-        ]
-
-        spread_pct = orderbook[
-            "spread_pct"
-        ]
-
-
-        # ----------------------------------------------------
-        # OBI STATUS
-        # ----------------------------------------------------
-
-        if obi >= 0.15:
-
-            obi_status = "BUY PRESSURE"
-
-            obi_color = "#00e676"
-
-        elif obi <= -0.15:
-
-            obi_status = "SELL PRESSURE"
-
-            obi_color = "#ff5252"
-
-        else:
-
-            obi_status = "BALANCED"
-
-            obi_color = "#facc15"
-
-
-        # ====================================================
-        # ORDER BOOK CARD
-        # ====================================================
-
-        st.markdown(
-            f"""
-            <div class="ob-card">
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Bid Volume
-                    </span>
-
-                    <b style="
-                        color:#00e676;
-                    ">
-                        {bid_volume:,.2f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Ask Volume
-                    </span>
-
-                    <b style="
-                        color:#ff5252;
-                    ">
-                        {ask_volume:,.2f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        OBI
-                    </span>
-
-                    <b style="
-                        color:{obi_color};
-                    ">
-                        {obi:+.4f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Status
-                    </span>
-
-                    <b style="
-                        color:{obi_color};
-                    ">
-                        {obi_status}
-                    </b>
-
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-        # ====================================================
-        # PRICE / SPREAD CARD
-        # ====================================================
-
-        st.markdown(
-            f"""
-            <div class="ob-card">
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Best Bid
-                    </span>
-
-                    <b style="
-                        color:#00e676;
-                    ">
-                        ${best_bid:,.2f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Best Ask
-                    </span>
-
-                    <b style="
-                        color:#ff5252;
-                    ">
-                        ${best_ask:,.2f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Spread
-                    </span>
-
-                    <b>
-                        ${spread:,.4f}
-                    </b>
-
-                </div>
-
-
-                <div class="ob-row">
-
-                    <span class="ob-label">
-                        Spread %
-                    </span>
-
-                    <b>
-                        {spread_pct:.4f}%
-                    </b>
-
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
+# ============================================================
+# TRADE SETUP
+# ============================================================
+st.subheader("🎯 Current Trade Setup")
+
+if direction in {"LONG", "SHORT"}:
+    if direction == "LONG":
+        sl = current_price - atr
+        tp1 = current_price + 1.5 * atr
+        tp2 = current_price + 2.0 * atr
     else:
+        sl = current_price + atr
+        tp1 = current_price - 1.5 * atr
+        tp2 = current_price - 2.0 * atr
 
-        st.warning(
-            "Order book data unavailable."
-        )
+    rr = 2.0
 
+    t1, t2, t3, t4, t5 = st.columns(5)
 
-    # ========================================================
-    # TRI LEVEL TABLE
-    # ========================================================
-
-    st.markdown(
-        """
-        <div class="section-title"
-             style="font-size:20px;margin-top:15px;">
-            TRI Levels
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-    if tri_levels:
-
-        for tri_tf, tri in tri_levels.items():
-
-            tri_color = TRI_COLORS.get(
-                tri_tf,
-                "#38bdf8"
-            )
+    for col, label, value, cls in [
+        (t1, "ENTRY", current_price, "blue"),
+        (t2, "STOP LOSS", sl, "red"),
+        (t3, "TP1", tp1, "green"),
+        (t4, "TP2", tp2, "green"),
+        (t5, "RISK / REWARD", rr, "blue"),
+    ]:
+        with col:
+            suffix = "R" if label == "RISK / REWARD" else ""
+            prefix = "" if label == "RISK / REWARD" else "$"
 
             st.markdown(
                 f"""
-                <div class="tri-box">
-
-                    <div style="
-                        color:{tri_color};
-                        font-weight:700;
-                        margin-bottom:8px;
-                    ">
-                        {tri_tf}
+                <div class="card">
+                    <div class="label">{label}</div>
+                    <div class="value {cls}">
+                        {prefix}{value:,.6f}{suffix}
                     </div>
-
-                    <div class="ob-row">
-
-                        <span class="ob-label">
-                            Body 50%
-                        </span>
-
-                        <b>
-                            ${tri["body_50"]:,.2f}
-                        </b>
-
-                    </div>
-
-                    <div class="ob-row">
-
-                        <span class="ob-label">
-                            Upper 50%
-                        </span>
-
-                        <b>
-                            ${tri["upper_50"]:,.2f}
-                        </b>
-
-                    </div>
-
-                    <div class="ob-row">
-
-                        <span class="ob-label">
-                            Lower 50%
-                        </span>
-
-                        <b>
-                            ${tri["lower_50"]:,.2f}
-                        </b>
-
-                    </div>
-
                 </div>
                 """,
                 unsafe_allow_html=True
             )
+else:
+    st.info(
+        "Current 12-feature ensemble is NEUTRAL. "
+        "No new directional paper trade is created."
+    )
+
+
+# ============================================================
+# CHART
+# ============================================================
+left, right = st.columns([2.5, 1])
+
+with left:
+    st.subheader("📈 Price & Trajectory")
+
+    future_times = [
+        df["Time"].iloc[-1]
+        + pd.Timedelta(minutes=tf_minutes * i)
+        for i in range(1, forecast_horizon + 1)
+    ]
+
+    if direction == "LONG":
+        target = current_price + 2.0 * atr
+        steps = np.linspace(0, np.pi / 2, forecast_horizon)
+        forecast = current_price + (
+            target - current_price
+        ) * np.sin(steps)
+
+    elif direction == "SHORT":
+        target = current_price - 2.0 * atr
+        steps = np.linspace(0, np.pi / 2, forecast_horizon)
+        forecast = current_price - (
+            current_price - target
+        ) * np.sin(steps)
+
+    else:
+        forecast = np.repeat(
+            current_price,
+            forecast_horizon
+        )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df["Time"],
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Price"
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[df["Time"].iloc[-1]] + future_times,
+            y=[current_price] + list(forecast),
+            mode="lines+markers",
+            name="Trajectory",
+            line=dict(
+                width=2,
+                dash="dot"
+            )
+        )
+    )
+
+    # ========================================================
+    # TRI LINE OVERLAY — ADDED TO EXISTING CHART ONLY
+    # ========================================================
+    tri_levels = get_all_tri_levels(symbol)
+    fig = add_tri_lines(fig, tri_levels)
+
+    if direction in {"LONG", "SHORT"}:
+        fig.add_hline(
+            y=sl,
+            line_dash="dash",
+            annotation_text="SL"
+        )
+        fig.add_hline(
+            y=tp1,
+            line_dash="dash",
+            annotation_text="TP1"
+        )
+        fig.add_hline(
+            y=tp2,
+            line_dash="dash",
+            annotation_text="TP2"
+        )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=450,
+        xaxis_rangeslider_visible=False,
+        paper_bgcolor="#111622",
+        plot_bgcolor="#111622",
+        margin=dict(l=5, r=5, t=10, b=5)
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
+
+# ============================================================
+# RISK
+# ============================================================
+with right:
+    st.subheader("🛡️ Risk Engine")
+
+    for label, value in [
+        ("LTZ Score", risk_metrics["LTZ_Score"]),
+        ("Spoof Score", risk_metrics["Spoof_Score"]),
+        ("Squeeze Risk", risk_metrics["Squeeze_Risk"]),
+        ("Market Risk", risk_metrics["Market_Risk"]),
+    ]:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="label">{label}</div>
+                <div class="value orange">
+                    {value:,.4f}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# 12 FEATURES
+# ============================================================
+st.markdown("---")
+st.subheader("🔬 12 Research Features")
+
+feature_rows = []
+
+for name in lab.feature_names:
+    value = float(features.get(name, 0.0))
+
+    if value > 0.1:
+        status = "PASS / BULLISH"
+    elif value < -0.1:
+        status = "FAIL / BEARISH"
+    else:
+        status = "NEUTRAL"
+
+    feature_rows.append({
+        "Feature": name,
+        "Value": round(value, 4),
+        "Weight": f"{weights[name] * 100:.2f}%",
+        "Status": status
+    })
+
+feature_df = pd.DataFrame(feature_rows)
+
+st.dataframe(
+    feature_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ============================================================
+# ORDER BOOK
+# ============================================================
+st.subheader("📚 Order Book — Top 20")
+
+bid_volume = float(np.sum(bids[:, 1]))
+ask_volume = float(np.sum(asks[:, 1]))
+
+obi = (
+    (bid_volume - ask_volume)
+    / (bid_volume + ask_volume + 1e-8)
+)
+
+best_bid = float(bids[0, 0])
+best_ask = float(asks[0, 0])
+
+spread = best_ask - best_bid
+spread_pct = (
+    spread / ((best_bid + best_ask) / 2)
+) * 100
+
+o1, o2, o3, o4, o5 = st.columns(5)
+
+for col, label, value in [
+    (o1, "Bid Volume", bid_volume),
+    (o2, "Ask Volume", ask_volume),
+    (o3, "OBI", obi),
+    (o4, "Best Bid", best_bid),
+    (o5, "Best Ask", best_ask),
+]:
+    with col:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="label">{label}</div>
+                <div class="value blue">{value:,.6f}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+st.caption(
+    f"Spread: {spread:,.8f} ({spread_pct:.4f}%)"
+)
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+st.markdown("---")
+st.subheader("🏆 Win Rate & Performance")
+
+st.caption(
+    "Win Rate = Wins ÷ (Wins + Losses). Pending trades are NOT included "
+    "in the denominator. Total Trades = Closed + Pending."
+)
+
+stats = trade_statistics(
+    st.session_state.trade_history
+)
+
+p1, p2, p3, p4, p5, p6 = st.columns(6)
+
+metrics = [
+    ("TOTAL TRADES", stats["total"]),
+    ("CLOSED", stats["closed"]),
+    ("WINS", stats["wins"]),
+    ("LOSSES", stats["losses"]),
+    ("PENDING", stats["pending"]),
+    ("WIN RATE", stats["win_rate"]),
+]
+
+for col, (label, value) in zip(
+    [p1, p2, p3, p4, p5, p6],
+    metrics
+):
+    with col:
+        if label == "WIN RATE":
+            display = f"{value:.2f}%"
+            cls = "green"
+        else:
+            display = str(value)
+            cls = "blue"
+
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="label">{label}</div>
+                <div class="value {cls}">
+                    {display}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+q1, q2, q3, q4 = st.columns(4)
+
+for col, label, value in [
+    (q1, "Net PnL %", stats["net_pnl"]),
+    (q2, "Profit Factor", stats["profit_factor"]),
+    (q3, "Average Win %", stats["avg_win"]),
+    (q4, "Average Loss %", stats["avg_loss"]),
+]:
+    with col:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="label">{label}</div>
+                <div class="value blue">
+                    {value:.3f}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# FILTERED PERFORMANCE
+# ============================================================
+st.subheader("🔎 Win Rate Checker")
+
+history_df = pd.DataFrame(
+    st.session_state.trade_history
+)
+
+if not history_df.empty:
+    fc1, fc2, fc3 = st.columns(3)
+
+    with fc1:
+        coin_filter = st.selectbox(
+            "Coin",
+            ["ALL"] + sorted(
+                history_df["symbol"].dropna().unique().tolist()
+            )
+        )
+
+    with fc2:
+        tf_filter = st.selectbox(
+            "Timeframe",
+            ["ALL"] + sorted(
+                history_df["timeframe"].dropna().unique().tolist()
+            )
+        )
+
+    with fc3:
+        dir_filter = st.selectbox(
+            "Direction",
+            ["ALL", "LONG", "SHORT"]
+        )
+
+    filtered = history_df.copy()
+
+    if coin_filter != "ALL":
+        filtered = filtered[
+            filtered["symbol"] == coin_filter
+        ]
+
+    if tf_filter != "ALL":
+        filtered = filtered[
+            filtered["timeframe"] == tf_filter
+        ]
+
+    if dir_filter != "ALL":
+        filtered = filtered[
+            filtered["direction"] == dir_filter
+        ]
+
+    fwins = int(
+        (filtered["outcome"] == "WIN").sum()
+    )
+    flosses = int(
+        (filtered["outcome"] == "LOSS").sum()
+    )
+    fclosed = fwins + flosses
+
+    fwinrate = (
+        fwins / fclosed * 100
+        if fclosed > 0
+        else 0.0
+    )
+
+    fpending = int((filtered["outcome"] == "PENDING").sum())
+    ftotal = len(filtered)
+
+    st.success(
+        f"Filtered — Total: {ftotal} | Closed: {fclosed} | "
+        f"Pending: {fpending} | Wins: {fwins} | "
+        f"Losses: {flosses} | Win Rate: {fwinrate:.2f}%"
+    )
+
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    checker_metrics = [
+        ("TOTAL", ftotal),
+        ("CLOSED", fclosed),
+        ("WINS", fwins),
+        ("LOSSES", flosses),
+        ("WIN RATE", f"{fwinrate:.2f}%"),
+    ]
+    for col, (label, value) in zip(
+        [fc1, fc2, fc3, fc4, fc5], checker_metrics
+    ):
+        with col:
+            cls = "green" if label in {"WINS", "WIN RATE"} else (
+                "red" if label == "LOSSES" else "blue"
+            )
+            st.markdown(
+                f"""
+                <div class="card">
+                    <div class="label">{label}</div>
+                    <div class="value {cls}">{value}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# ============================================================
+# TRADE HISTORY
+# ============================================================
+st.subheader("📋 Trade History")
+
+if st.session_state.trade_history:
+    history_view = pd.DataFrame(
+        st.session_state.trade_history
+    )
+
+    columns = [
+        "trade_id",
+        "timestamp",
+        "symbol",
+        "timeframe",
+        "direction",
+        "entry_price",
+        "stop_loss",
+        "tp1",
+        "tp2",
+        "exit_price",
+        "confidence",
+        "final_score",
+        "outcome",
+        "pnl_percent",
+        "duration_minutes",
+    ]
+
+    columns = [
+        c for c in columns
+        if c in history_view.columns
+    ]
+
+    st.dataframe(
+        history_view[columns],
+        use_container_width=True,
+        hide_index=True,
+        height=360
+    )
+else:
+    st.info("No paper trades yet.")
 
 
 # ============================================================
 # FOOTER
 # ============================================================
-
-st.markdown(
-    """
-    <div style="
-        text-align:center;
-        color:#64748b;
-        font-size:11px;
-        padding:20px 0 5px 0;
-    ">
-        TRI Quant Trading Terminal • Market data via Binance
-    </div>
-    """,
-    unsafe_allow_html=True
+st.markdown("---")
+st.caption(
+    "Research/paper-trading terminal. "
+    "Signals are model outputs, not guaranteed predictions. "
+    "No live order execution is implemented."
 )
