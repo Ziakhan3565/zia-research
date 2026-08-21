@@ -624,40 +624,33 @@ def get_all_tri_levels(symbol):
     return levels
 
 
-def add_tri_lines(fig, tri_levels):
-    """Add TRI horizontal levels without annotations or side labels."""
+def add_tri_lines(fig, tri_levels, visible_low=None, visible_high=None):
+    """Add clean TRI horizontal levels. Far-away levels are hidden so the
+    current candle chart stays readable; the calculation itself is unchanged."""
     for tri_tf, tri in tri_levels.items():
         color = TRI_COLORS.get(tri_tf, "#38bdf8")
 
-        # Body 50% — thick solid line.
-        fig.add_hline(
-            y=tri["body_50"],
-            line_color=color,
-            line_width=3,
-            line_dash="solid",
-            opacity=0.95,
-            layer="above",
-        )
+        for level_name, width, opacity, dash in [
+            ("body_50", 3, 0.95, "solid"),
+            ("upper_50", 1, 0.45, "dot"),
+            ("lower_50", 1, 0.45, "dot"),
+        ]:
+            level = float(tri[level_name])
 
-        # Upper Wick 50% — thin dotted line.
-        fig.add_hline(
-            y=tri["upper_50"],
-            line_color=color,
-            line_width=1,
-            line_dash="dot",
-            opacity=0.75,
-            layer="above",
-        )
+            # Do not let distant yearly/monthly levels compress the chart.
+            if visible_low is not None and level < visible_low:
+                continue
+            if visible_high is not None and level > visible_high:
+                continue
 
-        # Lower Wick 50% — thin dotted line.
-        fig.add_hline(
-            y=tri["lower_50"],
-            line_color=color,
-            line_width=1,
-            line_dash="dot",
-            opacity=0.75,
-            layer="above",
-        )
+            fig.add_hline(
+                y=level,
+                line_color=color,
+                line_width=width,
+                line_dash=dash,
+                opacity=opacity,
+                layer="above",
+            )
 
     return fig
 
@@ -1399,10 +1392,34 @@ with left:
     )
 
     # ========================================================
-    # TRI LINE OVERLAY — ADDED TO EXISTING CHART ONLY
+    # TRI LINE OVERLAY — CLEAN / ADAPTIVE VISIBILITY
     # ========================================================
     tri_levels = get_all_tri_levels(symbol)
-    fig = add_tri_lines(fig, tri_levels)
+
+    # Keep the visible chart focused on the current market area.
+    # This prevents distant yearly/monthly TRI levels from stretching
+    # the y-axis and making the candles tiny.
+    recent_df = df.tail(min(120, len(df)))
+
+    chart_low = float(recent_df["Low"].min())
+    chart_high = float(recent_df["High"].max())
+
+    if len(forecast) > 0:
+        chart_low = min(chart_low, float(np.min(forecast)))
+        chart_high = max(chart_high, float(np.max(forecast)))
+
+    chart_span = max(chart_high - chart_low, current_price * 0.005)
+    chart_padding = chart_span * 0.08
+
+    visible_low = chart_low - chart_padding
+    visible_high = chart_high + chart_padding
+
+    fig = add_tri_lines(
+        fig,
+        tri_levels,
+        visible_low=visible_low,
+        visible_high=visible_high,
+    )
 
     if direction in {"LONG", "SHORT"}:
         fig.add_hline(
@@ -1423,11 +1440,35 @@ with left:
 
     fig.update_layout(
         template="plotly_dark",
-        height=450,
+        height=500,
         xaxis_rangeslider_visible=False,
         paper_bgcolor="#111622",
         plot_bgcolor="#111622",
-        margin=dict(l=5, r=5, t=10, b=5)
+        margin=dict(l=10, r=70, t=10, b=10),
+        hovermode="x unified",
+        xaxis=dict(
+            showgrid=False,
+            rangeslider_visible=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#202938",
+            zeroline=False,
+            fixedrange=False,
+            range=[visible_low, visible_high],
+            autorange=False,
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=1.0,
+            xanchor="right",
+            x=1.0,
+            bgcolor="rgba(17,22,34,0.75)",
+            bordercolor="#202938",
+            borderwidth=1,
+            font=dict(size=10),
+        ),
     )
 
     st.plotly_chart(
