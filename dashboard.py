@@ -2,23 +2,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import requests
-import streamlit as st
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-st.set_page_config(
-    page_title="TRI Line Engine Analysis",
-    page_icon="📈",
-    layout="wide"
-)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
 BINANCE_API = "https://api.binance.com/api/v3/klines"
+
 DEFAULT_SYMBOL = "BTCUSDT"
 
 TIMEFRAME_MAPPING = {
@@ -34,39 +27,59 @@ TIMEFRAME_MAPPING = {
     "1M": "1m",
 }
 
+
 # ============================================================
 # DATA CLASS
 # ============================================================
+
 @dataclass
 class TRILineLevels:
     timeframe: str
+
     open: float
     high: float
     low: float
     close: float
+
     body_high: float
     body_low: float
+
     body_50: float
     upper_50: float
     lower_50: float
+
     candle_time: int
+
 
 # ============================================================
 # TRI LINE ENGINE
 # ============================================================
+
 class TRILineEngine:
+
     def __init__(
         self,
         symbol: str = DEFAULT_SYMBOL,
         enabled_timeframes: Optional[Dict[str, bool]] = None,
         timeout: int = 10,
     ):
+
         self.symbol = symbol.upper()
         self.timeout = timeout
 
+        # ----------------------------------------------------
+        # DEFAULT TIMEFRAME SETTINGS
+        # ----------------------------------------------------
+
         self.enabled = {tf: True for tf in TIMEFRAME_MAPPING}
+
+        # User settings override
         if enabled_timeframes:
             self.enabled.update(enabled_timeframes)
+
+        # ----------------------------------------------------
+        # COLORS
+        # ----------------------------------------------------
 
         self.colors = {
             "YEARLY": "sky",
@@ -81,43 +94,89 @@ class TRILineEngine:
             "1M": "cyan",
         }
 
+    # ========================================================
+    # CHANGE SYMBOL
+    # ========================================================
+
     def set_symbol(self, symbol: str):
         self.symbol = symbol.upper()
 
-    def get_klines(self, interval: str, limit: int = 5):
+    # ========================================================
+    # ENABLE / DISABLE TIMEFRAME
+    # ========================================================
+
+    def set_timeframe(self, timeframe: str, enabled: bool):
+        timeframe = timeframe.upper()
+        if timeframe not in TIMEFRAME_MAPPING:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        self.enabled[timeframe] = enabled
+
+    # ========================================================
+    # CHANGE COLOR
+    # ========================================================
+
+    def set_color(self, timeframe: str, color: str):
+        timeframe = timeframe.upper()
+        if timeframe not in TIMEFRAME_MAPPING:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        self.colors[timeframe] = color
+
+    # ========================================================
+    # GET BINANCE CANDLES (Supports historical depth up to limit)
+    # ========================================================
+
+    def get_klines(
+        self,
+        interval: str,
+        limit: int = 100,  # 3 months tak ka data ya zyada candles ke liye limit barha sakte hain
+    ):
+
         params = {
             "symbol": self.symbol,
             "interval": interval,
             "limit": limit,
         }
+
         response = requests.get(
             BINANCE_API,
             params=params,
             timeout=self.timeout,
         )
+
         response.raise_for_status()
+
         return response.json()
 
-    def get_previous_candle(self, interval: str):
-        candles = self.get_klines(interval=interval, limit=5)
-        if len(candles) < 2:
-            raise RuntimeError(f"Not enough candle data for {interval}")
+    # ========================================================
+    # GET HISTORICAL CANDLES LIST (e.g., last 3 months candles)
+    # ========================================================
+
+    def get_historical_candles(
+        self,
+        interval: str,
+        limit: int = 100
+    ) -> List[dict]:
         
-        candle = candles[-2]
-        return {
-            "time": int(candle[0]),
-            "open": float(candle[1]),
-            "high": float(candle[2]),
-            "low": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5]),
-        }
+        candles = self.get_klines(interval=interval, limit=limit)
+        
+        formatted_candles = []
+        for candle in candles:
+            formatted_candles.append({
+                "time": int(candle[0]),
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "volume": float(candle[5]),
+            })
+            
+        return formatted_candles
 
-    def calculate_levels(self, timeframe: str) -> TRILineLevels:
-        timeframe = timeframe.upper()
-        interval = TIMEFRAME_MAPPING[timeframe]
-        candle = self.get_previous_candle(interval)
+    # ========================================================
+    # CALCULATE TRI LEVELS FOR A SPECIFIC CANDLE INDEX
+    # ========================================================
 
+    def calculate_levels_from_candle(self, timeframe: str, candle: dict) -> TRILineLevels:
         o = candle["open"]
         h = candle["high"]
         l = candle["low"]
@@ -125,6 +184,7 @@ class TRILineEngine:
 
         body_high = max(o, c)
         body_low = min(o, c)
+
         body_50 = (body_high + body_low) / 2.0
         upper_50 = (h + body_high) / 2.0
         lower_50 = (l + body_low) / 2.0
@@ -143,59 +203,95 @@ class TRILineEngine:
             candle_time=candle["time"],
         )
 
+    # ========================================================
+    # CALCULATE LATEST LEVELS
+    # ========================================================
+
+    def calculate_levels(
+        self,
+        timeframe: str,
+    ) -> TRILineLevels:
+
+        timeframe = timeframe.upper()
+        interval = TIMEFRAME_MAPPING[timeframe]
+
+        candles = self.get_historical_candles(interval, limit=5)
+        if len(candles) < 2:
+            raise RuntimeError(f"Not enough candle data for {interval}")
+
+        # [-2] = previous completed candle
+        return self.calculate_levels_from_candle(timeframe, candles[-2])
+
+    # ========================================================
+    # CALCULATE ALL ENABLED TIMEFRAMES
+    # ========================================================
+
     def calculate_all(self):
+
         results = {}
+
         for timeframe in TIMEFRAME_MAPPING:
+
             if not self.enabled.get(timeframe, False):
                 continue
+
             try:
                 levels = self.calculate_levels(timeframe)
                 results[timeframe] = levels
+
             except Exception as error:
                 results[timeframe] = {"error": str(error)}
+
         return results
 
-# ============================================================
-# STREAMLIT UI APP
-# ============================================================
-st.title("📊 TRI Line Market Analysis Hub")
-st.markdown("Analyze multi-timeframe key levels (**1m to Yearly**) seamlessly.")
+    # ========================================================
+    # PRINT LEVELS
+    # ========================================================
 
-# Sidebar controls
-st.sidebar.header("Configuration")
-selected_symbol = st.sidebar.text_input("Trading Symbol", value="BTCUSDT").upper()
+    def print_levels(self):
 
-engine = TRILineEngine(symbol=selected_symbol)
+        results = self.calculate_all()
 
-st.sidebar.subheader("Select Timeframes")
-enabled_tfs = {}
-for tf in TIMEFRAME_MAPPING.keys():
-    enabled_tfs[tf] = st.sidebar.checkbox(tf, value=True)
+        print()
+        print("=" * 75)
+        print(f"TRI LINE ANALYSIS | {self.symbol}")
+        print("=" * 75)
 
-engine.enabled = enabled_tfs
+        for timeframe, value in results.items():
 
-if st.sidebar.button("Fetch & Calculate Levels", type="primary"):
-    with st.spinner("Fetching data from Binance..."):
-        data = engine.calculate_all()
-        
-    st.success(f"Successfully calculated levels for {selected_symbol}!")
-    
-    for tf, val in data.items():
-        with st.expander(f"Timeframe: [{tf}]", expanded=True):
-            if isinstance(val, TRILineLevels):
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Open", f"{val.open:.4f}")
-                col2.metric("High", f"{val.high:.4f}")
-                col3.metric("Low", f"{val.low:.4f}")
-                col4.metric("Close", f"{val.close:.4f}")
-                
-                st.markdown("---")
-                
-                s1, s2, s3 = st.columns(3)
-                s1.metric("Body 50%", f"{val.body_50:.4f}")
-                s2.metric("Upper Wick 50%", f"{val.upper_50:.4f}")
-                s3.metric("Lower Wick 50%", f"{val.lower_50:.4f}")
+            print()
+            print(f"[{timeframe}]")
+
+            if isinstance(value, TRILineLevels):
+                print(f"Color       : {self.colors[timeframe]}")
+                print(f"Open        : {value.open:.8f}")
+                print(f"High        : {value.high:.8f}")
+                print(f"Low         : {value.low:.8f}")
+                print(f"Close       : {value.close:.8f}")
+                print(f"Body 50%    : {value.body_50:.8f}")
+                print(f"Upper 50%   : {value.upper_50:.8f}")
+                print(f"Lower 50%   : {value.lower_50:.8f}")
             else:
-                st.error(f"Error fetching data: {val.get('error')}")
-else:
-    st.info("👈 Click 'Fetch & Calculate Levels' in the sidebar to load the market data.")
+                print(f"ERROR       : {value['error']}")
+
+        print()
+        print("=" * 75)
+
+
+# ============================================================
+# SIMPLE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    engine = TRILineEngine(symbol="BTCUSDT")
+
+    # Enable all timeframes including 1m, 5m etc.
+    for tf in TIMEFRAME_MAPPING.keys():
+        engine.set_timeframe(tf, True)
+
+    engine.print_levels()
+    
+    # Example: Agar aapko pichlay 3 mahino ka data ya multiple candles nikalni hon:
+    # historical_1h = engine.get_historical_candles("1h", limit=200)
+    # print(f"Fetched {len(historical_1h)} candles for 1H timeframe.")
