@@ -1,591 +1,534 @@
-import streamlit as st
-import pandas as pd
-import requests
-import plotly.graph_objects as go
+# ==========================================
+# TRI LINE ANALYSIS ENGINE
+# ==========================================
 
-
-# ============================================================
-# PAGE
-# ============================================================
-
-st.set_page_config(
-    page_title="TRI LINE ANALYSIS",
-    page_icon="📊",
-    layout="wide"
-)
-
-
-# ============================================================
-# BINANCE
-# ============================================================
-
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-
-
-# ============================================================
-# TIMEFRAME CONFIG
-# ============================================================
-
-TIMEFRAMES = {
-    "Yearly": "1y",
-    "Monthly": "1M",
-    "Weekly": "1w",
-    "Daily": "1d",
+TRI_TIMEFRAMES = {
+    "YEARLY": "1M",      # yearly monthly candles se calculate hoga
+    "MONTHLY": "1M",
+    "WEEKLY": "1w",
+    "DAILY": "1d",
     "4H": "4h",
     "1H": "1h",
     "30M": "30m",
     "15M": "15m",
 }
 
-
-# ============================================================
-# DEFAULT COLORS
-# ============================================================
-
-DEFAULT_COLORS = {
-    "Yearly": "#87CEEB",      # Sky
-    "Monthly": "#FF0000",     # Red
-    "Weekly": "#00A000",      # Green
-    "Daily": "#000000",       # Black
-    "4H": "#FFA500",          # Orange
-    "1H": "#800080",          # Purple
-    "30M": "#006400",         # Dark Green
-    "15M": "#0000FF",         # Blue
+TRI_COLORS = {
+    "YEARLY": "#87CEEB",     # Sky
+    "MONTHLY": "#FF0000",    # Red
+    "WEEKLY": "#00C853",     # Green
+    "DAILY": "#FFFFFF",      # White on dark dashboard
+    "4H": "#FFA500",         # Orange
+    "1H": "#A855F7",         # Purple
+    "30M": "#006400",        # Dark Green
+    "15M": "#2196F3",        # Blue
 }
 
 
-# ============================================================
-# GET CANDLES
-# ============================================================
+@st.cache_data(ttl=15)
+def fetch_tri_candle(symbol, interval):
 
-@st.cache_data(ttl=10)
-def get_candles(symbol, interval, limit=500):
+    try:
 
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
+        url = "https://data-api.binance.vision/api/v3/klines"
 
-    response = requests.get(
-        BINANCE_URL,
-        params=params,
-        timeout=15
-    )
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": 5,
+        }
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "buy_base",
-        "buy_quote",
-        "ignore",
-    ]
-
-    df = pd.DataFrame(data, columns=columns)
-
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms"
-    )
-
-    df["close_time"] = pd.to_datetime(
-        df["close_time"],
-        unit="ms"
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
+        response = requests.get(
+            url,
+            params=params,
+            timeout=5
         )
 
-    return df
+        response.raise_for_status()
 
+        data = response.json()
 
-# ============================================================
-# GET PREVIOUS COMPLETED CANDLE
-# ============================================================
+        if not isinstance(data, list) or len(data) < 2:
+            return None
 
-@st.cache_data(ttl=10)
-def get_previous_candle(symbol, interval):
+        columns = [
+            "Open_Time",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "Close_Time",
+            "QAV",
+            "NAT",
+            "TBBAV",
+            "TBQAV",
+            "Ignore",
+        ]
 
-    df = get_candles(
-        symbol,
-        interval,
-        10
-    )
+        temp = pd.DataFrame(
+            data,
+            columns=columns
+        )
 
-    if len(df) < 2:
+        for col in [
+            "Open",
+            "High",
+            "Low",
+            "Close"
+        ]:
+            temp[col] = pd.to_numeric(
+                temp[col],
+                errors="coerce"
+            )
+
+        # Previous completed candle
+        return temp.iloc[-2]
+
+    except Exception:
         return None
 
-    # Last candle can still be forming.
-    # [-2] = previous completed candle.
-    return df.iloc[-2]
 
+@st.cache_data(ttl=30)
+def fetch_tri_yearly_candle(symbol):
 
-# ============================================================
-# TRI LINE CALCULATION
-# ============================================================
+    try:
+
+        # Binance does not provide a direct "1y"
+        # kline interval, therefore fetch monthly candles
+        # and construct yearly candles.
+
+        url = "https://data-api.binance.vision/api/v3/klines"
+
+        params = {
+            "symbol": symbol,
+            "interval": "1M",
+            "limit": 36,
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=5
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, list) or len(data) < 13:
+            return None
+
+        columns = [
+            "Open_Time",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "Close_Time",
+            "QAV",
+            "NAT",
+            "TBBAV",
+            "TBQAV",
+            "Ignore",
+        ]
+
+        temp = pd.DataFrame(
+            data,
+            columns=columns
+        )
+
+        temp["Time"] = pd.to_datetime(
+            temp["Open_Time"],
+            unit="ms",
+            utc=True
+        )
+
+        for col in [
+            "Open",
+            "High",
+            "Low",
+            "Close"
+        ]:
+            temp[col] = pd.to_numeric(
+                temp[col],
+                errors="coerce"
+            )
+
+        # Build yearly candles
+        yearly = (
+            temp
+            .set_index("Time")
+            .resample("YE")
+            .agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+            })
+            .dropna()
+        )
+
+        if len(yearly) < 2:
+            return None
+
+        # Previous completed yearly candle
+        previous_year = yearly.iloc[-2]
+
+        return previous_year
+
+    except Exception:
+        return None
+
 
 def calculate_tri_levels(candle):
 
     if candle is None:
         return None
 
-    o = float(candle["open"])
-    h = float(candle["high"])
-    l = float(candle["low"])
-    c = float(candle["close"])
-
-    # --------------------------------------------------------
-    # BODY
-    # --------------------------------------------------------
-
-    body_high = max(o, c)
-    body_low = min(o, c)
-
-    # --------------------------------------------------------
-    # BODY 50%
-    # --------------------------------------------------------
-
-    body_50 = (
-        body_high + body_low
-    ) / 2.0
-
-    # --------------------------------------------------------
-    # UPPER WICK 50%
-    # --------------------------------------------------------
-
-    upper_50 = (
-        h + body_high
-    ) / 2.0
-
-    # --------------------------------------------------------
-    # LOWER WICK 50%
-    # --------------------------------------------------------
-
-    lower_50 = (
-        l + body_low
-    ) / 2.0
-
-    return {
-        "body_50": body_50,
-        "upper_50": upper_50,
-        "lower_50": lower_50,
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-    }
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("⚙️ TRI LINE SETTINGS")
-
-symbol = st.sidebar.text_input(
-    "Symbol",
-    value="BTCUSDT"
-).upper().strip()
-
-st.sidebar.subheader("Timeframes")
-
-enabled = {}
-
-for timeframe in TIMEFRAMES:
-
-    enabled[timeframe] = st.sidebar.checkbox(
-        timeframe,
-        value=True,
-        key=f"enable_{timeframe}"
-    )
-
-
-# ============================================================
-# COLOR SETTINGS
-# ============================================================
-
-st.sidebar.subheader("Line Colors")
-
-colors = {}
-
-for timeframe in TIMEFRAMES:
-
-    colors[timeframe] = st.sidebar.color_picker(
-        f"{timeframe} Color",
-        DEFAULT_COLORS[timeframe],
-        key=f"color_{timeframe}"
-    )
-
-
-# ============================================================
-# LINE WIDTH
-# ============================================================
-
-st.sidebar.subheader("Line Width")
-
-body_width = st.sidebar.slider(
-    "Body 50% Width",
-    min_value=1,
-    max_value=6,
-    value=3
-)
-
-wick_width = st.sidebar.slider(
-    "Wick 50% Width",
-    min_value=1,
-    max_value=6,
-    value=1
-)
-
-
-# ============================================================
-# CHART SETTINGS
-# ============================================================
-
-st.sidebar.subheader("Chart")
-
-chart_timeframe = st.sidebar.selectbox(
-    "Candle Timeframe",
-    [
-        "15m",
-        "30m",
-        "1h",
-        "4h",
-        "1d",
-    ],
-    index=0
-)
-
-candle_limit = st.sidebar.slider(
-    "Candles",
-    min_value=100,
-    max_value=1000,
-    value=300,
-    step=100
-)
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title("📊 TRI LINE ANALYSIS")
-
-st.caption(
-    f"{symbol} — Previous Completed Candle 50% Analysis"
-)
-
-
-# ============================================================
-# LOAD CHART DATA
-# ============================================================
-
-try:
-
-    chart_df = get_candles(
-        symbol,
-        chart_timeframe,
-        candle_limit
-    )
-
-except Exception as error:
-
-    st.error(
-        f"Market data error: {error}"
-    )
-
-    st.stop()
-
-
-# ============================================================
-# CANDLE CHART
-# ============================================================
-
-fig = go.Figure()
-
-
-fig.add_trace(
-    go.Candlestick(
-        x=chart_df["open_time"],
-
-        open=chart_df["open"],
-        high=chart_df["high"],
-        low=chart_df["low"],
-        close=chart_df["close"],
-
-        name=symbol,
-
-        increasing_line_color="#26A69A",
-        decreasing_line_color="#EF5350",
-
-        increasing_fillcolor="#26A69A",
-        decreasing_fillcolor="#EF5350",
-    )
-)
-
-
-# ============================================================
-# TRI LINES
-# ============================================================
-
-tri_results = {}
-
-
-for timeframe, interval in TIMEFRAMES.items():
-
-    if not enabled[timeframe]:
-        continue
-
     try:
 
-        candle = get_previous_candle(
+        o = float(candle["Open"])
+        h = float(candle["High"])
+        l = float(candle["Low"])
+        c = float(candle["Close"])
+
+        # ==========================================
+        # BODY
+        # ==========================================
+
+        body_high = max(o, c)
+        body_low = min(o, c)
+
+        # ==========================================
+        # BODY 50%
+        # ==========================================
+
+        body_50 = (
+            body_high + body_low
+        ) / 2.0
+
+        # ==========================================
+        # UPPER WICK 50%
+        # ==========================================
+
+        upper_50 = (
+            h + body_high
+        ) / 2.0
+
+        # ==========================================
+        # LOWER WICK 50%
+        # ==========================================
+
+        lower_50 = (
+            l + body_low
+        ) / 2.0
+
+        return {
+            "body_50": body_50,
+            "upper_50": upper_50,
+            "lower_50": lower_50,
+        }
+
+    except Exception:
+        return None
+
+
+def get_all_tri_levels(symbol):
+
+    levels = {}
+
+    # ==========================================
+    # YEARLY
+    # ==========================================
+
+    yearly_candle = fetch_tri_yearly_candle(symbol)
+
+    yearly_levels = calculate_tri_levels(
+        yearly_candle
+    )
+
+    if yearly_levels is not None:
+
+        levels["YEARLY"] = yearly_levels
+
+    # ==========================================
+    # MONTHLY / WEEKLY / DAILY / INTRADAY
+    # ==========================================
+
+    for name, interval in TRI_TIMEFRAMES.items():
+
+        if name == "YEARLY":
+            continue
+
+        candle = fetch_tri_candle(
             symbol,
             interval
         )
 
-        levels = calculate_tri_levels(
+        tri = calculate_tri_levels(
             candle
         )
 
-        if levels is None:
-            continue
+        if tri is not None:
 
-        tri_results[timeframe] = levels
+            levels[name] = tri
 
-        # ----------------------------------------------------
-        # BODY 50%
-        # ----------------------------------------------------
+    return levels
+    fig = go.Figure()
 
-        fig.add_hline(
-            y=levels["body_50"],
+fig.add_trace(
+    go.Candlestick(
+        x=df["Time"],
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="Candles",
+        increasing_line_color="#00e676",
+        decreasing_line_color="#ff5252"
+    )
+)
 
-            line_color=colors[timeframe],
-            line_width=body_width,
-
-            line_dash="solid",
-
-            annotation_text=(
-                f"{timeframe} Body 50%"
-            ),
-
-            annotation_position="right",
-
-            annotation_font_size=10,
-
-            layer="above",
+fig.add_trace(
+    go.Scatter(
+        x=[df["Time"].iloc[-1]] + future_times,
+        y=[close_p] + list(forecast_prices),
+        mode="lines+markers",
+        name="Trajectory",
+        line=dict(
+            color=dir_color,
+            width=2,
+            dash="dot"
         )
+    )
+)# ==========================================
+# TRI LINE OVERLAY
+# ==========================================
 
-        # ----------------------------------------------------
-        # UPPER WICK 50%
-        # ----------------------------------------------------
+tri_levels = get_all_tri_levels(
+    selected_symbol
+)
 
-        fig.add_hline(
-            y=levels["upper_50"],
 
-            line_color=colors[timeframe],
-            line_width=wick_width,
+# ==========================================
+# ADD TRI HORIZONTAL LEVELS
+# ==========================================
 
-            line_dash="dot",
+for tri_tf, tri in tri_levels.items():
 
-            annotation_text=(
-                f"{timeframe} Upper 50%"
-            ),
+    tri_color = TRI_COLORS.get(
+        tri_tf,
+        "#38bdf8"
+    )
 
-            annotation_position="right",
+    # ------------------------------------------
+    # BODY 50%
+    # ------------------------------------------
 
-            annotation_font_size=8,
+    fig.add_hline(
+        y=tri["body_50"],
+        line_color=tri_color,
+        line_width=3,
+        line_dash="solid",
+        opacity=0.95,
+        annotation_text=(
+            f"{tri_tf} • BODY 50%"
+        ),
+        annotation_position="right",
+        annotation_font=dict(
+            size=9,
+            color=tri_color
+        ),
+        layer="above"
+    )
 
-            layer="above",
+    # ------------------------------------------
+    # UPPER WICK 50%
+    # ------------------------------------------
+
+    fig.add_hline(
+        y=tri["upper_50"],
+        line_color=tri_color,
+        line_width=1,
+        line_dash="dot",
+        opacity=0.75,
+        annotation_text=(
+            f"{tri_tf} • UPPER 50%"
+        ),
+        annotation_position="right",
+        annotation_font=dict(
+            size=8,
+            color=tri_color
+        ),
+        layer="above"
+    )
+
+    # ------------------------------------------
+    # LOWER WICK 50%
+    # ------------------------------------------
+
+    fig.add_hline(
+        y=tri["lower_50"],
+        line_color=tri_color,
+        line_width=1,
+        line_dash="dot",
+        opacity=0.75,
+        annotation_text=(
+            f"{tri_tf} • LOWER 50%"
+        ),
+        annotation_position="right",
+        annotation_font=dict(
+            size=8,
+            color=tri_color
+        ),
+        layer="above"
+    )fig = go.Figure()
+
+# ==========================================
+# EXISTING CANDLES
+# ==========================================
+
+fig.add_trace(
+    go.Candlestick(
+        x=df["Time"],
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="Candles",
+        increasing_line_color="#00e676",
+        decreasing_line_color="#ff5252"
+    )
+)
+
+
+# ==========================================
+# EXISTING TRAJECTORY
+# ==========================================
+
+fig.add_trace(
+    go.Scatter(
+        x=[df["Time"].iloc[-1]] + future_times,
+        y=[close_p] + list(forecast_prices),
+        mode="lines+markers",
+        name="Trajectory",
+        line=dict(
+            color=dir_color,
+            width=2,
+            dash="dot"
         )
-
-        # ----------------------------------------------------
-        # LOWER WICK 50%
-        # ----------------------------------------------------
-
-        fig.add_hline(
-            y=levels["lower_50"],
-
-            line_color=colors[timeframe],
-            line_width=wick_width,
-
-            line_dash="dot",
-
-            annotation_text=(
-                f"{timeframe} Lower 50%"
-            ),
-
-            annotation_position="right",
-
-            annotation_font_size=8,
-
-            layer="above",
-        )
-
-    except Exception as error:
-
-        st.warning(
-            f"{timeframe}: {error}"
-        )
+    )
+)
 
 
-# ============================================================
-# CURRENT PRICE
-# ============================================================
+# ==========================================
+# TRI LINE ANALYSIS
+# ==========================================
 
-current_price = float(
-    chart_df["close"].iloc[-1]
+tri_levels = get_all_tri_levels(
+    selected_symbol
+)
+
+for tri_tf, tri in tri_levels.items():
+
+    tri_color = TRI_COLORS[tri_tf]
+
+    # BODY 50%
+    fig.add_hline(
+        y=tri["body_50"],
+        line_color=tri_color,
+        line_width=3,
+        line_dash="solid",
+        opacity=0.95,
+        annotation_text=f"{tri_tf} • BODY 50%",
+        annotation_position="right",
+        annotation_font=dict(
+            size=9,
+            color=tri_color
+        ),
+        layer="above"
+    )
+
+    # UPPER WICK 50%
+    fig.add_hline(
+        y=tri["upper_50"],
+        line_color=tri_color,
+        line_width=1,
+        line_dash="dot",
+        opacity=0.75,
+        annotation_text=f"{tri_tf} • UPPER 50%",
+        annotation_position="right",
+        annotation_font=dict(
+            size=8,
+            color=tri_color
+        ),
+        layer="above"
+    )
+
+    # LOWER WICK 50%
+    fig.add_hline(
+        y=tri["lower_50"],
+        line_color=tri_color,
+        line_width=1,
+        line_dash="dot",
+        opacity=0.75,
+        annotation_text=f"{tri_tf} • LOWER 50%",
+        annotation_position="right",
+        annotation_font=dict(
+            size=8,
+            color=tri_color
+        ),
+        layer="above"
+    )
+
+
+# ==========================================
+# EXISTING BEAM / BASE / SL
+# ==========================================
+
+fig.add_hline(
+    y=beam_level,
+    line_dash="dash",
+    line_color="#00e676",
+    annotation_text=f"BEAM: ${beam_level:,.2f}"
 )
 
 fig.add_hline(
-    y=current_price,
-
-    line_color="#FFD700",
-    line_width=2,
-
+    y=base_level,
     line_dash="dash",
+    line_color="#ff5252",
+    annotation_text=f"BASE: ${base_level:,.2f}"
+)
 
-    annotation_text=(
-        f"PRICE {current_price:,.2f}"
-    ),
-
-    annotation_position="right",
-
-    annotation_font_size=11,
+fig.add_hline(
+    y=sl_val,
+    line_dash="dot",
+    line_color="#ff5252",
+    annotation_text=f"SL: ${sl_val:,.2f}"
 )
 
 
-# ============================================================
-# CHART DESIGN
-# ============================================================
+# ==========================================
+# EXISTING CHART DESIGN
+# ==========================================
 
 fig.update_layout(
-
-    height=750,
-
     template="plotly_dark",
-
+    height=420,
     xaxis_rangeslider_visible=False,
-
-    hovermode="x unified",
-
+    paper_bgcolor="#111622",
+    plot_bgcolor="#111622",
     margin=dict(
-        l=20,
-        r=180,
-        t=50,
-        b=20,
-    ),
-
-    title={
-        "text": (
-            f"{symbol} | "
-            f"{chart_timeframe.upper()} | "
-            "TRI LINE"
-        ),
-        "x": 0.5,
-    },
-
-    xaxis=dict(
-        showgrid=True,
-        gridcolor="rgba(128,128,128,0.15)",
-    ),
-
-    yaxis=dict(
-        showgrid=True,
-        gridcolor="rgba(128,128,128,0.15)",
-        fixedrange=False,
-    ),
-
+        l=10,
+        r=150,
+        t=10,
+        b=10
+    )
 )
-
-
-# ============================================================
-# DISPLAY CHART
-# ============================================================
 
 st.plotly_chart(
     fig,
-    use_container_width=True,
-    config={
-        "displaylogo": False,
-        "scrollZoom": True,
-        "responsive": True,
-    }
-)
-
-
-# ============================================================
-# LEVEL TABLE
-# ============================================================
-
-st.subheader("📐 TRI LINE Levels")
-
-
-table_data = []
-
-
-for timeframe, levels in tri_results.items():
-
-    table_data.append({
-
-        "Timeframe": timeframe,
-
-        "Body 50%": round(
-            levels["body_50"],
-            4
-        ),
-
-        "Upper 50%": round(
-            levels["upper_50"],
-            4
-        ),
-
-        "Lower 50%": round(
-            levels["lower_50"],
-            4
-        ),
-
-        "Color": colors[timeframe],
-    })
-
-
-if table_data:
-
-    table_df = pd.DataFrame(
-        table_data
-    )
-
-    st.dataframe(
-        table_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# CURRENT PRICE INFO
-# ============================================================
-
-st.metric(
-    "Current Price",
-    f"{current_price:,.4f}"
+    use_container_width=True
 )
