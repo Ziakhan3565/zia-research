@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
@@ -117,12 +118,12 @@ class TenPaperResearchLab:
         except Exception:
             scaled_features = feature_vector
 
-        # --- MACHINE LEARNING ENSEMBLE PREDICTION (FIXED & ENHANCED) ---
+        # --- MACHINE LEARNING ENSEMBLE PREDICTION ---
         if performance_history and len(performance_history) >= 5:
             try:
                 X_train = []
                 y_train = []
-                for hist in performance_history[-30:]: # Last 30 records
+                for hist in performance_history[-30:]:
                     stored_feat = hist.get("features")
                     if stored_feat and len(stored_feat) == len(self.feature_names):
                         X_train.append([stored_feat[k] for k in self.feature_names])
@@ -151,7 +152,7 @@ class TenPaperResearchLab:
             except Exception:
                 pass
 
-        # --- ENHANCEMENT: DYNAMIC WEIGHT ADAPTATION ---
+        # --- DYNAMIC WEIGHT ADAPTATION ---
         if performance_history and len(performance_history) > 0:
             last_perf = performance_history[-1]
             if "feature_contributions" in last_perf and last_perf.get("outcome") == "WIN":
@@ -162,7 +163,7 @@ class TenPaperResearchLab:
                 if total_w > 0:
                     self.dynamic_weights = {k: w / total_w for k, w in self.dynamic_weights.items()}
 
-        # Compute final score via ML Probability or Weighted Linear Ensemble
+        # Compute final score
         if self.is_model_trained:
             try:
                 ml_prob = self.ml_model.predict_proba(scaled_features)[0][1]
@@ -205,3 +206,63 @@ class PowerTradingRiskEngine:
             "Dynamic_SL": dynamic_sl,
             "Dynamic_TP": dynamic_tp
         }
+
+
+# --- NEW CHART PLOTTING FUNCTION FOR CANDLES ---
+def plot_signals_on_chart(df, final_score, risk_metrics):
+    """
+    Yeh function candles ke upar signals, buy/sell markers aur SL/TP levels plot karega.
+    """
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index,
+        open=df['Open'], high=df['High'],
+        low=df['Low'], close=df['Close'],
+        name='Candles'
+    )])
+
+    last_price = df['Close'].iloc[-1]
+    last_time = df.index[-1]
+
+    # Buy Signal Marker & Levels
+    if final_score > 0.5:
+        fig.add_trace(go.Scatter(
+            x=[last_time], y=[last_price],
+            mode='markers+text',
+            marker=dict(size=12, color='green', symbol='triangle-up'),
+            text=["BUY SIGNAL"],
+            textposition="bottom center",
+            name='Signal'
+        ))
+        
+        sl_price = last_price * (1 - risk_metrics['Dynamic_SL'])
+        tp_price = last_price * (1 + risk_metrics['Dynamic_TP'])
+        
+        fig.add_hline(y=sl_price, line_dash="dash", line_color="red", annotation_text="Dynamic SL")
+        fig.add_hline(y=tp_price, line_dash="dash", line_color="green", annotation_text="Dynamic TP")
+
+    # Sell Signal Marker & Levels
+    elif final_score < -0.5:
+        fig.add_trace(go.Scatter(
+            x=[last_time], y=[last_price],
+            mode='markers+text',
+            marker=dict(size=12, color='red', symbol='triangle-down'),
+            text=["SELL SIGNAL"],
+            textposition="top center",
+            name='Signal'
+        ))
+        
+        sl_price = last_price * (1 + risk_metrics['Dynamic_SL'])
+        tp_price = last_price * (1 - risk_metrics['Dynamic_TP'])
+        
+        fig.add_hline(y=sl_price, line_dash="dash", line_color="red", annotation_text="Dynamic SL")
+        fig.add_hline(y=tp_price, line_dash="dash", line_color="green", annotation_text="Dynamic TP")
+
+    fig.update_layout(
+        title="Live Research Lab Chart with Signals & SL/TP",
+        xaxis_title="Time",
+        yaxis_title="Price",
+        template="plotly_dark",
+        height=600
+    )
+    
+    return fig
