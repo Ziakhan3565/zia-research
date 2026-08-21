@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from sklearn.preprocessing::StandardScaler
+from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
