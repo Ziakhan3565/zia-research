@@ -26,6 +26,19 @@ def set_leverage_and_margin(symbol, leverage):
     except Exception as e:
         print(f"⚠️ Leverage/Margin error for {symbol}: {e}")
 
+def has_open_position(symbol):
+    """MEXC par check karta hai ke is symbol ki koi active futures position hai ya nahi"""
+    try:
+        # MEXC swap/futures se positions fetch karein
+        positions = mexc.fetch_positions([symbol])
+        for pos in positions:
+            # Agar contracts ki quantity 0 se zyada hai, matlab position khuli hui hai
+            if float(pos.get('contracts', 0)) > 0:
+                return True
+    except Exception as e:
+        print(f"⚠️ Position check error for {symbol}: {e}")
+    return False
+
 def execute_futures_trade(symbol, side, amount_usdt, leverage, tp_pct, sl_pct):
     """MEXC Futures par Market Order aur TP/SL lagana"""
     try:
@@ -52,16 +65,9 @@ def execute_futures_trade(symbol, side, amount_usdt, leverage, tp_pct, sl_pct):
         if side == 'buy':
             tp_price = current_price * (1 + tp_pct / 100)
             sl_price = current_price * (1 - sl_pct / 100)
-            close_side = 'sell'
         else:
             tp_price = current_price * (1 - tp_pct / 100)
             sl_price = current_price * (1 + sl_pct / 100)
-            close_side = 'buy'
-
-        # Optional: Exchange-side TP/SL limit/stop orders (agar MEXC swap support kare)
-        # Aap chahein toh inhe uncomment kar sakte hain ya management loop mein handle kar sakte hain:
-        # mexc.create_order(symbol, 'limit', close_side, contract_size, tp_price, {'reduceOnly': True})
-        # mexc.create_order(symbol, 'stop_market', close_side, contract_size, None, {'stopPrice': sl_price, 'reduceOnly': True})
 
         print(f"🎯 Target Set -> TP: {tp_price:.4f} | SL: {sl_price:.4f}")
 
@@ -70,7 +76,7 @@ def execute_futures_trade(symbol, side, amount_usdt, leverage, tp_pct, sl_pct):
 
 def run_bot():
     processed_signals = set()
-    print("🤖 Bot Engine Ready & Listening for Signals... (Press Ctrl+C to stop)")
+    print("🤖 Bot Engine Ready & Listening for Signals (with Anti-Overlap Lock)... (Press Ctrl+C to stop)")
 
     while True:
         # 1. Config Load Karein
@@ -93,23 +99,29 @@ def run_bot():
             try:
                 df = pd.read_csv("signal_history.csv")
                 if not df.empty:
-                    # Sab se latest signal uthane ke liye tail/iloc[-1] ya sorted check karein
+                    # Sab se latest signal uthane ke liye iloc[-1] use karein
                     latest = df.iloc[-1] 
                     sig_id = f"{latest.get('timestamp')}_{latest.get('symbol')}_{latest.get('signal', '')}"
                     
                     symbol = latest['symbol']
-                    # Signal column check (1 matlab Long/Buy, 0 matlab Short/Sell)
                     raw_signal = latest.get('signal', None)
                     side = 'buy' if raw_signal == 1 else 'sell'
 
-                    # Agar naya signal hai aur selected coins ki list mein mojood hai
+                    # Agar signal naya hai aur selected coins ki list mein hai
                     if sig_id not in processed_signals and symbol in cfg.get("selected_coins", []):
+                        
+                        # --- ANTI-OVERLAP LOCK: Check if position is already active on exchange ---
+                        if has_open_position(symbol):
+                            print(f"🔒 Active position already running on MEXC for {symbol}. Skipping new signal.")
+                            processed_signals.add(sig_id) # Isay process man kar ignore kar dein taakh baar baar print na ho
+                            continue
+
                         leverage = cfg.get("leverage", 5)
                         trade_amount = cfg.get("trade_amount", 10.0)
                         tp_pct = cfg.get("tp_pct", 0.6)
                         sl_pct = cfg.get("sl_pct", 0.4)
 
-                        print(f"\n🚀 New Signal Detected: {symbol} | Side: {side.upper()}")
+                        print(f"\n🚀 New Signal Approved: {symbol} | Side: {side.upper()}")
                         
                         # Leverage Set Karein
                         set_leverage_and_margin(symbol, leverage)
