@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List
@@ -11,7 +12,6 @@ import requests
 # ============================================================
 
 BINANCE_API = "https://api.binance.com/api/v3/klines"
-
 DEFAULT_SYMBOL = "BTCUSDT"
 
 TIMEFRAME_MAPPING = {
@@ -35,19 +35,15 @@ TIMEFRAME_MAPPING = {
 @dataclass
 class TRILineLevels:
     timeframe: str
-
     open: float
     high: float
     low: float
     close: float
-
     body_high: float
     body_low: float
-
     body_50: float
     upper_50: float
     lower_50: float
-
     candle_time: int
 
 
@@ -61,25 +57,14 @@ class TRILineEngine:
         self,
         symbol: str = DEFAULT_SYMBOL,
         enabled_timeframes: Optional[Dict[str, bool]] = None,
-        timeout: int = 10,
+        timeout: int = 15,
     ):
-
         self.symbol = symbol.upper()
         self.timeout = timeout
 
-        # ----------------------------------------------------
-        # DEFAULT TIMEFRAME SETTINGS
-        # ----------------------------------------------------
-
         self.enabled = {tf: True for tf in TIMEFRAME_MAPPING}
-
-        # User settings override
         if enabled_timeframes:
             self.enabled.update(enabled_timeframes)
-
-        # ----------------------------------------------------
-        # COLORS
-        # ----------------------------------------------------
 
         self.colors = {
             "YEARLY": "sky",
@@ -94,16 +79,8 @@ class TRILineEngine:
             "1M": "cyan",
         }
 
-    # ========================================================
-    # CHANGE SYMBOL
-    # ========================================================
-
     def set_symbol(self, symbol: str):
         self.symbol = symbol.upper()
-
-    # ========================================================
-    # ENABLE / DISABLE TIMEFRAME
-    # ========================================================
 
     def set_timeframe(self, timeframe: str, enabled: bool):
         timeframe = timeframe.upper()
@@ -111,54 +88,33 @@ class TRILineEngine:
             raise ValueError(f"Unsupported timeframe: {timeframe}")
         self.enabled[timeframe] = enabled
 
-    # ========================================================
-    # CHANGE COLOR
-    # ========================================================
-
     def set_color(self, timeframe: str, color: str):
         timeframe = timeframe.upper()
         if timeframe not in TIMEFRAME_MAPPING:
             raise ValueError(f"Unsupported timeframe: {timeframe}")
         self.colors[timeframe] = color
 
-    # ========================================================
-    # GET BINANCE CANDLES (Supports historical depth up to limit)
-    # ========================================================
-
-    def get_klines(
-        self,
-        interval: str,
-        limit: int = 100,  # 3 months tak ka data ya zyada candles ke liye limit barha sakte hain
-    ):
-
+    def get_klines(self, interval: str, limit: int = 100):
         params = {
             "symbol": self.symbol,
             "interval": interval,
             "limit": limit,
         }
+        try:
+            print(f"Connecting to Binance for [{interval}]...")
+            response = requests.get(
+                BINANCE_API,
+                params=params,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"-> Network Error on {interval}: {e}")
+            raise
 
-        response = requests.get(
-            BINANCE_API,
-            params=params,
-            timeout=self.timeout,
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    # ========================================================
-    # GET HISTORICAL CANDLES LIST (e.g., last 3 months candles)
-    # ========================================================
-
-    def get_historical_candles(
-        self,
-        interval: str,
-        limit: int = 100
-    ) -> List[dict]:
-        
+    def get_historical_candles(self, interval: str, limit: int = 100) -> List[dict]:
         candles = self.get_klines(interval=interval, limit=limit)
-        
         formatted_candles = []
         for candle in candles:
             formatted_candles.append({
@@ -169,12 +125,7 @@ class TRILineEngine:
                 "close": float(candle[4]),
                 "volume": float(candle[5]),
             })
-            
         return formatted_candles
-
-    # ========================================================
-    # CALCULATE TRI LEVELS FOR A SPECIFIC CANDLE INDEX
-    # ========================================================
 
     def calculate_levels_from_candle(self, timeframe: str, candle: dict) -> TRILineLevels:
         o = candle["open"]
@@ -203,65 +154,36 @@ class TRILineEngine:
             candle_time=candle["time"],
         )
 
-    # ========================================================
-    # CALCULATE LATEST LEVELS
-    # ========================================================
-
-    def calculate_levels(
-        self,
-        timeframe: str,
-    ) -> TRILineLevels:
-
+    def calculate_levels(self, timeframe: str) -> TRILineLevels:
         timeframe = timeframe.upper()
         interval = TIMEFRAME_MAPPING[timeframe]
 
-        candles = self.get_historical_candles(interval, limit=5)
+        candles = self.get_historical_candles(interval, limit=10)
         if len(candles) < 2:
             raise RuntimeError(f"Not enough candle data for {interval}")
 
-        # [-2] = previous completed candle
         return self.calculate_levels_from_candle(timeframe, candles[-2])
 
-    # ========================================================
-    # CALCULATE ALL ENABLED TIMEFRAMES
-    # ========================================================
-
     def calculate_all(self):
-
         results = {}
-
         for timeframe in TIMEFRAME_MAPPING:
-
             if not self.enabled.get(timeframe, False):
                 continue
-
             try:
                 levels = self.calculate_levels(timeframe)
                 results[timeframe] = levels
-
             except Exception as error:
                 results[timeframe] = {"error": str(error)}
-
         return results
 
-    # ========================================================
-    # PRINT LEVELS
-    # ========================================================
-
     def print_levels(self):
-
         results = self.calculate_all()
-
-        print()
-        print("=" * 75)
+        print("\n" + "=" * 75)
         print(f"TRI LINE ANALYSIS | {self.symbol}")
         print("=" * 75)
 
         for timeframe, value in results.items():
-
-            print()
-            print(f"[{timeframe}]")
-
+            print(f"\n[{timeframe}]")
             if isinstance(value, TRILineLevels):
                 print(f"Color       : {self.colors[timeframe]}")
                 print(f"Open        : {value.open:.8f}")
@@ -274,8 +196,7 @@ class TRILineEngine:
             else:
                 print(f"ERROR       : {value['error']}")
 
-        print()
-        print("=" * 75)
+        print("\n" + "=" * 75)
 
 
 # ============================================================
@@ -283,15 +204,12 @@ class TRILineEngine:
 # ============================================================
 
 if __name__ == "__main__":
+    print("Script started successfully. Fetching market levels...")
+    try:
+        engine = TRILineEngine(symbol="BTCUSDT")
+        engine.print_levels()
+    except Exception as err:
+        print(f"Critical Error: {err}")
 
-    engine = TRILineEngine(symbol="BTCUSDT")
-
-    # Enable all timeframes including 1m, 5m etc.
-    for tf in TIMEFRAME_MAPPING.keys():
-        engine.set_timeframe(tf, True)
-
-    engine.print_levels()
-    
-    # Example: Agar aapko pichlay 3 mahino ka data ya multiple candles nikalni hon:
-    # historical_1h = engine.get_historical_candles("1h", limit=200)
-    # print(f"Fetched {len(historical_1h)} candles for 1H timeframe.")
+    # Yeh line ensure karegi ke terminal window foran band na ho
+    input("\nPress Enter to exit...")
