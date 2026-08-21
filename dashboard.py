@@ -195,14 +195,14 @@ COINS_LIST = [
 TIMEFRAME_MAP = {
     "1m (Scalping)": ("1m", 1),
     "15m (Medium TF)": ("15m", 15),
-    "30m (Medium TF)": ("30m", 30),
     "1h (Intraday)": ("1h", 60),
-    "4h (Intraday)": ("4h", 240),
+    "4h (Macro 2023-2026)": ("4h", 240),
+    "1d (Daily Full History)": ("1d", 1440),
 }
 
 st.sidebar.markdown("### ⚡ Terminal Controls")
 selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
-selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1)
+selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=3) # Default 4h for macro view
 forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
 
 st.sidebar.markdown("---")
@@ -213,31 +213,44 @@ api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
 # ==========================================
-# 5. DATA FETCHING (PAGINATION FOR MAX HISTORY)
+# 5. DATA FETCHING (2023 TO 2026 FULL HISTORY PAGINATION)
 # ==========================================
-@st.cache_data(ttl=300)
-def fetch_klines_data(symbol, tf_key, total_candles=2500):
-    binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("30m" if "30m" in tf_key else ("1h" if "1h" in tf_key else "4h")))
+@st.cache_data(ttl=600)
+def fetch_klines_data(symbol, tf_key):
+    binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("1h" if "1h" in tf_key else ("4h" if "4h" in tf_key else "1d")))
     url = "https://data-api.binance.vision/api/v3/klines"
     
     all_data = []
     limit = 1000
-    end_time = None
+    
+    # 2023 se data shuru karne ke liye start time (Timestamp in milliseconds for Jan 1, 2023)
+    start_time = int(datetime.datetime(2023, 1, 1).timestamp() * 1000)
+    current_start_time = start_time
     
     try:
-        while len(all_data) < total_candles:
-            params = {"symbol": symbol, "interval": binance_tf, "limit": limit}
-            if end_time:
-                params["endTime"] = end_time
-                
-            res = requests.get(url, params=params, timeout=5).json()
+        # Loop ke zariye 2023 se lekar aaj tak ka sara data sequentially khinchana
+        while True:
+            params = {
+                "symbol": symbol, 
+                "interval": binance_tf, 
+                "limit": limit,
+                "startTime": current_start_time
+            }
+            res = requests.get(url, params=params, timeout=6).json()
             if not isinstance(res, list) or len(res) == 0:
                 break
                 
-            all_data = res + all_data
-            end_time = res[0][0] - 1
+            all_data.extend(res)
             
+            # Agli request ke liye start time ko aakhri candle ke time par set karna
+            current_start_time = res[-1][0] + 1
+            
+            # Agar 1000 se kam candles aayi hain matlab aaj tak ka data poora ho gaya hai
             if len(res) < limit:
+                break
+                
+            # Safety break taake infinite loop na phanse (max ~15k-20k candles)
+            if len(all_data) > 15000:
                 break
                 
         if len(all_data) > 0:
@@ -251,7 +264,7 @@ def fetch_klines_data(symbol, tf_key, total_candles=2500):
     except Exception as e:
         print(f"Error fetching historical data: {e}")
         
-    dates = pd.date_range(end=datetime.datetime.now(), periods=100, freq=binance_tf)
+    dates = pd.date_range(end=datetime.datetime.now(), periods=100, freq="4h")
     base_p = 60000.0
     closes = base_p + np.cumsum(np.random.normal(0, 10, 100))
     return pd.DataFrame({
@@ -386,15 +399,14 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     st.markdown(f"""
     <div class="top-status-bar">
-        🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
+        🟢 <b>[{selected_symbol}] (2023 - 2026 Data Loaded)</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
         TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
-        ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
+        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Total Candles: <b>{len(df):,}</b>
     </div>
     """, unsafe_allow_html=True)
 
     if has_active_trade_for_coin:
-        st.warning(f"🔒 **Position Locked:** {selected_symbol} par pehle se aik active/pending trade chal rahi hai. Jab tak TP ya SL hit nahi hoga, naya signal CSV mein save nahi hoga.")
+        st.warning(f"🔒 **Position Locked:** {selected_symbol} par active trade mojood hai.")
 
     # ==========================================
     # 8. TRADE SIGNAL PANEL & METRICS
@@ -429,10 +441,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     # ==========================================
     st.markdown("---")
     
-    # Full Screen Toggle Control
     col_ch_head, col_ch_toggle = st.columns([3, 1])
     with col_ch_head:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol}) — Total Candles: {len(df)}")
+        st.subheader(f"📈 Macro Historical Chart (2023 - 2026) [{selected_symbol}] — {len(df):,} Candles")
     with col_ch_toggle:
         full_screen_chart = st.toggle("🔍 Expand Full Screen", value=False)
 
@@ -448,17 +459,16 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         forecast_prices = [close_p] * forecast_horizon
 
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+    fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles (2023-2026)", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
     fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
     fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
     fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
-    fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
     
-    chart_height = 650 if full_screen_chart else 420
+    chart_height = 680 if full_screen_chart else 450
     fig.update_layout(
         template="plotly_dark", 
         height=chart_height, 
-        xaxis_rangeslider_visible=False, 
+        xaxis_rangeslider_visible=True, # Rangeslider enable kar diya taake 2023 se zoom in/out asani se ho sake
         paper_bgcolor="#111622", 
         plot_bgcolor="#111622", 
         margin=dict(l=10, r=10, t=10, b=10),
@@ -467,11 +477,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     )
 
     if full_screen_chart:
-        # Agar full screen on hai toh chart poori width par aayega
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
         
-        # Microstructure panel neechay shift ho jayega
-        with st.expander("📊 Market Microstructure & Order Book Panel (Expanded)", expanded=True):
+        with st.expander("📊 Market Microstructure Panel (Expanded)", expanded=True):
             bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
             ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
             obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
@@ -483,9 +491,8 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 <div class="metric-card">
                     <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
                     <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
-                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
-                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
-                    <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
+                    <div style="display:flex; justify-content:space-between;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
                 </div>
                 """, unsafe_allow_html=True)
             with m_col2:
@@ -493,7 +500,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
                 st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
     else:
-        # Normal View: Side-by-side layout
         col_chart, col_risk_panel = st.columns([2.5, 1])
         with col_chart:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False, "scrollZoom": True})
@@ -510,8 +516,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
-                <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
-                <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MED</b></div>
+                <div style="display:flex; justify-content:space-between;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -544,9 +549,8 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         <div class="metric-card">
             <div style="font-weight:700; color:#38bdf8; margin-bottom:6px;">Advanced Model Insights</div>
             <div style="font-size:12px; color:#cbd5e1; line-height:1.6;">
-                • <b>HAWKES:</b> Measures aggressive order clustering and arrival rates.<br>
-                • <b>BOOK_IMB:</b> Computes real-time depth pressure across bids & asks.<br>
-                • <b>Dynamic Weights:</b> Optimized linear blending for robust signals.
+                • <b>2023-2026 Span:</b> Poora macro trend shamil hai.<br>
+                • <b>Range Slider:</b> Chart ke neechay slider se aap kisi bhi saal (2023, 2024, 2025) par zoom kar sakte hain.
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -555,7 +559,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     # 11. PERFORMANCE & WIN RATE SECTION
     # ==========================================
     st.markdown("---")
-    st.subheader("📊 Performance Summary & Win Rate Checker with Filters")
+    st.subheader("📊 Performance Summary & Win Rate Checker")
 
     if st.session_state.trade_history_log:
         df_log = pd.DataFrame(st.session_state.trade_history_log)
@@ -616,7 +620,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 os.remove(CSV_FILE)
             st.rerun()
     else:
-        st.info("No paper trade history recorded yet. Signals will automatically log when active.")
+        st.info("No paper trade history recorded yet.")
 
 else:
     st.warning("⚠️ Data pipeline initializing or connection restricted. Please refresh.")
