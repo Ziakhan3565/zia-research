@@ -213,34 +213,55 @@ api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
 # ==========================================
-# 5. DATA FETCHING (SAFE API WITH FALLBACK)
+# 5. DATA FETCHING (PAGINATION FOR MAX HISTORY)
 # ==========================================
-@st.cache_data(ttl=15)
-def fetch_klines_data(symbol, tf_key, limit=100):
+@st.cache_data(ttl=300)
+def fetch_klines_data(symbol, tf_key, total_candles=2500):
     binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("30m" if "30m" in tf_key else ("1h" if "1h" in tf_key else "4h")))
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
+    url = "https://data-api.binance.vision/api/v3/klines"
+    
+    all_data = []
+    limit = 1000
+    end_time = None
+    
     try:
-        res = requests.get(url, timeout=4).json()
-        if isinstance(res, dict) or not isinstance(res, list):
-            raise ValueError("API limit or invalid format")
-        df = pd.DataFrame(res, columns=["Open_Time", "Open", "High", "Low", "Close", "Volume", "Close_Time", "QAV", "NAT", "TBBAV", "TBQAV", "Ignore"])
-        df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = df[col].astype(float)
-        df.set_index("Time", inplace=True)
-        return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
-    except Exception:
-        dates = pd.date_range(end=datetime.datetime.now(), periods=limit, freq=binance_tf)
-        base_p = 60000.0
-        closes = base_p + np.cumsum(np.random.normal(0, 10, limit))
-        return pd.DataFrame({
-            "Time": dates,
-            "Open": closes - 5,
-            "High": closes + 15,
-            "Low": closes - 15,
-            "Close": closes,
-            "Volume": np.random.uniform(50, 500, limit)
-        })
+        while len(all_data) < total_candles:
+            params = {"symbol": symbol, "interval": binance_tf, "limit": limit}
+            if end_time:
+                params["endTime"] = end_time
+                
+            res = requests.get(url, params=params, timeout=5).json()
+            if not isinstance(res, list) or len(res) == 0:
+                break
+                
+            all_data = res + all_data
+            end_time = res[0][0] - 1
+            
+            if len(res) < limit:
+                break
+                
+        if len(all_data) > 0:
+            df = pd.DataFrame(all_data, columns=["Open_Time", "Open", "High", "Low", "Close", "Volume", "Close_Time", "QAV", "NAT", "TBBAV", "TBQAV", "Ignore"])
+            df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = df[col].astype(float)
+            df.drop_duplicates(subset=["Time"], inplace=True)
+            df.sort_values("Time", inplace=True)
+            return df.reset_index(drop=True)[["Time", "Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        print(f"Error fetching historical data: {e}")
+        
+    dates = pd.date_range(end=datetime.datetime.now(), periods=100, freq=binance_tf)
+    base_p = 60000.0
+    closes = base_p + np.cumsum(np.random.normal(0, 10, 100))
+    return pd.DataFrame({
+        "Time": dates,
+        "Open": closes - 5,
+        "High": closes + 15,
+        "Low": closes - 15,
+        "Close": closes,
+        "Volume": np.random.uniform(50, 500, 100)
+    })
 
 @st.cache_data(ttl=10)
 def fetch_order_book_depth(symbol, depth_limit=20):
@@ -289,7 +310,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     
     trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
 
-    # --- ACTIVE TRADE LOCK / ANTI-OVERLAP CHECK ---
     has_active_trade_for_coin = any(
         t["symbol"] == selected_symbol and t.get("outcome") == "PENDING" 
         for t in st.session_state.trade_history_log
@@ -320,7 +340,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             st.session_state.trade_history_log.insert(0, new_trade)
             save_persistent_history(st.session_state.trade_history_log)
 
-    # Update Pending Trades Outcome (TP / SL Hit check)
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING" and trade["symbol"] == selected_symbol:
             curr_price = close_p
@@ -375,7 +394,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     """, unsafe_allow_html=True)
 
     if has_active_trade_for_coin:
-        st.warning(f"🔒 **Position Locked:** {selected_symbol} par pehle se aik active/pending trade chal rahi hai. Jab tak TP ya SL hit nahi hota, naya signal CSV mein save nahi hoga.")
+        st.warning(f"🔒 **Position Locked:** {selected_symbol} par pehle se aik active/pending trade chal rahi hai. Jab tak TP ya SL hit nahi hoga, naya signal CSV mein save nahi hoga.")
 
     # ==========================================
     # 8. TRADE SIGNAL PANEL & METRICS
@@ -406,63 +425,100 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
     # ==========================================
-    # 9. CHART & MICROSTRUCTURE SECTION
+    # 9. CHART & FULL SCREEN TOGGLE SECTION
     # ==========================================
-    col_chart, col_risk_panel = st.columns([2.5, 1])
-    with col_chart:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
-        time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
-        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
+    st.markdown("---")
+    
+    # Full Screen Toggle Control
+    col_ch_head, col_ch_toggle = st.columns([3, 1])
+    with col_ch_head:
+        st.subheader(f"Price Trajectory & Levels ({selected_symbol}) — Total Candles: {len(df)}")
+    with col_ch_toggle:
+        full_screen_chart = st.toggle("🔍 Expand Full Screen", value=False)
 
-        if direction == "LONG":
-            forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
-        elif direction == "SHORT":
-            forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
-        else:
-            forecast_prices = [close_p] * forecast_horizon
+    time_delta = pd.Timedelta(minutes=tf_minutes)
+    future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
+    t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
 
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
-        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
-        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
-        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
-        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
+    if direction == "LONG":
+        forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
+    elif direction == "SHORT":
+        forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
+    else:
+        forecast_prices = [close_p] * forecast_horizon
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+    fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
+    fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
+    fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
+    fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
+    
+    chart_height = 650 if full_screen_chart else 420
+    fig.update_layout(
+        template="plotly_dark", 
+        height=chart_height, 
+        xaxis_rangeslider_visible=False, 
+        paper_bgcolor="#111622", 
+        plot_bgcolor="#111622", 
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=True, gridcolor="#1e2638"),
+        yaxis=dict(showgrid=True, gridcolor="#1e2638")
+    )
+
+    if full_screen_chart:
+        # Agar full screen on hai toh chart poori width par aayega
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
         
-        # Optimized layout with scrollZoom for interactive feel
-        fig.update_layout(
-            template="plotly_dark", 
-            height=420, 
-            xaxis_rangeslider_visible=False, 
-            paper_bgcolor="#111622", 
-            plot_bgcolor="#111622", 
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis=dict(showgrid=True, gridcolor="#1e2638"),
-            yaxis=dict(showgrid=True, gridcolor="#1e2638")
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False, "scrollZoom": True})
+        # Microstructure panel neechay shift ho jayega
+        with st.expander("📊 Market Microstructure & Order Book Panel (Expanded)", expanded=True):
+            bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
+            ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+            obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
+            spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
 
-    with col_risk_panel:
-        st.subheader("Market Microstructure & OB")
-        bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
-        ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-        obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
-        spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
+            m_col1, m_col2 = st.columns(2)
+            with m_col1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
+                    <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
+                </div>
+                """, unsafe_allow_html=True)
+            with m_col2:
+                fig_obi = go.Figure(go.Bar(x=["Top 5", "Top 10", "Top 20"], y=[obi_val*0.8, obi_val*0.9, obi_val], marker_color="#38bdf8"))
+                fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
+                st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
+    else:
+        # Normal View: Side-by-side layout
+        col_chart, col_risk_panel = st.columns([2.5, 1])
+        with col_chart:
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False, "scrollZoom": True})
 
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
-            <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
-        </div>
-        """, unsafe_allow_html=True)
+        with col_risk_panel:
+            st.subheader("Market Micro & OB")
+            bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
+            ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+            obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
+            spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
 
-        st.subheader("Top 20 OBI Analysis")
-        fig_obi = go.Figure(go.Bar(x=["Top 5", "Top 10", "Top 20"], y=[obi_val*0.8, obi_val*0.9, obi_val], marker_color="#38bdf8"))
-        fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
-        st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(f"""
+            <div class="metric-card">
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
+                <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MED</b></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.subheader("Top 20 OBI Analysis")
+            fig_obi = go.Figure(go.Bar(x=["Top 5", "Top 10", "Top 20"], y=[obi_val*0.8, obi_val*0.9, obi_val], marker_color="#38bdf8"))
+            fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
+            st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
 
     # ==========================================
     # 10. RESEARCH PAPER SCOREBOARD
