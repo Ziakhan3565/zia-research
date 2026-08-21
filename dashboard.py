@@ -8,7 +8,6 @@ import requests
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
-from streamlit_lightweight_charts import renderLightweightCharts
 
 # ==========================================
 # 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
@@ -407,42 +406,41 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
     # ==========================================
-    # 9. CHART & MICROSTRUCTURE SECTION (TradingView Lightweight Charts)
+    # 9. CHART & MICROSTRUCTURE SECTION
     # ==========================================
     col_chart, col_risk_panel = st.columns([2.5, 1])
     with col_chart:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol}) - TradingView Style")
-        
-        # Format dataframe for streamlit-lightweight-charts
-        chart_df = df.copy()
-        # Lightweight charts expects Unix timestamp or 'YYYY-MM-DD' format for 'time'
-        chart_df['time'] = chart_df['Time'].astype('int64') // 10**9
-        chart_data = chart_df[['time', 'Open', 'High', 'Low', 'Close']].rename(
-            columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}
-        ).to_dict('records')
+        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
+        time_delta = pd.Timedelta(minutes=tf_minutes)
+        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
+        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
 
-        chartOptions = {
-            "layout": {"background": {"color": "#111622"}, "textColor": "#d1d4dc"},
-            "grid": {"vertLines": {"color": "#1e2638"}, "horzLines": {"color": "#1e2638"}},
-            "crosshair": {"mode": 0},
-            "priceScale": {"borderColor": "#1e2638"},
-            "timeScale": {"borderColor": "#1e2638", "timeVisible": True, "secondsVisible": False},
-        }
+        if direction == "LONG":
+            forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
+        elif direction == "SHORT":
+            forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
+        else:
+            forecast_prices = [close_p] * forecast_horizon
+
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
+        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
+        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
+        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
         
-        seriesCandlestickChart = [
-            {
-                "type": 'Candlestick',
-                "data": chart_data,
-                "options": {
-                    "upColor": "#00e676", "downColor": "#ff5252",
-                    "borderVisible": False, "wickUpColor": "#00e676", "wickDownColor": "#ff5252"
-                }
-            }
-        ]
-        
-        renderLightweightCharts([
-            {"chart": chartOptions, "series": seriesCandlestickChart}
-        ], 'candlestick')
+        # Optimized layout with scrollZoom for interactive feel
+        fig.update_layout(
+            template="plotly_dark", 
+            height=420, 
+            xaxis_rangeslider_visible=False, 
+            paper_bgcolor="#111622", 
+            plot_bgcolor="#111622", 
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(showgrid=True, gridcolor="#1e2638"),
+            yaxis=dict(showgrid=True, gridcolor="#1e2638")
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False, "scrollZoom": True})
 
     with col_risk_panel:
         st.subheader("Market Microstructure & OB")
