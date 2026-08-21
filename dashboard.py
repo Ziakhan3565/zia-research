@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
-
 import requests
+import streamlit as st
 
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
+st.set_page_config(
+    page_title="TRI Line Engine Analysis",
+    page_icon="📈",
+    layout="wide"
+)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
 BINANCE_API = "https://api.binance.com/api/v3/klines"
 DEFAULT_SYMBOL = "BTCUSDT"
 
@@ -28,11 +34,9 @@ TIMEFRAME_MAPPING = {
     "1M": "1m",
 }
 
-
 # ============================================================
 # DATA CLASS
 # ============================================================
-
 @dataclass
 class TRILineLevels:
     timeframe: str
@@ -47,18 +51,15 @@ class TRILineLevels:
     lower_50: float
     candle_time: int
 
-
 # ============================================================
 # TRI LINE ENGINE
 # ============================================================
-
 class TRILineEngine:
-
     def __init__(
         self,
         symbol: str = DEFAULT_SYMBOL,
         enabled_timeframes: Optional[Dict[str, bool]] = None,
-        timeout: int = 15,
+        timeout: int = 10,
     ):
         self.symbol = symbol.upper()
         self.timeout = timeout
@@ -83,41 +84,25 @@ class TRILineEngine:
     def set_symbol(self, symbol: str):
         self.symbol = symbol.upper()
 
-    def set_timeframe(self, timeframe: str, enabled: bool):
-        timeframe = timeframe.upper()
-        if timeframe not in TIMEFRAME_MAPPING:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-        self.enabled[timeframe] = enabled
-
-    def set_color(self, timeframe: str, color: str):
-        timeframe = timeframe.upper()
-        if timeframe not in TIMEFRAME_MAPPING:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-        self.colors[timeframe] = color
-
     def get_klines(self, interval: str, limit: int = 5):
         params = {
             "symbol": self.symbol,
             "interval": interval,
             "limit": limit,
         }
-        try:
-            response = requests.get(
-                BINANCE_API,
-                params=params,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[API ERROR] Failed to fetch {interval} for {self.symbol}: {e}", file=sys.stderr)
-            raise
+        response = requests.get(
+            BINANCE_API,
+            params=params,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def get_previous_candle(self, interval: str):
         candles = self.get_klines(interval=interval, limit=5)
-        if not candles or len(candles) < 2:
-            raise RuntimeError(f"Not enough candle data returned for interval {interval}")
-
+        if len(candles) < 2:
+            raise RuntimeError(f"Not enough candle data for {interval}")
+        
         candle = candles[-2]
         return {
             "time": int(candle[0]),
@@ -163,43 +148,54 @@ class TRILineEngine:
         for timeframe in TIMEFRAME_MAPPING:
             if not self.enabled.get(timeframe, False):
                 continue
-
             try:
-                print(f"Fetching data for [{timeframe}]...")
                 levels = self.calculate_levels(timeframe)
                 results[timeframe] = levels
             except Exception as error:
                 results[timeframe] = {"error": str(error)}
         return results
 
-    def print_levels(self):
-        results = self.calculate_all()
-        print("\n" + "=" * 75)
-        print(f"TRI LINE ANALYSIS | {self.symbol}")
-        print("=" * 75)
+# ============================================================
+# STREAMLIT UI APP
+# ============================================================
+st.title("📊 TRI Line Market Analysis Hub")
+st.markdown("Analyze multi-timeframe key levels (**1m to Yearly**) seamlessly.")
 
-        for timeframe, value in results.items():
-            print(f"\n[{timeframe}]")
-            if isinstance(value, TRILineLevels):
-                print(f"Color       : {self.colors[timeframe]}")
-                print(f"Open        : {value.open:.8f}")
-                print(f"High        : {value.high:.8f}")
-                print(f"Low         : {value.low:.8f}")
-                print(f"Close       : {value.close:.8f}")
-                print(f"Body 50%    : {value.body_50:.8f}")
-                print(f"Upper 50%   : {value.upper_50:.8f}")
-                print(f"Lower 50%   : {value.lower_50:.8f}")
+# Sidebar controls
+st.sidebar.header("Configuration")
+selected_symbol = st.sidebar.text_input("Trading Symbol", value="BTCUSDT").upper()
+
+engine = TRILineEngine(symbol=selected_symbol)
+
+st.sidebar.subheader("Select Timeframes")
+enabled_tfs = {}
+for tf in TIMEFRAME_MAPPING.keys():
+    enabled_tfs[tf] = st.sidebar.checkbox(tf, value=True)
+
+engine.enabled = enabled_tfs
+
+if st.sidebar.button("Fetch & Calculate Levels", type="primary"):
+    with st.spinner("Fetching data from Binance..."):
+        data = engine.calculate_all()
+        
+    st.success(f"Successfully calculated levels for {selected_symbol}!")
+    
+    for tf, val in data.items():
+        with st.expander(f"Timeframe: [{tf}]", expanded=True):
+            if isinstance(val, TRILineLevels):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Open", f"{val.open:.4f}")
+                col2.metric("High", f"{val.high:.4f}")
+                col3.metric("Low", f"{val.low:.4f}")
+                col4.metric("Close", f"{val.close:.4f}")
+                
+                st.markdown("---")
+                
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Body 50%", f"{val.body_50:.4f}")
+                s2.metric("Upper Wick 50%", f"{val.upper_50:.4f}")
+                s3.metric("Lower Wick 50%", f"{val.lower_50:.4f}")
             else:
-                print(f"ERROR       : {value['error']}")
-
-        print("\n" + "=" * 75)
-
-
-# ============================================================
-# SIMPLE TEST
-# ============================================================
-
-if __name__ == "__main__":
-    print("Starting TRILineEngine script...")
-    engine = TRILineEngine(symbol="BTCUSDT")
-    engine.print_levels()
+                st.error(f"Error fetching data: {val.get('error')}")
+else:
+    st.info("👈 Click 'Fetch & Calculate Levels' in the sidebar to load the market data.")
