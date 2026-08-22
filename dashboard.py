@@ -11,7 +11,7 @@ from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
-# 1. STREAMLIT CONFIG
+# STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -21,8 +21,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Auto refresh every 5 seconds
-count = st_autorefresh(
+st_autorefresh(
     interval=5000,
     limit=None,
     key="research_lab_auto_refresh"
@@ -32,7 +31,7 @@ CSV_FILE = "signal_history.csv"
 
 
 # ============================================================
-# 2. PERSISTENT TRADE HISTORY
+# PERSISTENT TRADE HISTORY
 # ============================================================
 
 EXPECTED_COLS = [
@@ -71,16 +70,16 @@ def load_persistent_history():
                 if col == "outcome":
                     df_hist[col] = "PENDING"
 
-                elif col == "status":
-                    df_hist[col] = "Open"
-
                 elif col == "duration":
                     df_hist[col] = "Active"
+
+                elif col == "status":
+                    df_hist[col] = "Open"
 
                 else:
                     df_hist[col] = 0.0
 
-        df_hist = df_hist[EXPECTED_COLS]
+        df_hist["outcome"] = df_hist["outcome"].fillna("PENDING")
 
         return df_hist.to_dict("records")
 
@@ -93,10 +92,6 @@ def save_persistent_history(history_list):
     try:
 
         if not history_list:
-            pd.DataFrame(columns=EXPECTED_COLS).to_csv(
-                CSV_FILE,
-                index=False
-            )
             return
 
         df_hist = pd.DataFrame(history_list)
@@ -106,8 +101,6 @@ def save_persistent_history(history_list):
             if col not in df_hist.columns:
                 df_hist[col] = 0
 
-        df_hist = df_hist[EXPECTED_COLS]
-
         df_hist.to_csv(
             CSV_FILE,
             index=False
@@ -116,7 +109,7 @@ def save_persistent_history(history_list):
     except Exception as e:
 
         st.error(
-            f"Error saving history to CSV: {e}"
+            f"Error saving history: {e}"
         )
 
 
@@ -128,7 +121,7 @@ if "trade_history_log" not in st.session_state:
 
 
 # ============================================================
-# 3. RESEARCH LAB
+# QUANT RESEARCH ENGINE
 # ============================================================
 
 class TenPaperResearchLab:
@@ -140,7 +133,6 @@ class TenPaperResearchLab:
         self.scaler = StandardScaler()
 
         self.feature_names = [
-
             "HAWKES",
             "BOOK_IMB",
             "TAKER_FLOW",
@@ -183,22 +175,12 @@ class TenPaperResearchLab:
             }
 
 
-        # ------------------------------------------------
-        # BASIC MARKET DATA
-        # ------------------------------------------------
-
-        bid_vol = np.sum(
-            bids[:, 1]
-        )
-
-        ask_vol = np.sum(
-            asks[:, 1]
-        )
+        bid_vol = np.sum(bids[:, 1])
+        ask_vol = np.sum(asks[:, 1])
 
         mid_price = (
-            bids[0, 0] +
-            asks[0, 0]
-        ) / 2.0
+            bids[0, 0] + asks[0, 0]
+        ) / 2
 
         returns = (
             df["Close"]
@@ -207,8 +189,7 @@ class TenPaperResearchLab:
         )
 
         realized_vol = (
-            returns.std() +
-            1e-8
+            returns.std() + 1e-8
         )
 
         returns_h = (
@@ -227,9 +208,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 1. HAWKES
-        # ------------------------------------------------
+        # 1 HAWKES
 
         vol_changes = (
             df["Volume"]
@@ -257,16 +236,13 @@ class TenPaperResearchLab:
             (
                 hawkes_intensity - 1.0
             )
-            *
-            np.sign(returns_h),
+            * np.sign(returns_h),
             -1,
             1
         )
 
 
-        # ------------------------------------------------
-        # 2. BOOK IMBALANCE
-        # ------------------------------------------------
+        # 2 BOOK IMBALANCE
 
         results["BOOK_IMB"] = (
             bid_vol - ask_vol
@@ -275,9 +251,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 3. TAKER FLOW
-        # ------------------------------------------------
+        # 3 TAKER FLOW
 
         taker_buy = (
             df["Volume"].iloc[-1]
@@ -306,16 +280,15 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 4. QUANT IMPLIED
-        # ------------------------------------------------
+        # 4 QUANT IMPLY
 
         depth_skew = (
-            bids[0, 1] -
-            asks[0, 1]
+            bids[0, 1] - asks[0, 1]
         ) / (
-            bids[0, 1] +
-            asks[0, 1] +
+            bids[0, 1]
+            +
+            asks[0, 1]
+            +
             1e-8
         )
 
@@ -326,9 +299,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 5. BAYESIAN
-        # ------------------------------------------------
+        # 5 BAYESIAN
 
         prior = 0.745
 
@@ -355,15 +326,15 @@ class TenPaperResearchLab:
         )
 
         results["BAYESIAN"] = np.clip(
-            (posterior - 0.5) * 2.0,
+            (
+                posterior - 0.5
+            ) * 2.0,
             -1,
             1
         )
 
 
-        # ------------------------------------------------
-        # 6. QUANTILES
-        # ------------------------------------------------
+        # 6 QUANTILES
 
         q90 = (
             returns.quantile(0.90)
@@ -386,19 +357,15 @@ class TenPaperResearchLab:
                 (
                     q90 - q10 + 1e-8
                 )
-            )
-            *
-            2.0
-            -
-            1.0,
+                * 2.0
+                - 1.0
+            ),
             -1,
             1
         )
 
 
-        # ------------------------------------------------
-        # 7. TARGET / INVALIDATION
-        # ------------------------------------------------
+        # 7 TARGET INVALIDATION
 
         target_diff = (
             delta_p
@@ -410,12 +377,9 @@ class TenPaperResearchLab:
         )
 
         results["TARGET_INV"] = (
-
             1.0
             if target_diff >= 0.0006
-
             else
-
             (
                 -1.0
                 if target_diff <= -0.0006
@@ -424,9 +388,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 8. ADAPTIVE CONF
-        # ------------------------------------------------
+        # 8 ADAPTIVE CONF
 
         ma_fast = (
             df["Close"]
@@ -459,9 +421,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 9. FRACTIONAL KELLY
-        # ------------------------------------------------
+        # 9 FRACTIONAL KELLY
 
         win_prob = (
             0.55
@@ -480,25 +440,20 @@ class TenPaperResearchLab:
             -
             (
                 (1 - win_prob)
-                /
-                1.5
+                / 1.5
             )
         )
 
         results["FRAC_KELLY"] = np.clip(
             kelly_fraction
-            *
-            2.0
-            *
-            np.sign(returns_h),
+            * 2.0
+            * np.sign(returns_h),
             -1,
             1
         )
 
 
-        # ------------------------------------------------
-        # 10. RMT DOMINANCE
-        # ------------------------------------------------
+        # 10 RMT
 
         rmt_dom = (
             abs(returns_h)
@@ -521,9 +476,7 @@ class TenPaperResearchLab:
         )
 
 
-        # ------------------------------------------------
-        # 11. CONFORMAL CROSS
-        # ------------------------------------------------
+        # 11 CONFORMAL
 
         conformal_spread = (
             realized_vol * 1.96
@@ -533,7 +486,9 @@ class TenPaperResearchLab:
             mid_price
             *
             (
-                1 + conformal_spread
+                1
+                +
+                conformal_spread
             )
         )
 
@@ -541,49 +496,46 @@ class TenPaperResearchLab:
             mid_price
             *
             (
-                1 - conformal_spread
+                1
+                -
+                conformal_spread
             )
         )
 
-        center = (
-            upper_b + lower_b
-        ) / 2
-
         results["CONF_CROSS"] = (
-
             1.0
-            if mid_price > center
-
+            if mid_price >
+            (
+                upper_b + lower_b
+            ) / 2
             else
-
             (
                 -1.0
-                if mid_price < center
+                if mid_price <
+                (
+                    upper_b + lower_b
+                ) / 2
                 else 0.0
             )
         )
 
 
-        # ------------------------------------------------
-        # 12. REWARD / RISK
-        # ------------------------------------------------
+        # 12 REWARD RISK
 
         rr_ratio = (
             abs(q90)
             /
             (
                 abs(q10)
-                + 1e-8
+                +
+                1e-8
             )
         )
 
         results["REWARD_RISK"] = (
-
             1.0
             if rr_ratio >= 1.2
-
             else
-
             (
                 -1.0
                 if rr_ratio < 0.8
@@ -614,7 +566,7 @@ class TenPaperResearchLab:
                 results[k]
                 for k in self.feature_names
             ]
-        ).reshape(1, -1)
+        )
 
         weight_vector = np.array(
             list(
@@ -624,7 +576,7 @@ class TenPaperResearchLab:
 
         final_score = float(
             np.dot(
-                feature_vector[0],
+                feature_vector,
                 weight_vector
             )
         )
@@ -637,7 +589,7 @@ class TenPaperResearchLab:
 
 
 # ============================================================
-# 4. RISK ENGINE
+# RISK ENGINE
 # ============================================================
 
 class PowerTradingRiskEngine:
@@ -656,33 +608,43 @@ class PowerTradingRiskEngine:
 
         total_ltz = (
             np.sum(liquidation_volumes)
-            if len(liquidation_volumes) > 0
+            if len(liquidation_volumes)
             else 0.0
         )
 
         max_ltz = (
             np.max(liquidation_volumes)
-            if len(liquidation_volumes) > 0
+            if len(liquidation_volumes)
             else 0.0
         )
 
         ltz_score = (
             max_ltz
             /
-            (total_ltz + 1e-8)
+            (
+                total_ltz + 1e-8
+            )
         ) * 100
 
         spoof_ratio = (
             cancelled_vol
             /
-            (displayed_vol + 1e-8)
+            (
+                displayed_vol
+                +
+                1e-8
+            )
         )
 
         persistence = min(
             max(
                 time_exists
                 /
-                (obs_window + 1e-8),
+                (
+                    obs_window
+                    +
+                    1e-8
+                ),
                 0
             ),
             1
@@ -691,7 +653,9 @@ class PowerTradingRiskEngine:
         spoof_score = (
             spoof_ratio
             *
-            (1 - persistence)
+            (
+                1 - persistence
+            )
         )
 
         squeeze_risk = (
@@ -713,23 +677,15 @@ class PowerTradingRiskEngine:
         )
 
         return {
-
-            "LTZ_Score":
-                ltz_score,
-
-            "Spoof_Score":
-                spoof_score,
-
-            "Squeeze_Risk":
-                squeeze_risk,
-
-            "Market_Risk":
-                market_risk
+            "LTZ_Score": ltz_score,
+            "Spoof_Score": spoof_score,
+            "Squeeze_Risk": squeeze_risk,
+            "Market_Risk": market_risk
         }
 
 
 # ============================================================
-# 5. PROFESSIONAL DARK UI
+# PROFESSIONAL UI
 # ============================================================
 
 st.markdown(
@@ -743,195 +699,163 @@ st.markdown(
 html,
 body,
 [class*="css"] {
-    font-family: 'Inter', sans-serif !important;
+
+    font-family:
+    'Inter',
+    sans-serif !important;
+
 }
 
 .stApp {
-    background:
-        radial-gradient(
-            circle at top right,
-            #111827 0%,
-            #080a0f 40%,
-            #080a0f 100%
-        );
 
-    color: #e2e8f0;
+    background:
+    #080a0f;
+
+    color:
+    #e2e8f0;
+
 }
 
 section[data-testid="stSidebar"] {
 
     background:
-        linear-gradient(
-            180deg,
-            #0d1117,
-            #090c11
-        ) !important;
+    #0d1117 !important;
 
     border-right:
-        1px solid #1e2638;
+    1px solid #1c2330;
+
+}
+
+.block-container {
+
+    padding-top:
+    1.2rem;
+
+    padding-bottom:
+    2rem;
+
 }
 
 .metric-card {
 
     background:
-        linear-gradient(
-            145deg,
-            #131824,
-            #0f131d
-        );
+    linear-gradient(
+        145deg,
+        #111622,
+        #0d121c
+    );
 
     border:
-        1px solid #20293b;
+    1px solid #20293a;
 
     border-radius:
-        14px;
+    12px;
 
     padding:
-        16px;
-
-    box-shadow:
-        0 8px 25px
-        rgba(0,0,0,0.22);
+    14px;
 
     margin-bottom:
-        10px;
+    10px;
 
-    transition:
-        all 0.2s ease;
-}
-
-.metric-card:hover {
-
-    border-color:
-        #334155;
-
-    transform:
-        translateY(-1px);
 }
 
 .metric-label {
 
     font-size:
-        10px;
+    10px;
 
     font-weight:
-        700;
+    700;
 
     color:
-        #7f8ea3;
+    #7d8795;
 
     text-transform:
-        uppercase;
+    uppercase;
 
     letter-spacing:
-        0.7px;
+    0.7px;
 
-    margin-bottom:
-        6px;
 }
 
 .metric-val-green {
 
     font-size:
-        19px;
+    20px;
 
     font-weight:
-        800;
+    800;
 
     color:
-        #00e676;
+    #00e676;
+
 }
 
 .metric-val-red {
 
     font-size:
-        19px;
+    20px;
 
     font-weight:
-        800;
+    800;
 
     color:
-        #ff5252;
+    #ff5252;
+
 }
 
 .metric-val-blue {
 
     font-size:
-        19px;
+    20px;
 
     font-weight:
-        800;
+    800;
 
     color:
-        #38bdf8;
+    #38bdf8;
+
 }
 
 .top-status-bar {
 
     background:
-        linear-gradient(
-            90deg,
-            #111827,
-            #101722
-        );
+    #111622;
 
     border:
-        1px solid #253047;
+    1px solid #20293a;
 
     border-radius:
-        12px;
+    10px;
 
     padding:
-        14px 18px;
+    12px 18px;
 
     margin-bottom:
-        18px;
+    18px;
 
     font-weight:
-        600;
+    600;
 
     font-size:
-        13px;
+    13px;
 
-    box-shadow:
-        0 6px 20px
-        rgba(0,0,0,0.2);
 }
 
 .section-title {
 
     font-size:
-        18px;
+    17px;
 
     font-weight:
-        800;
-
-    color:
-        #f8fafc;
+    800;
 
     margin-top:
-        10px;
+    10px;
 
     margin-bottom:
-        12px;
-}
+    12px;
 
-.small-muted {
-
-    color:
-        #64748b;
-
-    font-size:
-        11px;
-}
-
-div[data-testid="stDataFrame"] {
-
-    border:
-        1px solid #20293b;
-
-    border-radius:
-        10px;
 }
 
 </style>
@@ -941,11 +865,10 @@ div[data-testid="stDataFrame"] {
 
 
 # ============================================================
-# 6. SIDEBAR
+# SIDEBAR
 # ============================================================
 
 COINS_LIST = [
-
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
@@ -955,21 +878,25 @@ COINS_LIST = [
     "ADAUSDT",
     "AVAXUSDT",
     "DOTUSDT",
-    "LINKUSDT"
+    "LINKUSDT",
 ]
-
 
 TIMEFRAME_MAP = {
 
-    "1m (Scalping)": ("1m", 1),
+    "1m (Scalping)":
+        ("1m", 1),
 
-    "15m (Medium TF)": ("15m", 15),
+    "15m (Medium TF)":
+        ("15m", 15),
 
-    "30m (Medium TF)": ("30m", 30),
+    "30m (Medium TF)":
+        ("30m", 30),
 
-    "1h (Intraday)": ("1h", 60),
+    "1h (Intraday)":
+        ("1h", 60),
 
-    "4h (Intraday)": ("4h", 240),
+    "4h (Intraday)":
+        ("4h", 240),
 }
 
 
@@ -999,7 +926,7 @@ forecast_horizon = st.sidebar.slider(
 st.sidebar.markdown("---")
 
 st.sidebar.markdown(
-    "### 🎛️ Paper Trading Mode"
+    "### 🎛️ Paper Trading"
 )
 
 paper_trading_mode = st.sidebar.toggle(
@@ -1013,7 +940,7 @@ api_interval, tf_minutes = (
 
 
 # ============================================================
-# 7. BINANCE MARKET DATA
+# BINANCE DATA
 # ============================================================
 
 @st.cache_data(ttl=15)
@@ -1046,7 +973,6 @@ def fetch_klines_data(
         f"&limit={limit}"
     )
 
-
     try:
 
         response = requests.get(
@@ -1054,18 +980,12 @@ def fetch_klines_data(
             timeout=5
         )
 
-        response.raise_for_status()
-
         res = response.json()
 
-        if (
-            isinstance(res, dict)
-            or not isinstance(res, list)
-        ):
+        if not isinstance(res, list):
             raise ValueError(
                 "Invalid Binance response"
             )
-
 
         df = pd.DataFrame(
             res,
@@ -1085,12 +1005,10 @@ def fetch_klines_data(
             ]
         )
 
-
         df["Time"] = pd.to_datetime(
             df["Open_Time"],
             unit="ms"
         )
-
 
         for col in [
             "Open",
@@ -1102,7 +1020,6 @@ def fetch_klines_data(
 
             df[col] = df[col].astype(float)
 
-
         return df[
             [
                 "Time",
@@ -1113,7 +1030,6 @@ def fetch_klines_data(
                 "Volume"
             ]
         ]
-
 
     except Exception:
 
@@ -1176,14 +1092,10 @@ def fetch_order_book_depth(
             f"&limit={depth_limit}"
         )
 
-        response = requests.get(
+        res = requests.get(
             url,
             timeout=5
-        )
-
-        response.raise_for_status()
-
-        res = response.json()
+        ).json()
 
         if (
             "bids" in res
@@ -1206,7 +1118,6 @@ def fetch_order_book_depth(
         pass
 
 
-    # Fallback
     dummy_bids = np.array(
         [
             [60000 - i * 2, 1.5]
@@ -1229,6 +1140,10 @@ def fetch_order_book_depth(
     )
 
 
+# ============================================================
+# FETCH DATA
+# ============================================================
+
 df = fetch_klines_data(
     selected_symbol,
     selected_tf_label
@@ -1240,7 +1155,7 @@ bids, asks = fetch_order_book_depth(
 
 
 # ============================================================
-# 8. ENGINE
+# MAIN ENGINE
 # ============================================================
 
 if (
@@ -1252,56 +1167,42 @@ if (
 
     lab = TenPaperResearchLab()
 
-
     (
         paper_results,
         final_score,
         evolved_weights
     ) = lab.calculate_all_signals(
-
         df,
         bids,
         asks,
-
         current_inventory=0,
-
         performance_history=
             st.session_state.trade_history_log
     )
 
 
     # ========================================================
-    # CURRENT PRICE
+    # PRICE / ATR
     # ========================================================
 
     close_p = float(
         df["Close"].iloc[-1]
     )
 
-
-    # ========================================================
-    # ATR
-    # ========================================================
-
     atr_val = (
-        (
-            df["High"]
-            -
-            df["Low"]
-        )
-        .rolling(14)
-        .mean()
-        .iloc[-1]
-    )
-
+        df["High"]
+        -
+        df["Low"]
+    ).rolling(14).mean().iloc[-1]
 
     if (
-        np.isnan(atr_val)
-        or
-        atr_val <= 0
+        pd.isna(atr_val)
+        or atr_val <= 0
     ):
 
-        atr_val = close_p * 0.005
+        atr_val = (
+            close_p * 0.005
+        )
 
 
     # ========================================================
@@ -1309,17 +1210,12 @@ if (
     # ========================================================
 
     direction = (
-
         "LONG"
-
         if final_score >= 0.15
-
-        else (
-
+        else
+        (
             "SHORT"
-
             if final_score <= -0.15
-
             else "NEUTRAL"
         )
     )
@@ -1337,93 +1233,113 @@ if (
 
 
     # ========================================================
-    # TRUE 1:2 RISK REWARD
+    # RISK / REWARD
+    #
+    # FIX:
+    #
+    # Risk = Entry -> SL
+    #
+    # Reward = Risk * 2
+    #
+    # Therefore:
+    #
+    # LONG:
+    # SL = Entry - Risk
+    # TP1 = Entry + 2Risk
+    #
+    # SHORT:
+    # SL = Entry + Risk
+    # TP1 = Entry - 2Risk
+    #
+    # EXACT 1:2
     # ========================================================
 
-    RISK_DISTANCE = (
-        1.0 * atr_val
-    )
-
-    REWARD_DISTANCE = (
-        2.0 * atr_val
+    risk_distance = float(
+        atr_val
     )
 
 
     if direction == "LONG":
 
-        sl_val = (
-            close_p
+        entry_price = close_p
+
+        stop_loss = (
+            entry_price
             -
-            RISK_DISTANCE
+            risk_distance
         )
 
-        tp1_val = (
-            close_p
+        tp1 = (
+            entry_price
             +
-            REWARD_DISTANCE
+            (
+                risk_distance * 2.0
+            )
         )
 
-        tp2_val = tp1_val
-
+        tp2 = (
+            entry_price
+            +
+            (
+                risk_distance * 3.0
+            )
+        )
 
     elif direction == "SHORT":
 
-        sl_val = (
-            close_p
+        entry_price = close_p
+
+        stop_loss = (
+            entry_price
             +
-            RISK_DISTANCE
+            risk_distance
         )
 
-        tp1_val = (
-            close_p
+        tp1 = (
+            entry_price
             -
-            REWARD_DISTANCE
-        )
-
-        tp2_val = tp1_val
-
-
-    else:
-
-        sl_val = close_p
-        tp1_val = close_p
-        tp2_val = close_p
-
-
-    # ========================================================
-    # ACTUAL RR
-    # ========================================================
-
-    if direction in [
-        "LONG",
-        "SHORT"
-    ]:
-
-        risk_distance = abs(
-            close_p - sl_val
-        )
-
-        reward_distance = abs(
-            tp1_val - close_p
-        )
-
-        if risk_distance > 0:
-
-            actual_rr = (
-                reward_distance
-                /
-                risk_distance
+            (
+                risk_distance * 2.0
             )
+        )
 
-        else:
-
-            actual_rr = 0.0
+        tp2 = (
+            entry_price
+            -
+            (
+                risk_distance * 3.0
+            )
+        )
 
     else:
 
-        risk_distance = 0.0
-        reward_distance = 0.0
-        actual_rr = 0.0
+        entry_price = close_p
+        stop_loss = close_p
+        tp1 = close_p
+        tp2 = close_p
+
+
+    # ACTUAL RR CALCULATION
+
+    actual_risk = abs(
+        entry_price
+        -
+        stop_loss
+    )
+
+    actual_reward = abs(
+        tp1
+        -
+        entry_price
+    )
+
+    rr_ratio = (
+        actual_reward
+        /
+        actual_risk
+        if actual_risk > 0
+        else 0
+    )
 
 
     # ========================================================
@@ -1431,20 +1347,38 @@ if (
     # ========================================================
 
     beam_level = (
-        close_p
+        entry_price
         +
-        2.0 * atr_val
+        (
+            risk_distance * 3
+        )
+        if direction == "LONG"
+        else
+        entry_price
+        -
+        (
+            risk_distance * 3
+        )
     )
 
     base_level = (
-        close_p
+        entry_price
         -
-        2.0 * atr_val
+        (
+            risk_distance * 1
+        )
+        if direction == "LONG"
+        else
+        entry_price
+        +
+        (
+            risk_distance * 1
+        )
     )
 
 
     # ========================================================
-    # TIME LOCK
+    # SIGNAL TIME LOCK
     # ========================================================
 
     lock_seconds = (
@@ -1460,8 +1394,7 @@ if (
         -
         (
             current_time_sec
-            %
-            lock_seconds
+            % lock_seconds
         )
     )
 
@@ -1470,8 +1403,7 @@ if (
         -
         (
             current_time_sec
-            %
-            lock_seconds
+            % lock_seconds
         )
     )
 
@@ -1485,7 +1417,7 @@ if (
 
 
     # ========================================================
-    # SAVE PAPER TRADE
+    # SAVE NEW TRADE
     # ========================================================
 
     if (
@@ -1495,9 +1427,7 @@ if (
     ):
 
         existing_trade_ids = [
-
             item.get("trade_id")
-
             for item
             in st.session_state.trade_history_log
         ]
@@ -1527,31 +1457,31 @@ if (
 
                 "entry_price":
                     round(
-                        close_p,
+                        entry_price,
                         2
                     ),
 
                 "stop_loss":
                     round(
-                        sl_val,
+                        stop_loss,
                         2
                     ),
 
                 "tp1":
                     round(
-                        tp1_val,
+                        tp1,
                         2
                     ),
 
                 "tp2":
                     round(
-                        tp2_val,
+                        tp2,
                         2
                     ),
 
                 "exit_price":
                     round(
-                        close_p,
+                        entry_price,
                         2
                     ),
 
@@ -1574,7 +1504,7 @@ if (
                     "Active",
 
                 "status":
-                    "Open"
+                    "Open",
             }
 
 
@@ -1582,7 +1512,6 @@ if (
                 0,
                 new_trade
             )
-
 
             save_persistent_history(
                 st.session_state.trade_history_log
@@ -1593,148 +1522,169 @@ if (
     # UPDATE OPEN TRADES
     # ========================================================
 
+    history_changed = False
+
+
     for trade in (
         st.session_state.trade_history_log
     ):
 
         if (
             trade.get("outcome")
-            == "PENDING"
-
-            and
-
-            trade.get("symbol")
-            == selected_symbol
+            !=
+            "PENDING"
         ):
-
-            curr_price = close_p
-
-            entry = float(
-                trade["entry_price"]
-            )
-
-            sl = float(
-                trade["stop_loss"]
-            )
-
-            tp = float(
-                trade["tp1"]
-            )
+            continue
 
 
-            # LONG
-            if trade["direction"] == "LONG":
+        if (
+            trade.get("symbol")
+            !=
+            selected_symbol
+        ):
+            continue
 
-                if curr_price >= tp:
 
-                    trade["outcome"] = "WIN"
+        curr_price = close_p
 
-                    trade["exit_price"] = round(
-                        curr_price,
-                        2
-                    )
+        entry = float(
+            trade["entry_price"]
+        )
 
-                    trade["pnl_percent"] = round(
+        sl = float(
+            trade["stop_loss"]
+        )
+
+        tp = float(
+            trade["tp1"]
+        )
+
+
+        if trade["direction"] == "LONG":
+
+            if curr_price >= tp:
+
+                trade["outcome"] = "WIN"
+
+                trade["exit_price"] = round(
+                    curr_price,
+                    2
+                )
+
+                trade["pnl_percent"] = round(
+                    (
                         (
-                            (
-                                curr_price
-                                -
-                                entry
-                            )
-                            /
+                            curr_price
+                            -
                             entry
                         )
-                        * 100,
-                        2
+                        /
+                        entry
                     )
+                    *
+                    100,
+                    2
+                )
 
-                    trade["status"] = "Closed"
+                trade["status"] = "Closed"
+
+                history_changed = True
 
 
-                elif curr_price <= sl:
+            elif curr_price <= sl:
 
-                    trade["outcome"] = "LOSS"
+                trade["outcome"] = "LOSS"
 
-                    trade["exit_price"] = round(
-                        curr_price,
-                        2
-                    )
+                trade["exit_price"] = round(
+                    curr_price,
+                    2
+                )
 
-                    trade["pnl_percent"] = round(
+                trade["pnl_percent"] = round(
+                    (
                         (
-                            (
-                                curr_price
-                                -
-                                entry
-                            )
-                            /
+                            curr_price
+                            -
                             entry
                         )
-                        * 100,
-                        2
+                        /
+                        entry
                     )
+                    *
+                    100,
+                    2
+                )
 
-                    trade["status"] = "Closed"
+                trade["status"] = "Closed"
+
+                history_changed = True
 
 
-            # SHORT
-            elif trade["direction"] == "SHORT":
+        elif trade["direction"] == "SHORT":
 
-                if curr_price <= tp:
+            if curr_price <= tp:
 
-                    trade["outcome"] = "WIN"
+                trade["outcome"] = "WIN"
 
-                    trade["exit_price"] = round(
-                        curr_price,
-                        2
-                    )
+                trade["exit_price"] = round(
+                    curr_price,
+                    2
+                )
 
-                    trade["pnl_percent"] = round(
+                trade["pnl_percent"] = round(
+                    (
                         (
-                            (
-                                entry
-                                -
-                                curr_price
-                            )
-                            /
                             entry
+                            -
+                            curr_price
                         )
-                        * 100,
-                        2
+                        /
+                        entry
                     )
+                    *
+                    100,
+                    2
+                )
 
-                    trade["status"] = "Closed"
+                trade["status"] = "Closed"
+
+                history_changed = True
 
 
-                elif curr_price >= sl:
+            elif curr_price >= sl:
 
-                    trade["outcome"] = "LOSS"
+                trade["outcome"] = "LOSS"
 
-                    trade["exit_price"] = round(
-                        curr_price,
-                        2
-                    )
+                trade["exit_price"] = round(
+                    curr_price,
+                    2
+                )
 
-                    trade["pnl_percent"] = round(
+                trade["pnl_percent"] = round(
+                    (
                         (
-                            (
-                                entry
-                                -
-                                curr_price
-                            )
-                            /
                             entry
+                            -
+                            curr_price
                         )
-                        * 100,
-                        2
+                        /
+                        entry
                     )
+                    *
+                    100,
+                    2
+                )
 
-                    trade["status"] = "Closed"
+                trade["status"] = "Closed"
+
+                history_changed = True
 
 
-    save_persistent_history(
-        st.session_state.trade_history_log
-    )
+    if history_changed:
+
+        save_persistent_history(
+            st.session_state.trade_history_log
+        )
 
 
     # ========================================================
@@ -1747,7 +1697,7 @@ if (
 
     disp_vol = (
         np.sum(asks[:, 1])
-        if len(asks) > 0
+        if len(asks)
         else 1.0
     )
 
@@ -1755,10 +1705,9 @@ if (
         risk_engine.calculate_risk_metrics(
 
             liquidation_volumes=
-                np.array([
-                    1000,
-                    2500
-                ]),
+                np.array(
+                    [1000, 2500]
+                ),
 
             displayed_vol=
                 disp_vol,
@@ -1792,21 +1741,17 @@ if (
     # HEADER
     # ========================================================
 
-    dir_color = (
+    if direction == "LONG":
 
-        "#00e676"
+        dir_color = "#00e676"
 
-        if direction == "LONG"
+    elif direction == "SHORT":
 
-        else (
+        dir_color = "#ff5252"
 
-            "#ff5252"
+    else:
 
-            if direction == "SHORT"
-
-            else "#38bdf8"
-        )
-    )
+        dir_color = "#38bdf8"
 
 
     mins_rem, secs_rem = divmod(
@@ -1817,342 +1762,311 @@ if (
 
     st.markdown(
         f"""
-        <div class="top-status-bar">
+<div class="top-status-bar">
 
-            🟢
-            <b>[{selected_symbol}]</b>
+🟢 <b>{selected_symbol}</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            Price:
-            <b>${close_p:,.2f}</b>
+Price:
+<b>${close_p:,.2f}</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            TF:
-            <b>{selected_tf_label}</b>
+TF:
+<b>{selected_tf_label}</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            SIGNAL:
+Signal:
 
-            <span style="color:{dir_color};">
-                {direction}
-            </span>
+<span style="color:{dir_color}; font-weight:800;">
+{direction}
+</span>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            Score:
-            <b>{final_score:+.3f}</b>
+Score:
+<b>{final_score:+.3f}</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            Confidence:
-            <b>{confidence}%</b>
+Confidence:
+<b>{confidence}%</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            R:R:
-            <b>1:{actual_rr:.2f}</b>
+RR:
+<b>1 : {rr_ratio:.2f}</b>
 
-            &nbsp;|&nbsp;
+&nbsp; | &nbsp;
 
-            ⏳ Next Reset:
-            <b>
-                {mins_rem}m {secs_rem}s
-            </b>
+Next Reset:
+<b>{mins_rem}m {secs_rem}s</b>
 
-        </div>
-        """,
+</div>
+""",
         unsafe_allow_html=True
     )
 
 
     # ========================================================
-    # SIGNAL METRICS
+    # SIGNAL CARDS
     # ========================================================
 
-    col_sig, col_m1, col_m2, col_m3, col_m4 = (
+    st.markdown(
+        '<div class="section-title">🎯 Signal Execution</div>',
+        unsafe_allow_html=True
+    )
+
+
+    col1, col2, col3, col4, col5 = (
         st.columns(
-            [1.3, 1, 1, 1, 1]
+            [1.25, 1, 1, 1, 1]
         )
     )
 
 
-    with col_sig:
+    with col1:
 
         st.markdown(
             f"""
-            <div class="metric-card"
-                 style="
-                 border-left:
-                 4px solid {dir_color};
-                 ">
+<div class="metric-card"
+style="border-left:4px solid {dir_color};">
 
-                <div class="metric-label">
-                    Signal Execution Panel
-                </div>
+<div class="metric-label">
+SIGNAL
+</div>
 
-                <div style="
-                    font-size:24px;
-                    font-weight:800;
-                    color:{dir_color};
-                ">
-                    {direction}
-                </div>
+<div style="
+font-size:25px;
+font-weight:800;
+color:{dir_color};
+">
 
-                <div style="
-                    font-size:11px;
-                    color:#94a3b8;
-                    margin-top:6px;
-                ">
+{direction}
 
-                    Entry:
-                    ${close_p:,.2f}
+</div>
 
-                    <br>
+<div style="
+font-size:11px;
+color:#8b949e;
+">
 
-                    Stop Loss:
-                    ${sl_val:,.2f}
+Entry ${entry_price:,.2f}
 
-                </div>
+</div>
 
-                <div style="
-                    font-size:11px;
-                    color:#38bdf8;
-                    margin-top:4px;
-                ">
-
-                    TP1:
-                    ${tp1_val:,.2f}
-
-                    <br>
-
-                    TP2:
-                    ${tp2_val:,.2f}
-
-                </div>
-
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
-    with col_m1:
+    with col2:
 
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div class="metric-label">
-                    BEAM Target
-                </div>
+<div class="metric-label">
+STOP LOSS
+</div>
 
-                <div class="metric-val-blue">
-                    ${beam_level:,.2f}
-                </div>
+<div class="metric-val-red">
+${stop_loss:,.2f}
+</div>
 
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
+    with col3:
+
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div class="metric-label">
-                    BASE Target
-                </div>
+<div class="metric-label">
+TP1 — 1:2
+</div>
 
-                <div class="metric-val-red">
-                    ${base_level:,.2f}
-                </div>
+<div class="metric-val-green">
+${tp1:,.2f}
+</div>
 
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
-    with col_m2:
+    with col4:
 
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div class="metric-label">
-                    Risk / Reward
-                </div>
+<div class="metric-label">
+TP2 — 1:3
+</div>
 
-                <div class="metric-val-blue">
-                    1 : {actual_rr:.2f}
-                </div>
+<div class="metric-val-blue">
+${tp2:,.2f}
+</div>
 
-                <div style="
-                    font-size:10px;
-                    color:#64748b;
-                    margin-top:4px;
-                ">
-
-                    Risk:
-                    {risk_distance:,.2f}
-
-                    &nbsp; | &nbsp;
-
-                    Reward:
-                    {reward_distance:,.2f}
-
-                </div>
-
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
+
+    with col5:
+
+        st.markdown(
+            f"""
+<div class="metric-card">
+
+<div class="metric-label">
+RISK / REWARD
+</div>
+
+<div class="metric-val-blue">
+1 : {rr_ratio:.2f}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+
+    # ========================================================
+    # SECOND METRIC ROW
+    # ========================================================
+
+    c1, c2, c3, c4 = (
+        st.columns(4)
+    )
+
+
+    with c1:
+
+        st.markdown(
+            f"""
+<div class="metric-card">
+
+<div class="metric-label">
+BEAM TARGET
+</div>
+
+<div class="metric-val-blue">
+${beam_level:,.2f}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+
+    with c2:
+
+        st.markdown(
+            f"""
+<div class="metric-card">
+
+<div class="metric-label">
+BASE / INVALIDATION
+</div>
+
+<div class="metric-val-red">
+${base_level:,.2f}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+
+    with c3:
 
         strength = (
-
-            "VERY STRONG"
-
-            if confidence >= 80
-
-            else (
-
-                "STRONG"
-
-                if confidence >= 65
-
-                else "MODERATE"
+            "HIGH"
+            if confidence >= 75
+            else
+            (
+                "MEDIUM"
+                if confidence >= 55
+                else "LOW"
             )
         )
 
-
-        strength_color = (
-
-            "#00e676"
-            if confidence >= 65
-            else "#f59e0b"
+        strength_class = (
+            "metric-val-green"
+            if strength == "HIGH"
+            else
+            "metric-val-blue"
         )
-
 
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div class="metric-label">
-                    Signal Strength
-                </div>
+<div class="metric-label">
+SIGNAL STRENGTH
+</div>
 
-                <div style="
-                    font-size:18px;
-                    font-weight:800;
-                    color:{strength_color};
-                ">
-                    {strength}
-                </div>
+<div class="{strength_class}">
+{strength}
+</div>
 
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
-    with col_m3:
+    with c4:
 
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div class="metric-label">
-                    LTZ Score
-                </div>
+<div class="metric-label">
+CONFIDENCE
+</div>
 
-                <div class="metric-val-blue">
-                    {risk_metrics["LTZ_Score"]:.2f}
-                </div>
+<div class="metric-val-blue">
+{confidence}%
+</div>
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-        st.markdown(
-            f"""
-            <div class="metric-card">
-
-                <div class="metric-label">
-                    Spoof Score
-                </div>
-
-                <div class="metric-val-red">
-                    {risk_metrics["Spoof_Score"]:.3f}
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-    with col_m4:
-
-        st.markdown(
-            f"""
-            <div class="metric-card">
-
-                <div class="metric-label">
-                    Squeeze Risk
-                </div>
-
-                <div class="metric-val-red">
-                    {risk_metrics["Squeeze_Risk"]:.2f}
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-        st.markdown(
-            f"""
-            <div class="metric-card">
-
-                <div class="metric-label">
-                    Market Risk
-                </div>
-
-                <div class="metric-val-red">
-                    {risk_metrics["Market_Risk"]:.2f}
-                </div>
-
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
     # ========================================================
-    # PRICE CHART + MICROSTRUCTURE
+    # PRICE CHART
     # ========================================================
 
-    col_chart, col_risk_panel = (
+    st.markdown("---")
+
+    chart_col, right_col = (
         st.columns(
             [2.5, 1]
         )
     )
 
 
-    with col_chart:
+    with chart_col:
 
         st.markdown(
-            '<div class="section-title">'
-            'Price Trajectory & Levels'
-            '</div>',
+            '<div class="section-title">📈 Price Trajectory & Levels</div>',
             unsafe_allow_html=True
         )
 
@@ -2161,15 +2075,12 @@ if (
             minutes=tf_minutes
         )
 
-
         future_times = [
-
             df["Time"].iloc[-1]
             +
             (
                 i * time_delta
             )
-
             for i
             in range(
                 1,
@@ -2191,14 +2102,11 @@ if (
                 close_p
                 +
                 (
-                    tp1_val
-                    -
-                    close_p
+                    tp1 - close_p
                 )
                 *
                 np.sin(t_steps)
             )
-
 
         elif direction == "SHORT":
 
@@ -2206,14 +2114,11 @@ if (
                 close_p
                 -
                 (
-                    close_p
-                    -
-                    tp1_val
+                    close_p - tp1
                 )
                 *
                 np.sin(t_steps)
             )
-
 
         else:
 
@@ -2225,7 +2130,6 @@ if (
         fig = go.Figure()
 
 
-        # Candles
         fig.add_trace(
             go.Candlestick(
 
@@ -2241,14 +2145,15 @@ if (
 
                 name="Price",
 
-                increasing_line_color="#00e676",
+                increasing_line_color=
+                    "#00e676",
 
-                decreasing_line_color="#ff5252"
+                decreasing_line_color=
+                    "#ff5252",
             )
         )
 
 
-        # Forecast
         fig.add_trace(
             go.Scatter(
 
@@ -2262,14 +2167,19 @@ if (
                     close_p
                 ]
                 +
-                list(forecast_prices),
+                list(
+                    forecast_prices
+                ),
 
-                mode="lines+markers",
+                mode=
+                    "lines+markers",
 
-                name="Trajectory",
+                name=
+                    "Forecast",
 
                 line=dict(
-                    color=dir_color,
+                    color=
+                        dir_color,
                     width=2,
                     dash="dot"
                 )
@@ -2277,59 +2187,30 @@ if (
         )
 
 
-        # TP
         fig.add_hline(
-
-            y=tp1_val,
-
+            y=tp1,
             line_dash="dash",
-
             line_color="#00e676",
-
             annotation_text=
-                f"TP 1:2 ${tp1_val:,.2f}"
+                f"TP1 1:2 ${tp1:,.2f}"
         )
 
 
-        # SL
         fig.add_hline(
-
-            y=sl_val,
-
-            line_dash="dot",
-
-            line_color="#ff5252",
-
-            annotation_text=
-                f"SL ${sl_val:,.2f}"
-        )
-
-
-        # Beam
-        fig.add_hline(
-
-            y=beam_level,
-
+            y=tp2,
             line_dash="dash",
-
             line_color="#38bdf8",
-
             annotation_text=
-                f"BEAM ${beam_level:,.2f}"
+                f"TP2 1:3 ${tp2:,.2f}"
         )
 
 
-        # Base
         fig.add_hline(
-
-            y=base_level,
-
-            line_dash="dash",
-
-            line_color="#f59e0b",
-
+            y=stop_loss,
+            line_dash="dot",
+            line_color="#ff5252",
             annotation_text=
-                f"BASE ${base_level:,.2f}"
+                f"SL ${stop_loss:,.2f}"
         )
 
 
@@ -2341,59 +2222,49 @@ if (
 
             xaxis_rangeslider_visible=False,
 
-            paper_bgcolor="#111622",
+            paper_bgcolor=
+                "#111622",
 
-            plot_bgcolor="#111622",
+            plot_bgcolor=
+                "#111622",
 
             margin=dict(
                 l=10,
                 r=10,
-                t=20,
+                t=10,
                 b=10
             ),
 
             legend=dict(
-                orientation="h",
-                y=1.02,
-                x=0
+                orientation="h"
             )
         )
 
 
         st.plotly_chart(
             fig,
-            use_container_width=True,
-            config={
-                "displayModeBar": False
-            }
+            use_container_width=True
         )
 
 
     # ========================================================
-    # MICROSTRUCTURE PANEL
+    # MICROSTRUCTURE
     # ========================================================
 
-    with col_risk_panel:
+    with right_col:
 
         st.markdown(
-            '<div class="section-title">'
-            'Market Microstructure'
-            '</div>',
+            '<div class="section-title">📊 Market Microstructure</div>',
             unsafe_allow_html=True
         )
 
 
         bid_vol_sum = (
             np.sum(bids[:, 1])
-            if len(bids) > 0
-            else 1.0
         )
-
 
         ask_vol_sum = (
             np.sum(asks[:, 1])
-            if len(asks) > 0
-            else 1.0
         )
 
 
@@ -2405,134 +2276,120 @@ if (
             bid_vol_sum
             +
             ask_vol_sum
+            +
+            1e-8
         )
 
 
-        spread_val = (
-
-            abs(
-                asks[0, 0]
-                -
-                bids[0, 0]
-            )
-
-            if (
-                len(bids) > 0
-                and
-                len(asks) > 0
-            )
-
-            else 0.0
+        spread_val = abs(
+            asks[0, 0]
+            -
+            bids[0, 0]
         )
 
 
         st.markdown(
             f"""
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div style="
-                    display:flex;
-                    justify-content:space-between;
-                    margin-bottom:10px;
-                ">
+<div style="
+display:flex;
+justify-content:space-between;
+margin-bottom:9px;
+">
 
-                    <span>Bid Volume</span>
+<span>Bid Volume</span>
 
-                    <b style="color:#00e676;">
-                        {bid_vol_sum:,.2f}
-                    </b>
+<b style="color:#00e676;">
+{bid_vol_sum:,.2f}
+</b>
 
-                </div>
-
-
-                <div style="
-                    display:flex;
-                    justify-content:space-between;
-                    margin-bottom:10px;
-                ">
-
-                    <span>Ask Volume</span>
-
-                    <b style="color:#ff5252;">
-                        {ask_vol_sum:,.2f}
-                    </b>
-
-                </div>
+</div>
 
 
-                <div style="
-                    display:flex;
-                    justify-content:space-between;
-                    margin-bottom:10px;
-                ">
+<div style="
+display:flex;
+justify-content:space-between;
+margin-bottom:9px;
+">
 
-                    <span>OBI</span>
+<span>Ask Volume</span>
 
-                    <b style="color:#38bdf8;">
-                        {obi_val:+.3f}
-                    </b>
+<b style="color:#ff5252;">
+{ask_vol_sum:,.2f}
+</b>
 
-                </div>
-
-
-                <div style="
-                    display:flex;
-                    justify-content:space-between;
-                    margin-bottom:10px;
-                ">
-
-                    <span>Spread</span>
-
-                    <b>
-                        ${spread_val:.2f}
-                    </b>
-
-                </div>
+</div>
 
 
-                <div style="
-                    display:flex;
-                    justify-content:space-between;
-                ">
+<div style="
+display:flex;
+justify-content:space-between;
+margin-bottom:9px;
+">
 
-                    <span>Risk Status</span>
+<span>OBI</span>
 
-                    <b style="color:#00e676;">
-                        LOW-MEDIUM
-                    </b>
+<b style="color:#38bdf8;">
+{obi_val:+.3f}
+</b>
 
-                </div>
+</div>
 
-            </div>
-            """,
+
+<div style="
+display:flex;
+justify-content:space-between;
+margin-bottom:9px;
+">
+
+<span>Spread</span>
+
+<b>
+${spread_val:.2f}
+</b>
+
+</div>
+
+
+<div style="
+display:flex;
+justify-content:space-between;
+">
+
+<span>RR</span>
+
+<b style="color:#38bdf8;">
+1 : {rr_ratio:.2f}
+</b>
+
+</div>
+
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
         st.markdown(
-            '<div class="section-title">'
-            'Top 20 OBI Analysis'
-            '</div>',
-            unsafe_allow_html=True
+            "#### Top 20 OBI"
         )
 
 
         fig_obi = go.Figure(
             go.Bar(
-
                 x=[
                     "Top 5",
                     "Top 10",
                     "Top 20"
                 ],
-
                 y=[
                     obi_val * 0.8,
                     obi_val * 0.9,
                     obi_val
                 ],
-
-                marker_color="#38bdf8"
+                marker_color=
+                    "#38bdf8"
             )
         )
 
@@ -2544,24 +2401,103 @@ if (
             margin=dict(
                 l=0,
                 r=0,
-                t=0,
+                t=5,
                 b=0
             ),
 
-            paper_bgcolor="#111622",
+            paper_bgcolor=
+                "#111622",
 
-            plot_bgcolor="#111622"
+            plot_bgcolor=
+                "#111622",
+
+            template=
+                "plotly_dark"
         )
 
 
         st.plotly_chart(
             fig_obi,
             use_container_width=True,
-
             config={
-                "displayModeBar": False
+                "displayModeBar":
+                    False
             }
         )
+
+
+    # ========================================================
+    # RISK PANEL
+    # ========================================================
+
+    st.markdown("---")
+
+    st.markdown(
+        '<div class="section-title">🛡️ Risk Engine</div>',
+        unsafe_allow_html=True
+    )
+
+
+    r1, r2, r3, r4 = (
+        st.columns(4)
+    )
+
+
+    risk_values = [
+
+        (
+            "LTZ SCORE",
+            risk_metrics["LTZ_Score"],
+            "metric-val-blue"
+        ),
+
+        (
+            "SPOOF SCORE",
+            risk_metrics["Spoof_Score"],
+            "metric-val-red"
+        ),
+
+        (
+            "SQUEEZE RISK",
+            risk_metrics["Squeeze_Risk"],
+            "metric-val-red"
+        ),
+
+        (
+            "MARKET RISK",
+            risk_metrics["Market_Risk"],
+            "metric-val-blue"
+        ),
+    ]
+
+
+    for col, (
+        label,
+        value,
+        cls
+    ) in zip(
+        [r1, r2, r3, r4],
+        risk_values
+    ):
+
+        with col:
+
+            st.markdown(
+                f"""
+<div class="metric-card">
+
+<div class="metric-label">
+{label}
+</div>
+
+<div class="{cls}">
+{value:.3f}
+</div>
+
+</div>
+""",
+                unsafe_allow_html=True
+            )
 
 
     # ========================================================
@@ -2571,21 +2507,19 @@ if (
     st.markdown("---")
 
     st.markdown(
-        '<div class="section-title">'
-        '🔬 12-Paper Quantitative Research Scoreboard'
-        '</div>',
+        '<div class="section-title">🔬 12-Paper Quantitative Research Scoreboard</div>',
         unsafe_allow_html=True
     )
 
 
-    col_sc1, col_sc2 = (
+    score_col, insight_col = (
         st.columns(
-            [1.5, 1]
+            [1.7, 1]
         )
     )
 
 
-    with col_sc1:
+    with score_col:
 
         paper_table_data = []
 
@@ -2593,18 +2527,14 @@ if (
         for k, v in paper_results.items():
 
             status = (
-
                 "PASS 🟢"
-
                 if v > 0.1
-
-                else (
-
+                else
+                (
                     "FAIL 🔴"
-
                     if v < -0.1
-
-                    else "NEUTRAL ⚪"
+                    else
+                    "NEUTRAL ⚪"
                 )
             )
 
@@ -2618,96 +2548,80 @@ if (
                     f"{v:+.3f}",
 
                 "Weight":
-                    (
-                        f"{evolved_weights.get(k, 0.083) * 100:.1f}%"
-                    ),
+                    f"{evolved_weights.get(k, 0.083) * 100:.1f}%",
 
                 "Status":
-                    status
+                    status,
             })
 
 
         st.dataframe(
-
             pd.DataFrame(
                 paper_table_data
             ),
-
             use_container_width=True,
-
             hide_index=True,
-
-            height=290
+            height=300
         )
 
 
-    with col_sc2:
+    with insight_col:
 
         st.markdown(
             """
-            <div class="metric-card">
+<div class="metric-card">
 
-                <div style="
-                    font-size:15px;
-                    font-weight:800;
-                    color:#38bdf8;
-                    margin-bottom:10px;
-                ">
-                    Advanced Model Insights
-                </div>
+<div style="
+font-size:14px;
+font-weight:800;
+color:#38bdf8;
+margin-bottom:10px;
+">
 
-                <div style="
-                    font-size:12px;
-                    color:#cbd5e1;
-                    line-height:1.8;
-                ">
+Advanced Model Insights
 
-                    • <b>HAWKES:</b>
-                    Order clustering and activity.
+</div>
 
-                    <br>
+<div style="
+font-size:12px;
+color:#cbd5e1;
+line-height:1.7;
+">
 
-                    • <b>BOOK_IMB:</b>
-                    Bid/ask depth pressure.
+<b>HAWKES</b><br>
+Aggressive order clustering.
 
-                    <br>
+<br><br>
 
-                    • <b>TAKER_FLOW:</b>
-                    Aggressive directional flow.
+<b>BOOK_IMB</b><br>
+Bid/ask depth pressure.
 
-                    <br>
+<br><br>
 
-                    • <b>BAYESIAN:</b>
-                    Probability adjustment.
+<b>TAKER_FLOW</b><br>
+Directional volume pressure.
 
-                    <br>
+<br><br>
 
-                    • <b>RMT_DOM:</b>
-                    Market regime dominance.
+<b>REWARD_RISK</b><br>
+Target quality filter.
 
-                    <br>
+</div>
 
-                    • <b>REWARD_RISK:</b>
-                    Reward/risk quality filter.
-
-                </div>
-
-            </div>
-            """,
+</div>
+""",
             unsafe_allow_html=True
         )
 
 
     # ========================================================
-    # 13 PERFORMANCE
+    # PERFORMANCE
     # ========================================================
 
     st.markdown("---")
 
     st.markdown(
-        '<div class="section-title">'
-        '📊 Performance Summary & Win Rate'
-        '</div>',
+        '<div class="section-title">📊 Performance & Trade History</div>',
         unsafe_allow_html=True
     )
 
@@ -2719,16 +2633,12 @@ if (
         )
 
 
-        # ----------------------------------------------------
-        # FILTERS
-        # ----------------------------------------------------
-
-        f_col1, f_col2, f_col3 = (
+        f1, f2, f3 = (
             st.columns(3)
         )
 
 
-        with f_col1:
+        with f1:
 
             coin_filter = st.selectbox(
                 "Filter Coin",
@@ -2736,7 +2646,7 @@ if (
             )
 
 
-        with f_col2:
+        with f2:
 
             tf_filter = st.selectbox(
                 "Filter Timeframe",
@@ -2748,7 +2658,7 @@ if (
             )
 
 
-        with f_col3:
+        with f3:
 
             dir_filter = st.selectbox(
                 "Filter Direction",
@@ -2760,7 +2670,9 @@ if (
             )
 
 
-        filtered_df = df_log.copy()
+        filtered_df = (
+            df_log.copy()
+        )
 
 
         if coin_filter != "ALL":
@@ -2790,14 +2702,9 @@ if (
             ]
 
 
-        # ----------------------------------------------------
-        # PERFORMANCE METRICS
-        # ----------------------------------------------------
-
         total_signals = len(
             filtered_df
         )
-
 
         wins = len(
             filtered_df[
@@ -2807,7 +2714,6 @@ if (
             ]
         )
 
-
         losses = len(
             filtered_df[
                 filtered_df["outcome"]
@@ -2815,7 +2721,6 @@ if (
                 "LOSS"
             ]
         )
-
 
         pending = len(
             filtered_df[
@@ -2825,25 +2730,19 @@ if (
             ]
         )
 
-
         closed_trades = (
             wins + losses
         )
 
 
         win_rate = (
-
-            (
-                wins
-                /
-                closed_trades
-            )
+            wins
+            /
+            closed_trades
             *
             100
-
             if closed_trades > 0
-
-            else 0.0
+            else 0
         )
 
 
@@ -2866,29 +2765,19 @@ if (
 
 
         gross_profit = (
-
             winning_trades_df[
                 "pnl_percent"
             ].sum()
-
             if not winning_trades_df.empty
-
-            else 0.0
+            else 0
         )
 
 
-        gross_loss = (
-
-            abs(
-                losing_trades_df[
-                    "pnl_percent"
-                ].sum()
-            )
-
-            if not losing_trades_df.empty
-
-            else 0.0
-        )
+        gross_loss = abs(
+            losing_trades_df[
+                "pnl_percent"
+            ].sum()
+        ) if not losing_trades_df.empty else 0
 
 
         net_pnl = (
@@ -2899,172 +2788,110 @@ if (
 
 
         profit_factor = (
-
             gross_profit
             /
             gross_loss
-
             if gross_loss > 0
-
             else (
-
                 gross_profit
                 if gross_profit > 0
-                else 0.0
+                else 0
             )
         )
 
-
-        # ----------------------------------------------------
-        # PERFORMANCE CARDS
-        # ----------------------------------------------------
 
         p1, p2, p3, p4, p5, p6 = (
             st.columns(6)
         )
 
 
-        with p1:
+        metrics = [
 
-            st.markdown(
-                f"""
-                <div class="metric-card">
+            (
+                "WIN RATE",
+                f"{win_rate:.1f}%",
+                "metric-val-green"
+            ),
 
-                    <div class="metric-label">
-                        Win Rate
-                    </div>
+            (
+                "CLOSED",
+                str(closed_trades),
+                "metric-val-blue"
+            ),
 
-                    <div class="metric-val-green">
-                        {win_rate:.1f}%
-                    </div>
+            (
+                "WINS / LOSSES",
+                f"{wins}W / {losses}L",
+                "metric-val-green"
+            ),
 
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+            (
+                "PENDING",
+                str(pending),
+                "metric-val-blue"
+            ),
 
+            (
+                "PROFIT FACTOR",
+                f"{profit_factor:.2f}",
+                "metric-val-blue"
+            ),
 
-        with p2:
-
-            st.markdown(
-                f"""
-                <div class="metric-card">
-
-                    <div class="metric-label">
-                        Closed Trades
-                    </div>
-
-                    <div class="metric-val-blue">
-                        {closed_trades}
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-
-        with p3:
-
-            st.markdown(
-                f"""
-                <div class="metric-card">
-
-                    <div class="metric-label">
-                        Wins / Losses
-                    </div>
-
-                    <div style="
-                        font-size:17px;
-                        font-weight:800;
-                        color:#00e676;
-                    ">
-                        {wins}W / {losses}L
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+            (
+                "NET PNL",
+                f"{net_pnl:+.2f}%",
+                (
+                    "metric-val-green"
+                    if net_pnl >= 0
+                    else
+                    "metric-val-red"
+                )
+            ),
+        ]
 
 
-        with p4:
+        for col, (
+            label,
+            value,
+            cls
+        ) in zip(
+            [
+                p1,
+                p2,
+                p3,
+                p4,
+                p5,
+                p6
+            ],
+            metrics
+        ):
 
-            st.markdown(
-                f"""
-                <div class="metric-card">
+            with col:
 
-                    <div class="metric-label">
-                        Pending
-                    </div>
+                st.markdown(
+                    f"""
+<div class="metric-card">
 
-                    <div class="metric-val-blue">
-                        {pending}
-                    </div>
+<div class="metric-label">
+{label}
+</div>
 
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+<div class="{cls}">
+{value}
+</div>
 
-
-        with p5:
-
-            st.markdown(
-                f"""
-                <div class="metric-card">
-
-                    <div class="metric-label">
-                        Profit Factor
-                    </div>
-
-                    <div class="metric-val-blue">
-                        {profit_factor:.2f}
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+</div>
+""",
+                    unsafe_allow_html=True
+                )
 
 
-        with p6:
-
-            pnl_color = (
-                "#00e676"
-                if net_pnl >= 0
-                else "#ff5252"
-            )
-
-
-            st.markdown(
-                f"""
-                <div class="metric-card">
-
-                    <div class="metric-label">
-                        Net PnL %
-                    </div>
-
-                    <div style="
-                        font-size:18px;
-                        font-weight:800;
-                        color:{pnl_color};
-                    ">
-                        {net_pnl:+.2f}%
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-
-        # ----------------------------------------------------
+        # ====================================================
         # TRADE TABLE
-        # ----------------------------------------------------
+        # ====================================================
 
         st.markdown(
-            "##### Detailed Trade History"
+            "#### 📋 Detailed Trade History"
         )
 
 
@@ -3081,68 +2908,60 @@ if (
             "exit_price",
             "pnl_percent",
             "outcome",
-            "confidence"
+            "confidence",
         ]
 
 
         available_cols = [
-
-            col
-
-            for col
+            c
+            for c
             in display_cols
-
-            if col in filtered_df.columns
+            if c in filtered_df.columns
         ]
 
 
         st.dataframe(
-
             filtered_df[
                 available_cols
             ],
-
             use_container_width=True,
-
             hide_index=True,
-
-            height=300
+            height=320
         )
-
-
-        # ----------------------------------------------------
-        # CLEAR HISTORY
-        # ----------------------------------------------------
-
-        if st.sidebar.button(
-            "🗑️ Clear Trade History Log"
-        ):
-
-            st.session_state.trade_history_log = []
-
-            if os.path.exists(
-                CSV_FILE
-            ):
-
-                os.remove(
-                    CSV_FILE
-                )
-
-            st.rerun()
 
 
     else:
 
         st.info(
-            "No paper trade history recorded yet. "
-            "Signals will automatically log when active."
+            "No paper trades recorded yet."
         )
+
+
+    # ========================================================
+    # CLEAR HISTORY
+    # ========================================================
+
+    st.markdown("---")
+
+    if st.sidebar.button(
+        "🗑️ Clear Trade History"
+    ):
+
+        st.session_state.trade_history_log = []
+
+        if os.path.exists(
+            CSV_FILE
+        ):
+
+            os.remove(
+                CSV_FILE
+            )
+
+        st.rerun()
 
 
 else:
 
     st.warning(
-        "⚠️ Data pipeline initializing "
-        "or connection restricted. "
-        "Please refresh."
+        "⚠️ Data pipeline initializing..."
     )
