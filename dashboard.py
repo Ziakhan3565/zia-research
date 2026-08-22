@@ -1,27 +1,21 @@
 import datetime
 import os
 import time
-import warnings
-
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
 
-warnings.filterwarnings("ignore")
 
-
-# ============================================================
+# =========================================================
 # STREAMLIT CONFIG
-# ============================================================
+# =========================================================
 
 st.set_page_config(
-    page_title="Quant Research Terminal",
+    page_title="TRI Quant Research Terminal",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -30,121 +24,187 @@ st.set_page_config(
 st_autorefresh(
     interval=5000,
     limit=None,
-    key="research_lab_auto_refresh",
+    key="tri_quant_auto_refresh"
 )
-
-
-# ============================================================
-# FILES
-# ============================================================
 
 CSV_FILE = "signal_history.csv"
-MODEL_FILE = "xgboost_obi_model.pkl"
 
 
-# ============================================================
-# PROFESSIONAL DARK UI
-# ============================================================
+# =========================================================
+# CUSTOM CSS
+# =========================================================
 
-st.markdown(
-    """
-    <style>
+st.markdown("""
+<style>
 
-    @import url(
-        'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap'
+html, body, [class*="css"] {
+    font-family: Arial, Helvetica, sans-serif !important;
+}
+
+.stApp {
+    background:
+        radial-gradient(circle at 15% 10%, rgba(56,189,248,0.06), transparent 25%),
+        radial-gradient(circle at 85% 15%, rgba(139,92,246,0.05), transparent 25%),
+        #080b12;
+    color: #e5e7eb;
+}
+
+section[data-testid="stSidebar"] {
+    background: #0b0f17 !important;
+    border-right: 1px solid #1b2433;
+}
+
+.block-container {
+    padding-top: 1rem;
+    padding-bottom: 2rem;
+    max-width: 1600px;
+}
+
+h1, h2, h3, h4 {
+    color: #f8fafc !important;
+}
+
+.topbar {
+    background: linear-gradient(
+        90deg,
+        rgba(17,24,39,0.98),
+        rgba(15,23,42,0.98)
     );
+    border: 1px solid #263247;
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin-bottom: 18px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+}
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif !important;
-    }
+.top-title {
+    font-size: 20px;
+    font-weight: 800;
+    color: #f8fafc;
+}
 
-    .stApp {
-        background-color: #080a0f;
-        color: #e2e8f0;
-    }
+.top-subtitle {
+    font-size: 11px;
+    color: #64748b;
+    margin-top: 4px;
+}
 
-    section[data-testid="stSidebar"] {
-        background-color: #0d1117 !important;
-        border-right: 1px solid #1e2638;
-    }
+.card {
+    background: linear-gradient(
+        145deg,
+        #111722,
+        #0d131d
+    );
+    border: 1px solid #202b3d;
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 12px;
+    box-shadow: 0 8px 25px rgba(0,0,0,0.20);
+}
 
-    .metric-card {
-        background: #111622;
-        border: 1px solid #1e2638;
-        border-radius: 12px;
-        padding: 14px;
-        margin-bottom: 10px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.25);
-    }
+.card-title {
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    margin-bottom: 8px;
+}
 
-    .metric-label {
-        font-size: 11px;
-        font-weight: 600;
-        color: #8b949e;
-        text-transform: uppercase;
-        margin-bottom: 4px;
-    }
+.card-value {
+    color: #f8fafc;
+    font-size: 23px;
+    font-weight: 800;
+}
 
-    .metric-value {
-        font-size: 19px;
-        font-weight: 700;
-    }
+.card-small {
+    color: #64748b;
+    font-size: 11px;
+    margin-top: 5px;
+}
 
-    .top-status-bar {
-        background: #111622;
-        border: 1px solid #1e2638;
-        border-radius: 10px;
-        padding: 12px 18px;
-        margin-bottom: 18px;
-        font-weight: 600;
-        font-size: 13px;
-    }
+.green {
+    color: #22c55e !important;
+}
 
-    .section-title {
-        font-size: 18px;
-        font-weight: 700;
-        margin-top: 10px;
-        margin-bottom: 12px;
-    }
+.red {
+    color: #ef4444 !important;
+}
 
-    .model-box {
-        background: #111622;
-        border: 1px solid #1e2638;
-        border-radius: 10px;
-        padding: 12px;
-        margin-top: 10px;
-        margin-bottom: 15px;
-    }
+.blue {
+    color: #38bdf8 !important;
+}
 
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+.orange {
+    color: #f59e0b !important;
+}
+
+.purple {
+    color: #a78bfa !important;
+}
+
+.signal-long {
+    color: #22c55e;
+    font-size: 27px;
+    font-weight: 900;
+}
+
+.signal-short {
+    color: #ef4444;
+    font-size: 27px;
+    font-weight: 900;
+}
+
+.signal-neutral {
+    color: #38bdf8;
+    font-size: 27px;
+    font-weight: 900;
+}
+
+.section-title {
+    font-size: 18px;
+    font-weight: 800;
+    color: #f8fafc;
+    margin-top: 10px;
+    margin-bottom: 12px;
+}
+
+.rr-box {
+    background: rgba(56,189,248,0.07);
+    border: 1px solid rgba(56,189,248,0.25);
+    border-radius: 12px;
+    padding: 12px;
+    text-align: center;
+}
+
+.rr-value {
+    font-size: 24px;
+    font-weight: 900;
+    color: #38bdf8;
+}
+
+.status-open {
+    color: #38bdf8;
+    font-weight: 800;
+}
+
+.status-win {
+    color: #22c55e;
+    font-weight: 800;
+}
+
+.status-loss {
+    color: #ef4444;
+    font-weight: 800;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 
-# ============================================================
-# PERSISTENT TRADE HISTORY
-# ============================================================
-
-EXPECTED_COLUMNS = [
-    "trade_id",
-    "timestamp",
-    "symbol",
-    "timeframe",
-    "direction",
-    "entry_price",
-    "stop_loss",
-    "tp1",
-    "tp2",
-    "exit_price",
-    "confidence",
-    "final_score",
-    "outcome",
-    "pnl_percent",
-    "duration",
-    "status",
-]
-
+# =========================================================
+# PERSISTENT HISTORY
+# =========================================================
 
 def load_persistent_history():
 
@@ -153,37 +213,44 @@ def load_persistent_history():
 
     try:
 
-        df = pd.read_csv(CSV_FILE)
+        df_hist = pd.read_csv(CSV_FILE)
 
-        for col in EXPECTED_COLUMNS:
+        expected_cols = [
+            "trade_id",
+            "timestamp",
+            "symbol",
+            "timeframe",
+            "direction",
+            "entry_price",
+            "stop_loss",
+            "tp1",
+            "tp2",
+            "exit_price",
+            "confidence",
+            "final_score",
+            "outcome",
+            "pnl_percent",
+            "duration",
+            "status",
+        ]
 
-            if col not in df.columns:
+        for col in expected_cols:
+
+            if col not in df_hist.columns:
 
                 if col == "outcome":
-                    df[col] = "PENDING"
+                    df_hist[col] = "PENDING"
 
                 elif col == "status":
-                    df[col] = "Open"
+                    df_hist[col] = "Open"
 
                 elif col == "duration":
-                    df[col] = "Active"
-
-                elif col in [
-                    "entry_price",
-                    "stop_loss",
-                    "tp1",
-                    "tp2",
-                    "exit_price",
-                    "confidence",
-                    "final_score",
-                    "pnl_percent",
-                ]:
-                    df[col] = 0.0
+                    df_hist[col] = "Active"
 
                 else:
-                    df[col] = ""
+                    df_hist[col] = 0.0
 
-        return df[EXPECTED_COLUMNS].to_dict("records")
+        return df_hist.to_dict("records")
 
     except Exception:
         return []
@@ -193,83 +260,26 @@ def save_persistent_history(history):
 
     try:
 
-        pd.DataFrame(history, columns=EXPECTED_COLUMNS).to_csv(
+        pd.DataFrame(history).to_csv(
             CSV_FILE,
             index=False
         )
 
     except Exception as e:
 
-        st.warning(f"Could not save trade history: {e}")
+        st.error(f"History save error: {e}")
 
 
 if "trade_history_log" not in st.session_state:
 
-    st.session_state.trade_history_log = load_persistent_history()
+    st.session_state.trade_history_log = (
+        load_persistent_history()
+    )
 
 
-# ============================================================
-# XGBOOST MODEL LOADER
-# ============================================================
-
-@st.cache_resource
-def load_xgboost_model():
-
-    if not os.path.exists(MODEL_FILE):
-        return None
-
-    try:
-
-        model = joblib.load(MODEL_FILE)
-
-        return model
-
-    except Exception:
-
-        return None
-
-
-xgb_model = load_xgboost_model()
-
-
-# ============================================================
-# XGBOOST PREDICTION
-# ============================================================
-
-def get_xgb_prediction(model, features):
-
-    if model is None:
-        return None, None
-
-    try:
-
-        feature_values = np.array(
-            [features[key] for key in features],
-            dtype=float
-        ).reshape(1, -1)
-
-        if hasattr(model, "predict_proba"):
-
-            probability = model.predict_proba(feature_values)[0]
-
-            prediction = int(np.argmax(probability))
-
-            confidence = float(np.max(probability)) * 100
-
-            return prediction, confidence
-
-        prediction = int(model.predict(feature_values)[0])
-
-        return prediction, None
-
-    except Exception:
-
-        return None, None
-
-
-# ============================================================
-# RESEARCH ENGINE
-# ============================================================
+# =========================================================
+# QUANT RESEARCH ENGINE
+# =========================================================
 
 class TenPaperResearchLab:
 
@@ -297,8 +307,8 @@ class TenPaperResearchLab:
         ]
 
         self.dynamic_weights = {
-            key: 1.0 / len(self.feature_names)
-            for key in self.feature_names
+            k: 1.0 / len(self.feature_names)
+            for k in self.feature_names
         }
 
 
@@ -314,19 +324,16 @@ class TenPaperResearchLab:
         ):
 
             return {
-                key: 0.0
-                for key in self.feature_names
+                k: 0.0
+                for k in self.feature_names
             }
 
-
         bid_vol = np.sum(bids[:, 1])
-
         ask_vol = np.sum(asks[:, 1])
 
         mid_price = (
             bids[0, 0] + asks[0, 0]
         ) / 2
-
 
         returns = (
             df["Close"]
@@ -334,28 +341,23 @@ class TenPaperResearchLab:
             .dropna()
         )
 
-        realized_vol = returns.std() + 1e-8
-
+        realized_vol = (
+            returns.std() + 1e-8
+        )
 
         returns_h = (
             df["Close"].iloc[-1]
             - df["Close"].iloc[-5]
         ) / (
-            df["Close"].iloc[-5]
-            + 1e-8
+            df["Close"].iloc[-5] + 1e-8
         )
-
 
         delta_p = (
             df["Close"].iloc[-1]
             - df["Close"].iloc[-2]
         )
 
-
-        # ----------------------------------------------------
-        # 1. HAWKES
-        # ----------------------------------------------------
-
+        # 1
         vol_changes = (
             df["Volume"]
             .pct_change()
@@ -365,7 +367,7 @@ class TenPaperResearchLab:
 
         if len(vol_changes) >= 15:
 
-            hawkes_intensity = (
+            hawkes = (
                 np.mean(vol_changes[-3:])
                 /
                 (
@@ -376,32 +378,23 @@ class TenPaperResearchLab:
 
         else:
 
-            hawkes_intensity = 1.0
-
+            hawkes = 1.0
 
         results["HAWKES"] = np.clip(
-            (hawkes_intensity - 1.0)
+            (hawkes - 1.0)
             * np.sign(returns_h),
             -1,
             1
         )
 
-
-        # ----------------------------------------------------
-        # 2. BOOK IMBALANCE
-        # ----------------------------------------------------
-
+        # 2
         results["BOOK_IMB"] = (
             bid_vol - ask_vol
         ) / (
             bid_vol + ask_vol + 1e-8
         )
 
-
-        # ----------------------------------------------------
-        # 3. TAKER FLOW
-        # ----------------------------------------------------
-
+        # 3
         taker_buy = (
             df["Volume"].iloc[-1]
             *
@@ -420,15 +413,13 @@ class TenPaperResearchLab:
             taker_buy + taker_sell + 1e-8
         )
 
-
-        # ----------------------------------------------------
-        # 4. QUANTITATIVE IMBALANCE
-        # ----------------------------------------------------
-
+        # 4
         depth_skew = (
             bids[0, 1] - asks[0, 1]
         ) / (
-            bids[0, 1] + asks[0, 1] + 1e-8
+            bids[0, 1]
+            + asks[0, 1]
+            + 1e-8
         )
 
         results["QUANT_IMPLY"] = np.clip(
@@ -437,11 +428,7 @@ class TenPaperResearchLab:
             1
         )
 
-
-        # ----------------------------------------------------
-        # 5. BAYESIAN
-        # ----------------------------------------------------
-
+        # 5
         prior = 0.745
 
         likelihood = (
@@ -453,28 +440,20 @@ class TenPaperResearchLab:
         posterior = (
             likelihood * prior
         ) / (
-            (
-                likelihood * prior
-            )
+            likelihood * prior
             +
-            (
-                (1 - likelihood)
-                * (1 - prior)
-            )
+            (1 - likelihood)
+            * (1 - prior)
             + 1e-8
         )
 
         results["BAYESIAN"] = np.clip(
-            (posterior - 0.5) * 2.0,
+            (posterior - 0.5) * 2,
             -1,
             1
         )
 
-
-        # ----------------------------------------------------
-        # 6. QUANTILES
-        # ----------------------------------------------------
-
+        # 6
         q90 = (
             returns.quantile(0.90)
             if len(returns) > 5
@@ -492,44 +471,32 @@ class TenPaperResearchLab:
                 (returns_h - q10)
                 /
                 (q90 - q10 + 1e-8)
-                * 2.0
-            )
-            - 1.0,
+                * 2
+                - 1
+            ),
             -1,
             1
         )
 
-
-        # ----------------------------------------------------
-        # 7. TARGET / INVALIDATION
-        # ----------------------------------------------------
-
+        # 7
         target_diff = (
             delta_p
             /
-            (
-                df["Close"].iloc[-1]
-                + 1e-8
-            )
+            (df["Close"].iloc[-1] + 1e-8)
         )
 
-        if target_diff >= 0.0006:
+        results["TARGET_INV"] = (
 
-            results["TARGET_INV"] = 1.0
+            1.0
+            if target_diff >= 0.0006
 
-        elif target_diff <= -0.0006:
+            else -1.0
+            if target_diff <= -0.0006
 
-            results["TARGET_INV"] = -1.0
+            else 0.0
+        )
 
-        else:
-
-            results["TARGET_INV"] = 0.0
-
-
-        # ----------------------------------------------------
-        # 8. ADAPTIVE CONFIRMATION
-        # ----------------------------------------------------
-
+        # 8
         ma_fast = (
             df["Close"]
             .rolling(3)
@@ -558,19 +525,13 @@ class TenPaperResearchLab:
             1
         )
 
-
-        # ----------------------------------------------------
-        # 9. FRACTIONAL KELLY
-        # ----------------------------------------------------
-
+        # 9
         win_prob = (
             0.55
             +
-            (
-                0.15
-                * np.sign(
-                    results["BOOK_IMB"]
-                )
+            0.15
+            * np.sign(
+                results["BOOK_IMB"]
             )
         )
 
@@ -585,17 +546,13 @@ class TenPaperResearchLab:
 
         results["FRAC_KELLY"] = np.clip(
             kelly_fraction
-            * 2.0
+            * 2
             * np.sign(returns_h),
             -1,
             1
         )
 
-
-        # ----------------------------------------------------
-        # 10. RMT DOMINANCE
-        # ----------------------------------------------------
-
+        # 10
         rmt_dom = (
             abs(returns_h)
             /
@@ -604,20 +561,15 @@ class TenPaperResearchLab:
                 * np.sqrt(5)
                 + 1e-8
             )
-        ) / 3.0
+        ) / 3
 
         results["RMT_DOM"] = np.clip(
-            rmt_dom
-            * np.sign(returns_h),
+            rmt_dom * np.sign(returns_h),
             -1,
             1
         )
 
-
-        # ----------------------------------------------------
-        # 11. CONFORMAL CROSS
-        # ----------------------------------------------------
-
+        # 11
         conformal_spread = (
             realized_vol * 1.96
         )
@@ -632,48 +584,38 @@ class TenPaperResearchLab:
             * (1 - conformal_spread)
         )
 
-        middle = (
-            upper_b + lower_b
-        ) / 2
+        results["CONF_CROSS"] = (
 
-        if mid_price > middle:
+            1.0
+            if mid_price > (
+                upper_b + lower_b
+            ) / 2
 
-            results["CONF_CROSS"] = 1.0
+            else -1.0
+            if mid_price < (
+                upper_b + lower_b
+            ) / 2
 
-        elif mid_price < middle:
+            else 0.0
+        )
 
-            results["CONF_CROSS"] = -1.0
-
-        else:
-
-            results["CONF_CROSS"] = 0.0
-
-
-        # ----------------------------------------------------
-        # 12. REWARD / RISK
-        # ----------------------------------------------------
-
+        # 12
         rr_ratio = (
             abs(q90)
             /
-            (
-                abs(q10)
-                + 1e-8
-            )
+            (abs(q10) + 1e-8)
         )
 
-        if rr_ratio >= 1.2:
+        results["REWARD_RISK"] = (
 
-            results["REWARD_RISK"] = 1.0
+            1.0
+            if rr_ratio >= 1.2
 
-        elif rr_ratio < 0.8:
+            else -1.0
+            if rr_ratio < 0.8
 
-            results["REWARD_RISK"] = -1.0
-
-        else:
-
-            results["REWARD_RISK"] = 0.0
-
+            else 0.0
+        )
 
         return results
 
@@ -693,12 +635,10 @@ class TenPaperResearchLab:
             asks
         )
 
-        feature_vector = np.array(
-            [
-                results[key]
-                for key in self.feature_names
-            ]
-        )
+        feature_vector = np.array([
+            results[k]
+            for k in self.feature_names
+        ])
 
         final_score = float(
             np.dot(
@@ -718,9 +658,9 @@ class TenPaperResearchLab:
         )
 
 
-# ============================================================
+# =========================================================
 # RISK ENGINE
-# ============================================================
+# =========================================================
 
 class PowerTradingRiskEngine:
 
@@ -738,42 +678,33 @@ class PowerTradingRiskEngine:
 
         total_ltz = (
             np.sum(liquidation_volumes)
-            if len(liquidation_volumes) > 0
-            else 0.0
+            if len(liquidation_volumes)
+            else 0
         )
 
         max_ltz = (
             np.max(liquidation_volumes)
-            if len(liquidation_volumes) > 0
-            else 0.0
+            if len(liquidation_volumes)
+            else 0
         )
 
         ltz_score = (
             max_ltz
             /
-            (
-                total_ltz
-                + 1e-8
-            )
+            (total_ltz + 1e-8)
         ) * 100
 
         spoof_ratio = (
             cancelled_vol
             /
-            (
-                displayed_vol
-                + 1e-8
-            )
+            (displayed_vol + 1e-8)
         )
 
         persistence = min(
             max(
                 time_exists
                 /
-                (
-                    obs_window
-                    + 1e-8
-                ),
+                (obs_window + 1e-8),
                 0
             ),
             1
@@ -793,29 +724,25 @@ class PowerTradingRiskEngine:
 
         market_risk = (
             ltz_score
-            + spoof_score
-            + squeeze_risk
+            +
+            spoof_score
+            +
+            squeeze_risk
         )
 
         return {
-
             "LTZ_Score": ltz_score,
-
             "Spoof_Score": spoof_score,
-
             "Squeeze_Risk": squeeze_risk,
-
             "Market_Risk": market_risk,
-
         }
 
 
-# ============================================================
+# =========================================================
 # SIDEBAR
-# ============================================================
+# =========================================================
 
 COINS_LIST = [
-
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
@@ -826,41 +753,33 @@ COINS_LIST = [
     "AVAXUSDT",
     "DOTUSDT",
     "LINKUSDT",
-
 ]
-
 
 TIMEFRAME_MAP = {
 
     "1m": ("1m", 1),
-
     "15m": ("15m", 15),
-
     "30m": ("30m", 30),
-
     "1h": ("1h", 60),
-
     "4h": ("4h", 240),
 
 }
 
 
-st.sidebar.markdown("## Terminal Controls")
-
-
-selected_symbol = st.sidebar.selectbox(
-    "Market",
-    COINS_LIST,
-    index=0
+st.sidebar.markdown(
+    "## ⚙️ Terminal Controls"
 )
 
+selected_symbol = st.sidebar.selectbox(
+    "Cryptocurrency",
+    COINS_LIST
+)
 
 selected_tf = st.sidebar.selectbox(
     "Timeframe",
     list(TIMEFRAME_MAP.keys()),
     index=1
 )
-
 
 forecast_horizon = st.sidebar.slider(
     "Forecast Candles",
@@ -869,30 +788,21 @@ forecast_horizon = st.sidebar.slider(
     15
 )
 
-
-st.sidebar.markdown("---")
-
-
-st.sidebar.markdown("## Paper Trading")
-
-
 paper_trading_mode = st.sidebar.toggle(
-    "Enable Paper Trading",
+    "Paper Trading",
     value=True
 )
 
-
 st.sidebar.markdown("---")
 
-
-st.sidebar.markdown("## TRI Line Controls")
-
+st.sidebar.markdown(
+    "### TRI Levels"
+)
 
 show_tri = st.sidebar.toggle(
     "Show TRI Lines",
     value=True
 )
-
 
 tri_enabled = {}
 
@@ -904,13 +814,12 @@ for tf in [
     "4H",
     "1H",
     "30M",
-    "15M",
+    "15M"
 ]:
 
     tri_enabled[tf] = st.sidebar.checkbox(
         tf,
-        value=True,
-        key=f"tri_{tf}"
+        value=True
     )
 
 
@@ -919,27 +828,20 @@ api_interval, tf_minutes = TIMEFRAME_MAP[
 ]
 
 
-# ============================================================
-# TRI CONFIG
-# ============================================================
+# =========================================================
+# TRI LINE
+# =========================================================
 
 TRI_COLORS = {
 
-    "YEARLY": "#87CEEB",
-
-    "MONTHLY": "#FF0000",
-
-    "WEEKLY": "#00C853",
-
-    "DAILY": "#FFFFFF",
-
-    "4H": "#FFA500",
-
-    "1H": "#A855F7",
-
-    "30M": "#006400",
-
-    "15M": "#2196F3",
+    "YEARLY": "#38bdf8",
+    "MONTHLY": "#ef4444",
+    "WEEKLY": "#22c55e",
+    "DAILY": "#f8fafc",
+    "4H": "#f59e0b",
+    "1H": "#a78bfa",
+    "30M": "#16a34a",
+    "15M": "#60a5fa",
 
 }
 
@@ -947,25 +849,15 @@ TRI_COLORS = {
 TRI_INTERVALS = {
 
     "MONTHLY": "1M",
-
     "WEEKLY": "1w",
-
     "DAILY": "1d",
-
     "4H": "4h",
-
     "1H": "1h",
-
     "30M": "30m",
-
     "15M": "15m",
 
 }
 
-
-# ============================================================
-# TRI DATA
-# ============================================================
 
 @st.cache_data(ttl=30)
 def fetch_tri_candle(symbol, interval):
@@ -973,21 +865,20 @@ def fetch_tri_candle(symbol, interval):
     try:
 
         url = (
-            "https://data-api.binance.vision/"
-            "api/v3/klines"
+            "https://data-api.binance.vision/api/v3/klines"
         )
 
-        response = requests.get(
+        res = requests.get(
             url,
             params={
                 "symbol": symbol,
                 "interval": interval,
                 "limit": 3,
             },
-            timeout=5
+            timeout=5,
         )
 
-        data = response.json()
+        data = res.json()
 
         if (
             not isinstance(data, list)
@@ -998,15 +889,10 @@ def fetch_tri_candle(symbol, interval):
         row = data[-2]
 
         return {
-
             "Open": float(row[1]),
-
             "High": float(row[2]),
-
             "Low": float(row[3]),
-
             "Close": float(row[4]),
-
         }
 
     except Exception:
@@ -1020,21 +906,20 @@ def fetch_tri_yearly_candle(symbol):
     try:
 
         url = (
-            "https://data-api.binance.vision/"
-            "api/v3/klines"
+            "https://data-api.binance.vision/api/v3/klines"
         )
 
-        response = requests.get(
+        res = requests.get(
             url,
             params={
                 "symbol": symbol,
                 "interval": "1M",
                 "limit": 36,
             },
-            timeout=5
+            timeout=5,
         )
 
-        data = response.json()
+        data = res.json()
 
         if (
             not isinstance(data, list)
@@ -1055,11 +940,8 @@ def fetch_tri_yearly_candle(symbol):
                 ),
 
                 "Open": float(row[1]),
-
                 "High": float(row[2]),
-
                 "Low": float(row[3]),
-
                 "Close": float(row[4]),
 
             })
@@ -1082,21 +964,15 @@ def fetch_tri_yearly_candle(symbol):
         )
 
         if len(yearly) < 2:
-
             return None
 
-        row = yearly.iloc[-2]
+        r = yearly.iloc[-2]
 
         return {
-
-            "Open": float(row["Open"]),
-
-            "High": float(row["High"]),
-
-            "Low": float(row["Low"]),
-
-            "Close": float(row["Close"]),
-
+            "Open": float(r["Open"]),
+            "High": float(r["High"]),
+            "Low": float(r["Low"]),
+            "Close": float(r["Close"]),
         }
 
     except Exception:
@@ -1109,32 +985,26 @@ def calculate_tri_levels(candle):
     if candle is None:
         return None
 
-    try:
+    o = float(candle["Open"])
+    h = float(candle["High"])
+    l = float(candle["Low"])
+    c = float(candle["Close"])
 
-        o = float(candle["Open"])
-        h = float(candle["High"])
-        l = float(candle["Low"])
-        c = float(candle["Close"])
+    body_high = max(o, c)
+    body_low = min(o, c)
 
-        body_high = max(o, c)
-        body_low = min(o, c)
+    return {
 
-        return {
+        "body_50":
+            (body_high + body_low) / 2,
 
-            "body_50":
-                (body_high + body_low) / 2,
+        "upper_50":
+            (h + body_high) / 2,
 
-            "upper_50":
-                (h + body_high) / 2,
+        "lower_50":
+            (l + body_low) / 2,
 
-            "lower_50":
-                (l + body_low) / 2,
-
-        }
-
-    except Exception:
-
-        return None
+    }
 
 
 @st.cache_data(ttl=30)
@@ -1164,9 +1034,9 @@ def get_all_tri_levels(symbol):
     return levels
 
 
-# ============================================================
+# =========================================================
 # MARKET DATA
-# ============================================================
+# =========================================================
 
 @st.cache_data(ttl=15)
 def fetch_klines_data(
@@ -1178,25 +1048,24 @@ def fetch_klines_data(
     try:
 
         url = (
-            "https://data-api.binance.vision/"
-            "api/v3/klines"
+            "https://data-api.binance.vision/api/v3/klines"
         )
 
-        response = requests.get(
+        res = requests.get(
             url,
             params={
                 "symbol": symbol,
                 "interval": timeframe,
                 "limit": limit,
             },
-            timeout=5
+            timeout=5,
         )
 
-        data = response.json()
+        data = res.json()
 
         if (
             not isinstance(data, list)
-            or len(data) == 0
+            or len(data) < 20
         ):
             raise ValueError(
                 "Invalid Binance response"
@@ -1217,7 +1086,7 @@ def fetch_klines_data(
                 "TBBAV",
                 "TBQAV",
                 "Ignore",
-            ]
+            ],
         )
 
         df["Time"] = pd.to_datetime(
@@ -1233,10 +1102,7 @@ def fetch_klines_data(
             "Volume",
         ]:
 
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
+            df[col] = df[col].astype(float)
 
         return df[
             [
@@ -1247,7 +1113,7 @@ def fetch_klines_data(
                 "Close",
                 "Volume",
             ]
-        ].dropna()
+        ]
 
     except Exception:
 
@@ -1257,10 +1123,10 @@ def fetch_klines_data(
             freq=timeframe
         )
 
-        base_price = 60000
+        base = 60000
 
-        close = (
-            base_price
+        closes = (
+            base
             +
             np.cumsum(
                 np.random.normal(
@@ -1274,15 +1140,10 @@ def fetch_klines_data(
         return pd.DataFrame({
 
             "Time": dates,
-
-            "Open": close - 5,
-
-            "High": close + 15,
-
-            "Low": close - 15,
-
-            "Close": close,
-
+            "Open": closes - 5,
+            "High": closes + 15,
+            "Low": closes - 15,
+            "Close": closes,
             "Volume": np.random.uniform(
                 50,
                 500,
@@ -1292,7 +1153,7 @@ def fetch_klines_data(
         })
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=5)
 def fetch_order_book_depth(
     symbol,
     depth_limit=20
@@ -1301,20 +1162,19 @@ def fetch_order_book_depth(
     try:
 
         url = (
-            "https://data-api.binance.vision/"
-            "api/v3/depth"
+            "https://data-api.binance.vision/api/v3/depth"
         )
 
-        response = requests.get(
+        res = requests.get(
             url,
             params={
                 "symbol": symbol,
                 "limit": depth_limit,
             },
-            timeout=5
+            timeout=4,
         )
 
-        data = response.json()
+        data = res.json()
 
         if (
             "bids" in data
@@ -1326,7 +1186,6 @@ def fetch_order_book_depth(
                     data["bids"],
                     dtype=float
                 ),
-
                 np.array(
                     data["asks"],
                     dtype=float
@@ -1334,31 +1193,20 @@ def fetch_order_book_depth(
             )
 
     except Exception:
-
         pass
 
-    dummy_bids = np.array(
-        [
-            [60000 - i * 2, 1.5]
-            for i in range(depth_limit)
-        ],
-        dtype=float
-    )
+    dummy_bids = np.array([
+        [60000 - i * 2, 1.5]
+        for i in range(20)
+    ])
 
-    dummy_asks = np.array(
-        [
-            [60000 + i * 2, 1.5]
-            for i in range(depth_limit)
-        ],
-        dtype=float
-    )
+    dummy_asks = np.array([
+        [60000 + i * 2, 1.5]
+        for i in range(20)
+    ])
 
     return dummy_bids, dummy_asks
 
-
-# ============================================================
-# FETCH DATA
-# ============================================================
 
 df = fetch_klines_data(
     selected_symbol,
@@ -1371,13 +1219,13 @@ bids, asks = fetch_order_book_depth(
 )
 
 
-# ============================================================
-# MAIN ENGINE
-# ============================================================
+# =========================================================
+# ENGINE
+# =========================================================
 
 if (
     not df.empty
-    and len(df) >= 15
+    and len(df) >= 20
     and len(bids) > 0
     and len(asks) > 0
 ):
@@ -1386,250 +1234,174 @@ if (
 
     (
         paper_results,
-        research_score,
+        final_score,
         evolved_weights
     ) = lab.calculate_all_signals(
         df,
         bids,
         asks,
-        current_inventory=0,
         performance_history=(
             st.session_state.trade_history_log
         )
     )
 
 
-    # ========================================================
-    # OBI
-    # ========================================================
+    # =====================================================
+    # PRICE / ATR
+    # =====================================================
 
-    bid_volume = float(
-        np.sum(bids[:, 1])
-    )
-
-    ask_volume = float(
-        np.sum(asks[:, 1])
-    )
-
-    obi = (
-        bid_volume - ask_volume
-    ) / (
-        bid_volume
-        + ask_volume
-        + 1e-12
-    )
-
-
-    # ========================================================
-    # PRICE
-    # ========================================================
-
-    close_price = float(
+    close_p = float(
         df["Close"].iloc[-1]
     )
 
-
-    # ========================================================
-    # ATR
-    # ========================================================
-
-    atr = (
+    atr_val = (
         df["High"]
         - df["Low"]
     ).rolling(14).mean().iloc[-1]
 
-    if np.isnan(atr):
+    if np.isnan(atr_val):
+        atr_val = close_p * 0.005
 
-        atr = close_price * 0.005
+
+    # =====================================================
+    # REAL 2:1 RISK REWARD
+    # =====================================================
+
+    risk_distance = 1.0 * atr_val
+    reward_distance = 2.0 * atr_val
 
 
-    # ========================================================
-    # TARGETS
-    # ========================================================
+    direction = (
 
-    beam = (
-        close_price
-        + 1.8 * atr
+        "LONG"
+        if final_score >= 0.15
+
+        else "SHORT"
+        if final_score <= -0.15
+
+        else "NEUTRAL"
+
     )
 
-    base = (
-        close_price
-        - 1.8 * atr
-    )
-
-
-    # ========================================================
-    # SIGNAL
-    # ========================================================
-
-    direction = "NEUTRAL"
-
-    if research_score >= 0.15:
-
-        direction = "LONG"
-
-    elif research_score <= -0.15:
-
-        direction = "SHORT"
-
-
-    # ========================================================
-    # XGBOOST
-    # ========================================================
-
-    xgb_prediction, xgb_confidence = (
-        get_xgb_prediction(
-            xgb_model,
-            paper_results
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Optional XGBoost confirmation
-    # --------------------------------------------------------
-
-    if xgb_prediction is not None:
-
-        # Expected:
-        # 0 = SHORT
-        # 1 = NEUTRAL
-        # 2 = LONG
-
-        if xgb_prediction == 2:
-
-            if direction == "SHORT":
-
-                direction = "NEUTRAL"
-
-            elif direction == "LONG":
-
-                direction = "LONG"
-
-        elif xgb_prediction == 0:
-
-            if direction == "LONG":
-
-                direction = "NEUTRAL"
-
-            elif direction == "SHORT":
-
-                direction = "SHORT"
-
-
-    # ========================================================
-    # TP / SL
-    # ========================================================
 
     if direction == "LONG":
 
-        tp1 = close_price + atr
-
-        tp2 = beam
-
-        sl = close_price - atr
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + reward_distance
+        tp2_val = close_p + (3.0 * atr_val)
 
     elif direction == "SHORT":
 
-        tp1 = close_price - atr
-
-        tp2 = base
-
-        sl = close_price + atr
+        sl_val = close_p + risk_distance
+        tp1_val = close_p - reward_distance
+        tp2_val = close_p - (3.0 * atr_val)
 
     else:
 
-        tp1 = close_price
-
-        tp2 = close_price
-
-        sl = close_price
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + reward_distance
+        tp2_val = close_p + (3.0 * atr_val)
 
 
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    research_confidence = min(
-        max(
-            abs(research_score) * 100,
-            15
-        ),
-        98
-    )
-
-    if xgb_confidence is not None:
-
-        confidence = int(
-            (
-                research_confidence
-                +
-                xgb_confidence
-            )
-            / 2
-        )
-
-    else:
-
-        confidence = int(
-            research_confidence
-        )
-
-
-    # ========================================================
-    # SIGNAL COLOR
-    # ========================================================
+    # =====================================================
+    # ACTUAL RR CALCULATION
+    # =====================================================
 
     if direction == "LONG":
 
-        signal_color = "#00e676"
+        actual_risk = abs(
+            close_p - sl_val
+        )
+
+        actual_reward = abs(
+            tp1_val - close_p
+        )
 
     elif direction == "SHORT":
 
-        signal_color = "#ff5252"
+        actual_risk = abs(
+            sl_val - close_p
+        )
+
+        actual_reward = abs(
+            close_p - tp1_val
+        )
 
     else:
 
-        signal_color = "#38bdf8"
+        actual_risk = abs(
+            close_p - sl_val
+        )
+
+        actual_reward = abs(
+            tp1_val - close_p
+        )
 
 
-    # ========================================================
-    # TIME LOCK
-    # ========================================================
+    rr_ratio = (
+        actual_reward
+        /
+        (actual_risk + 1e-12)
+    )
+
+
+    confidence = int(
+        min(
+            max(
+                abs(final_score) * 100,
+                15
+            ),
+            98
+        )
+    )
+
+
+    # =====================================================
+    # BEAM / BASE
+    # =====================================================
+
+    beam_level = (
+        close_p
+        +
+        3.0 * atr_val
+    )
+
+    base_level = (
+        close_p
+        -
+        3.0 * atr_val
+    )
+
+
+    # =====================================================
+    # TRADE ID
+    # =====================================================
 
     lock_seconds = (
         tf_minutes * 60
     )
 
-    current_time = int(time.time())
+    current_time_sec = int(
+        time.time()
+    )
 
     time_bucket = (
-        current_time
+        current_time_sec
         -
         (
-            current_time
+            current_time_sec
             % lock_seconds
         )
     )
 
-    remaining = (
+    time_remaining = (
         lock_seconds
         -
         (
-            current_time
+            current_time_sec
             % lock_seconds
         )
     )
-
-    mins, secs = divmod(
-        remaining,
-        60
-    )
-
-
-    # ========================================================
-    # TRADE ID
-    # ========================================================
 
     trade_id = (
         f"{selected_symbol}_"
@@ -1639,30 +1411,30 @@ if (
     )
 
 
-    # ========================================================
-    # PAPER TRADE ENTRY
-    # ========================================================
+    # =====================================================
+    # PAPER TRADE SAVE
+    # =====================================================
 
     if (
         paper_trading_mode
         and direction != "NEUTRAL"
     ):
 
-        existing_ids = [
+        existing_trade_ids = [
             item.get("trade_id")
             for item
             in st.session_state.trade_history_log
         ]
 
-        if trade_id not in existing_ids:
+        if trade_id not in existing_trade_ids:
 
             new_trade = {
 
-                "trade_id":
-                    trade_id,
+                "trade_id": trade_id,
 
                 "timestamp":
-                    datetime.datetime.now().strftime(
+                    datetime.datetime.now()
+                    .strftime(
                         "%Y-%m-%d %H:%M:%S"
                     ),
 
@@ -1676,42 +1448,28 @@ if (
                     direction,
 
                 "entry_price":
-                    round(
-                        close_price,
-                        2
-                    ),
+                    round(close_p, 2),
 
                 "stop_loss":
-                    round(
-                        sl,
-                        2
-                    ),
+                    round(sl_val, 2),
 
+                # ACTUAL 2R TARGET
                 "tp1":
-                    round(
-                        tp1,
-                        2
-                    ),
+                    round(tp1_val, 2),
 
                 "tp2":
-                    round(
-                        tp2,
-                        2
-                    ),
+                    round(tp2_val, 2),
 
                 "exit_price":
-                    round(
-                        close_price,
-                        2
-                    ),
+                    round(close_p, 2),
 
                 "confidence":
                     confidence,
 
                 "final_score":
                     round(
-                        research_score,
-                        4
+                        final_score,
+                        3
                     ),
 
                 "outcome":
@@ -1738,275 +1496,284 @@ if (
             )
 
 
-    # ========================================================
-    # UPDATE OPEN TRADES
-    # ========================================================
-
-    history_changed = False
+    # =====================================================
+    # CLOSE PAPER TRADES
+    # =====================================================
 
     for trade in st.session_state.trade_history_log:
 
         if (
-            trade.get("outcome") != "PENDING"
-            or trade.get("symbol") != selected_symbol
+            trade.get("outcome") == "PENDING"
+            and trade.get("symbol") == selected_symbol
         ):
-            continue
 
-        entry = float(
-            trade.get(
-                "entry_price",
-                0
+            curr_price = close_p
+
+            entry = float(
+                trade["entry_price"]
             )
-        )
 
-        trade_sl = float(
-            trade.get(
-                "stop_loss",
-                0
+            sl = float(
+                trade["stop_loss"]
             )
-        )
 
-        trade_tp = float(
-            trade.get(
-                "tp1",
-                0
+            tp = float(
+                trade["tp1"]
             )
-        )
 
-        if entry <= 0:
-            continue
+            if trade["direction"] == "LONG":
 
+                if curr_price >= tp:
 
-        # LONG
-        if trade["direction"] == "LONG":
+                    trade["outcome"] = "WIN"
 
-            if close_price >= trade_tp:
+                    trade["exit_price"] = curr_price
 
-                trade["outcome"] = "WIN"
-
-                trade["exit_price"] = (
-                    close_price
-                )
-
-                trade["pnl_percent"] = round(
-                    (
+                    trade["pnl_percent"] = round(
                         (
-                            close_price
-                            - entry
-                        )
-                        / entry
-                    )
-                    * 100,
-                    2
-                )
-
-                trade["status"] = "Closed"
-
-                history_changed = True
-
-
-            elif close_price <= trade_sl:
-
-                trade["outcome"] = "LOSS"
-
-                trade["exit_price"] = (
-                    close_price
-                )
-
-                trade["pnl_percent"] = round(
-                    (
-                        (
-                            close_price
-                            - entry
-                        )
-                        / entry
-                    )
-                    * 100,
-                    2
-                )
-
-                trade["status"] = "Closed"
-
-                history_changed = True
-
-
-        # SHORT
-        elif trade["direction"] == "SHORT":
-
-            if close_price <= trade_tp:
-
-                trade["outcome"] = "WIN"
-
-                trade["exit_price"] = (
-                    close_price
-                )
-
-                trade["pnl_percent"] = round(
-                    (
-                        (
+                            (
+                                curr_price
+                                - entry
+                            )
+                            /
                             entry
-                            - close_price
-                        )
-                        / entry
+                        ) * 100,
+                        2
                     )
-                    * 100,
-                    2
-                )
 
-                trade["status"] = "Closed"
-
-                history_changed = True
+                    trade["status"] = "Closed"
 
 
-            elif close_price >= trade_sl:
+                elif curr_price <= sl:
 
-                trade["outcome"] = "LOSS"
+                    trade["outcome"] = "LOSS"
 
-                trade["exit_price"] = (
-                    close_price
-                )
+                    trade["exit_price"] = curr_price
 
-                trade["pnl_percent"] = round(
-                    (
+                    trade["pnl_percent"] = round(
                         (
+                            (
+                                curr_price
+                                - entry
+                            )
+                            /
                             entry
-                            - close_price
-                        )
-                        / entry
+                        ) * 100,
+                        2
                     )
-                    * 100,
-                    2
-                )
 
-                trade["status"] = "Closed"
-
-                history_changed = True
+                    trade["status"] = "Closed"
 
 
-    if history_changed:
+            elif trade["direction"] == "SHORT":
 
-        save_persistent_history(
-            st.session_state.trade_history_log
-        )
+                if curr_price <= tp:
+
+                    trade["outcome"] = "WIN"
+
+                    trade["exit_price"] = curr_price
+
+                    trade["pnl_percent"] = round(
+                        (
+                            (
+                                entry
+                                - curr_price
+                            )
+                            /
+                            entry
+                        ) * 100,
+                        2
+                    )
+
+                    trade["status"] = "Closed"
 
 
-    # ========================================================
-    # RISK ENGINE
-    # ========================================================
+                elif curr_price >= sl:
+
+                    trade["outcome"] = "LOSS"
+
+                    trade["exit_price"] = curr_price
+
+                    trade["pnl_percent"] = round(
+                        (
+                            (
+                                entry
+                                - curr_price
+                            )
+                            /
+                            entry
+                        ) * 100,
+                        2
+                    )
+
+                    trade["status"] = "Closed"
+
+
+    save_persistent_history(
+        st.session_state.trade_history_log
+    )
+
+
+    # =====================================================
+    # RISK
+    # =====================================================
 
     risk_engine = PowerTradingRiskEngine()
 
-    volatility = (
-        df["Close"]
-        .pct_change()
-        .std()
-        + 1e-8
+    bid_vol_sum = float(
+        np.sum(bids[:, 1])
+    )
+
+    ask_vol_sum = float(
+        np.sum(asks[:, 1])
+    )
+
+    displayed_volume = (
+        bid_vol_sum
+        +
+        ask_vol_sum
     )
 
     risk_metrics = (
         risk_engine.calculate_risk_metrics(
 
-            liquidation_volumes=np.array(
-                [1000, 2500]
-            ),
+            liquidation_volumes=
+                np.array([
+                    1000,
+                    2500
+                ]),
 
-            displayed_vol=ask_volume,
+            displayed_vol=
+                displayed_volume,
 
-            cancelled_vol=(
-                ask_volume * 0.10
-            ),
+            cancelled_vol=
+                displayed_volume * 0.1,
 
-            time_exists=15.0,
+            time_exists=15,
 
-            obs_window=60.0,
+            obs_window=60,
 
-            open_interest=150000.0,
+            open_interest=150000,
 
-            leverage=20.0,
+            leverage=20,
 
-            volatility=volatility,
-
+            volatility=
+                df["Close"]
+                .pct_change()
+                .std()
+                +
+                1e-8,
         )
     )
 
 
-    # ========================================================
-    # HEADER
-    # ========================================================
+    # =====================================================
+    # COLORS
+    # =====================================================
 
-    st.markdown(
-        f"""
-        <div class="top-status-bar">
+    if direction == "LONG":
 
-        🟢 <b>{selected_symbol}</b>
-        &nbsp; | &nbsp;
+        dir_color = "#22c55e"
+        signal_class = "signal-long"
 
-        Price:
-        <b>${close_price:,.2f}</b>
+    elif direction == "SHORT":
 
-        &nbsp; | &nbsp;
-
-        Timeframe:
-        <b>{selected_tf}</b>
-
-        &nbsp; | &nbsp;
-
-        Signal:
-        <span style="color:{signal_color};">
-        <b>{direction}</b>
-        </span>
-
-        &nbsp; | &nbsp;
-
-        Research Score:
-        <b>{research_score:+.3f}</b>
-
-        &nbsp; | &nbsp;
-
-        Confidence:
-        <b>{confidence}%</b>
-
-        &nbsp; | &nbsp;
-
-        Next Reset:
-        <b>{mins}m {secs}s</b>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-    # ========================================================
-    # MODEL STATUS
-    # ========================================================
-
-    if xgb_model is not None:
-
-        model_status = "XGBoost Model: ACTIVE"
-
-        model_color = "#00e676"
+        dir_color = "#ef4444"
+        signal_class = "signal-short"
 
     else:
 
-        model_status = (
-            "XGBoost Model: NOT LOADED"
-        )
+        dir_color = "#38bdf8"
+        signal_class = "signal-neutral"
 
-        model_color = "#ffa500"
 
+    mins_rem, secs_rem = divmod(
+        time_remaining,
+        60
+    )
+
+
+    # =====================================================
+    # HEADER
+    # =====================================================
 
     st.markdown(
         f"""
-        <div class="model-box">
+        <div class="topbar">
 
-        <b>Machine Learning Engine</b>
+            <div class="top-title">
+                📊 TRI QUANT RESEARCH TERMINAL
+            </div>
 
-        &nbsp;&nbsp;
+            <div class="top-subtitle">
+                Live Market Analysis •
+                Order Book •
+                Quantitative Research •
+                Paper Trading
+            </div>
 
-        <span style="color:{model_color};">
-        ● {model_status}
-        </span>
+            <hr style="
+                border:0;
+                border-top:1px solid #202b3d;
+                margin:12px 0;
+            ">
+
+            <div style="
+                display:flex;
+                gap:25px;
+                flex-wrap:wrap;
+                font-size:13px;
+            ">
+
+                <span>
+                    <b>{selected_symbol}</b>
+                </span>
+
+                <span>
+                    Price:
+                    <b>
+                        ${close_p:,.2f}
+                    </b>
+                </span>
+
+                <span>
+                    TF:
+                    <b>
+                        {selected_tf}
+                    </b>
+                </span>
+
+                <span>
+                    Signal:
+                    <b style="
+                        color:{dir_color};
+                    ">
+                        {direction}
+                    </b>
+                </span>
+
+                <span>
+                    Score:
+                    <b>
+                        {final_score:+.3f}
+                    </b>
+                </span>
+
+                <span>
+                    Confidence:
+                    <b>
+                        {confidence}%
+                    </b>
+                </span>
+
+                <span>
+                    Reset:
+                    <b>
+                        {mins_rem}m {secs_rem}s
+                    </b>
+                </span>
+
+            </div>
 
         </div>
         """,
@@ -2014,9 +1781,9 @@ if (
     )
 
 
-    # ========================================================
-    # SIGNAL PANEL
-    # ========================================================
+    # =====================================================
+    # MAIN SIGNAL ROW
+    # =====================================================
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
@@ -2025,18 +1792,19 @@ if (
 
         st.markdown(
             f"""
-            <div class="metric-card">
+            <div class="card">
 
-            <div class="metric-label">
-            Signal
-            </div>
+                <div class="card-title">
+                    Signal
+                </div>
 
-            <div class="metric-value"
-                 style="color:{signal_color};">
+                <div class="{signal_class}">
+                    {direction}
+                </div>
 
-            {direction}
-
-            </div>
+                <div class="card-small">
+                    Quantitative composite signal
+                </div>
 
             </div>
             """,
@@ -2048,18 +1816,19 @@ if (
 
         st.markdown(
             f"""
-            <div class="metric-card">
+            <div class="card">
 
-            <div class="metric-label">
-            Entry
-            </div>
+                <div class="card-title">
+                    Entry
+                </div>
 
-            <div class="metric-value"
-                 style="color:#38bdf8;">
+                <div class="card-value">
+                    ${close_p:,.2f}
+                </div>
 
-            ${close_price:,.2f}
-
-            </div>
+                <div class="card-small">
+                    Current market price
+                </div>
 
             </div>
             """,
@@ -2071,18 +1840,19 @@ if (
 
         st.markdown(
             f"""
-            <div class="metric-card">
+            <div class="card">
 
-            <div class="metric-label">
-            Stop Loss
-            </div>
+                <div class="card-title">
+                    Stop Loss
+                </div>
 
-            <div class="metric-value"
-                 style="color:#ff5252;">
+                <div class="card-value red">
+                    ${sl_val:,.2f}
+                </div>
 
-            ${sl:,.2f}
-
-            </div>
+                <div class="card-small">
+                    Risk = {actual_risk:,.2f}
+                </div>
 
             </div>
             """,
@@ -2094,18 +1864,19 @@ if (
 
         st.markdown(
             f"""
-            <div class="metric-card">
+            <div class="card">
 
-            <div class="metric-label">
-            Take Profit 1
-            </div>
+                <div class="card-title">
+                    Take Profit
+                </div>
 
-            <div class="metric-value"
-                 style="color:#00e676;">
+                <div class="card-value green">
+                    ${tp1_val:,.2f}
+                </div>
 
-            ${tp1:,.2f}
-
-            </div>
+                <div class="card-small">
+                    Reward = {actual_reward:,.2f}
+                </div>
 
             </div>
             """,
@@ -2117,18 +1888,19 @@ if (
 
         st.markdown(
             f"""
-            <div class="metric-card">
+            <div class="card">
 
-            <div class="metric-label">
-            Take Profit 2
-            </div>
+                <div class="card-title">
+                    Risk / Reward
+                </div>
 
-            <div class="metric-value"
-                 style="color:#00e676;">
+                <div class="rr-value">
+                    1 : {rr_ratio:.2f}
+                </div>
 
-            ${tp2:,.2f}
-
-            </div>
+                <div class="card-small">
+                    ACTUAL calculated RR
+                </div>
 
             </div>
             """,
@@ -2136,76 +1908,68 @@ if (
         )
 
 
-    # ========================================================
-    # SECOND METRICS
-    # ========================================================
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-
-    with c1:
-
-        st.metric(
-            "OBI",
-            f"{obi:+.3f}"
-        )
-
-
-    with c2:
-
-        st.metric(
-            "Bid Volume",
-            f"{bid_volume:,.2f}"
-        )
-
-
-    with c3:
-
-        st.metric(
-            "Ask Volume",
-            f"{ask_volume:,.2f}"
-        )
-
-
-    with c4:
-
-        spread = abs(
-            float(asks[0, 0])
-            -
-            float(bids[0, 0])
-        )
-
-        st.metric(
-            "Spread",
-            f"${spread:.2f}"
-        )
-
-
-    with c5:
-
-        st.metric(
-            "ATR",
-            f"${atr:,.2f}"
-        )
-
-
-    # ========================================================
-    # CHART
-    # ========================================================
+    # =====================================================
+    # TARGET ROW
+    # =====================================================
 
     st.markdown(
-        '<div class="section-title">Price Analysis</div>',
+        '<div class="section-title">🎯 Trade Levels</div>',
         unsafe_allow_html=True
     )
 
+    t1, t2, t3, t4 = st.columns(4)
+
+
+    with t1:
+
+        st.metric(
+            "Entry",
+            f"${close_p:,.2f}"
+        )
+
+
+    with t2:
+
+        st.metric(
+            "Stop Loss",
+            f"${sl_val:,.2f}"
+        )
+
+
+    with t3:
+
+        st.metric(
+            "TP1 — 2R",
+            f"${tp1_val:,.2f}"
+        )
+
+
+    with t4:
+
+        st.metric(
+            "TP2 — 3R",
+            f"${tp2_val:,.2f}"
+        )
+
+
+    # =====================================================
+    # CHART
+    # =====================================================
+
+    st.markdown(
+        '<div class="section-title">📈 Price Trajectory</div>',
+        unsafe_allow_html=True
+    )
+
+    time_delta = pd.Timedelta(
+        minutes=tf_minutes
+    )
 
     future_times = [
 
         df["Time"].iloc[-1]
         +
-        pd.Timedelta(
-            minutes=tf_minutes * i
-        )
+        (i * time_delta)
 
         for i
         in range(
@@ -2215,8 +1979,7 @@ if (
 
     ]
 
-
-    steps = np.linspace(
+    t_steps = np.linspace(
         0,
         np.pi / 2,
         forecast_horizon
@@ -2226,33 +1989,27 @@ if (
     if direction == "LONG":
 
         forecast_prices = (
-            close_price
+            close_p
             +
-            (
-                beam
-                - close_price
-            )
+            (tp2_val - close_p)
             *
-            np.sin(steps)
+            np.sin(t_steps)
         )
 
     elif direction == "SHORT":
 
         forecast_prices = (
-            close_price
+            close_p
             -
-            (
-                close_price
-                - base
-            )
+            (close_p - tp2_val)
             *
-            np.sin(steps)
+            np.sin(t_steps)
         )
 
     else:
 
         forecast_prices = np.repeat(
-            close_price,
+            close_p,
             forecast_horizon
         )
 
@@ -2260,27 +2017,25 @@ if (
     fig = go.Figure()
 
 
-    # Candles
     fig.add_trace(
         go.Candlestick(
 
             x=df["Time"],
 
             open=df["Open"],
-
             high=df["High"],
-
             low=df["Low"],
-
             close=df["Close"],
 
-            name="Market",
+            name="Price",
+
+            increasing_line_color="#22c55e",
+            decreasing_line_color="#ef4444",
 
         )
     )
 
 
-    # Forecast
     fig.add_trace(
         go.Scatter(
 
@@ -2291,17 +2046,19 @@ if (
             future_times,
 
             y=[
-                close_price
+                close_p
             ]
             +
-            list(forecast_prices),
+            list(
+                forecast_prices
+            ),
 
             mode="lines+markers",
 
             name="Forecast",
 
             line=dict(
-                color=signal_color,
+                color=dir_color,
                 width=2,
                 dash="dot"
             ),
@@ -2314,49 +2071,39 @@ if (
     )
 
 
-    # Active levels
     fig.add_hline(
-        y=beam,
-        line_dash="dash",
-        line_color="#00e676",
-        annotation_text="BEAM"
-    )
-
-    fig.add_hline(
-        y=base,
-        line_dash="dash",
-        line_color="#ff5252",
-        annotation_text="BASE"
-    )
-
-    fig.add_hline(
-        y=sl,
+        y=sl_val,
         line_dash="dot",
-        line_color="#ff5252",
-        annotation_text="SL"
+        line_color="#ef4444",
+        annotation_text="SL",
+        annotation_position="right"
     )
 
 
-    # ========================================================
+    fig.add_hline(
+        y=tp1_val,
+        line_dash="dash",
+        line_color="#22c55e",
+        annotation_text="TP1 2R",
+        annotation_position="right"
+    )
+
+
+    fig.add_hline(
+        y=tp2_val,
+        line_dash="dot",
+        line_color="#38bdf8",
+        annotation_text="TP2 3R",
+        annotation_position="right"
+    )
+
+
     # TRI LINES
-    # ========================================================
 
     if show_tri:
 
         tri_levels = get_all_tri_levels(
             selected_symbol
-        )
-
-        recent = df.tail(
-            min(120, len(df))
-        )
-
-        chart_low = float(
-            recent["Low"].min()
-        )
-
-        chart_high = float(
-            recent["High"].max()
         )
 
         for tri_tf, tri in tri_levels.items():
@@ -2372,65 +2119,31 @@ if (
                 "#38bdf8"
             )
 
-            for name, width, opacity, dash in [
+            for level_name, width, opacity, dash in [
 
-                (
-                    "body_50",
-                    3,
-                    0.95,
-                    "solid"
-                ),
+                ("body_50", 3, 0.90, "solid"),
 
-                (
-                    "upper_50",
-                    1,
-                    0.55,
-                    "dot"
-                ),
+                ("upper_50", 1, 0.50, "dot"),
 
-                (
-                    "lower_50",
-                    1,
-                    0.55,
-                    "dot"
-                ),
+                ("lower_50", 1, 0.50, "dot"),
 
             ]:
 
-                level = float(
-                    tri[name]
-                )
-
-                span = max(
-                    chart_high
-                    - chart_low,
-                    close_price * 0.005
-                )
-
-                if (
-                    level
-                    <
-                    chart_low
-                    - span * 0.5
-                    or
-                    level
-                    >
-                    chart_high
-                    + span * 0.5
-                ):
-                    continue
-
                 fig.add_hline(
 
-                    y=level,
+                    y=float(
+                        tri[level_name]
+                    ),
 
                     line_color=color,
 
                     line_width=width,
 
+                    opacity=opacity,
+
                     line_dash=dash,
 
-                    opacity=opacity,
+                    layer="above",
 
                 )
 
@@ -2439,11 +2152,11 @@ if (
 
         template="plotly_dark",
 
-        height=500,
+        height=520,
 
-        paper_bgcolor="#111622",
+        paper_bgcolor="#0d131d",
 
-        plot_bgcolor="#111622",
+        plot_bgcolor="#0d131d",
 
         xaxis_rangeslider_visible=False,
 
@@ -2453,19 +2166,27 @@ if (
 
         margin=dict(
             l=10,
-            r=70,
+            r=80,
             t=10,
             b=10
         ),
 
         xaxis=dict(
             showgrid=True,
-            gridcolor="#202938"
+            gridcolor="#1e293b",
         ),
 
         yaxis=dict(
             showgrid=True,
-            gridcolor="#202938"
+            gridcolor="#1e293b",
+            zeroline=False,
+        ),
+
+        legend=dict(
+            orientation="h",
+            y=1.02,
+            x=1,
+            xanchor="right",
         ),
 
     )
@@ -2482,90 +2203,134 @@ if (
     )
 
 
-    # ========================================================
+    # =====================================================
     # MICROSTRUCTURE
-    # ========================================================
+    # =====================================================
 
     st.markdown(
-        '<div class="section-title">Order Book Analysis</div>',
+        '<div class="section-title">📚 Market Microstructure</div>',
         unsafe_allow_html=True
     )
 
+    m1, m2, m3, m4, m5 = st.columns(5)
 
-    m1, m2, m3, m4 = st.columns(4)
+
+    bid_vol_sum = float(
+        np.sum(bids[:, 1])
+    )
+
+    ask_vol_sum = float(
+        np.sum(asks[:, 1])
+    )
+
+    obi_val = (
+        bid_vol_sum
+        -
+        ask_vol_sum
+    ) / (
+        bid_vol_sum
+        +
+        ask_vol_sum
+        +
+        1e-12
+    )
+
+    spread_val = abs(
+        asks[0, 0]
+        -
+        bids[0, 0]
+    )
+
+    spread_mid = (
+        asks[0, 0]
+        +
+        bids[0, 0]
+    ) / 2
+
+    spread_pct = (
+        spread_val
+        /
+        spread_mid
+        *
+        100
+        if spread_mid
+        else 0
+    )
 
 
-    def calculate_obi(depth):
+    with m1:
 
-        bid = float(
+        st.metric(
+            "Bid Volume",
+            f"{bid_vol_sum:,.2f}"
+        )
+
+
+    with m2:
+
+        st.metric(
+            "Ask Volume",
+            f"{ask_vol_sum:,.2f}"
+        )
+
+
+    with m3:
+
+        st.metric(
+            "OBI",
+            f"{obi_val:+.3f}"
+        )
+
+
+    with m4:
+
+        st.metric(
+            "Spread",
+            f"${spread_val:.2f}"
+        )
+
+
+    with m5:
+
+        st.metric(
+            "Spread %",
+            f"{spread_pct:.4f}%"
+        )
+
+
+    # =====================================================
+    # TOP OBI
+    # =====================================================
+
+    def calc_obi(depth):
+
+        b = float(
             np.sum(
-                bids[
-                    :depth,
-                    1
-                ]
+                bids[:depth, 1]
             )
         )
 
-        ask = float(
+        a = float(
             np.sum(
-                asks[
-                    :depth,
-                    1
-                ]
+                asks[:depth, 1]
             )
         )
 
         return (
-            bid - ask
+            b - a
         ) / (
-            bid
-            + ask
-            + 1e-12
+            b + a + 1e-12
         )
 
 
-    top5 = calculate_obi(5)
-
-    top10 = calculate_obi(10)
-
-    top20 = calculate_obi(20)
+    top5_obi = calc_obi(5)
+    top10_obi = calc_obi(10)
+    top20_obi = calc_obi(20)
 
 
-    with m1:
-        st.metric(
-            "Top 5 OBI",
-            f"{top5:+.3f}"
-        )
+    fig_obi = go.Figure()
 
-    with m2:
-        st.metric(
-            "Top 10 OBI",
-            f"{top10:+.3f}"
-        )
-
-    with m3:
-        st.metric(
-            "Top 20 OBI",
-            f"{top20:+.3f}"
-        )
-
-    with m4:
-        st.metric(
-            "Book Pressure",
-            (
-                "BUY"
-                if obi > 0.15
-                else
-                "SELL"
-                if obi < -0.15
-                else
-                "NEUTRAL"
-            )
-        )
-
-
-    obi_fig = go.Figure(
-
+    fig_obi.add_trace(
         go.Bar(
 
             x=[
@@ -2575,39 +2340,39 @@ if (
             ],
 
             y=[
-                top5,
-                top10,
-                top20
+                top5_obi,
+                top10_obi,
+                top20_obi
             ],
 
             text=[
-                f"{top5:+.3f}",
-                f"{top10:+.3f}",
-                f"{top20:+.3f}",
+                f"{x:+.3f}"
+                for x in [
+                    top5_obi,
+                    top10_obi,
+                    top20_obi
+                ]
             ],
 
             textposition="outside",
 
         )
-
     )
 
-
-    obi_fig.add_hline(
+    fig_obi.add_hline(
         y=0,
         line_width=1
     )
 
+    fig_obi.update_layout(
 
-    obi_fig.update_layout(
+        height=240,
 
         template="plotly_dark",
 
-        height=250,
+        paper_bgcolor="#0d131d",
 
-        paper_bgcolor="#111622",
-
-        plot_bgcolor="#111622",
+        plot_bgcolor="#0d131d",
 
         margin=dict(
             l=10,
@@ -2620,11 +2385,13 @@ if (
             range=[-1, 1]
         ),
 
+        showlegend=False,
+
     )
 
 
     st.plotly_chart(
-        obi_fig,
+        fig_obi,
         use_container_width=True,
         config={
             "displayModeBar": False
@@ -2632,89 +2399,41 @@ if (
     )
 
 
-    # ========================================================
-    # RISK
-    # ========================================================
+    # =====================================================
+    # 12 PAPER SCOREBOARD
+    # =====================================================
 
     st.markdown(
-        '<div class="section-title">Risk Monitor</div>',
+        '<div class="section-title">🔬 Quantitative Research Scoreboard</div>',
         unsafe_allow_html=True
     )
 
+    paper_table = []
 
-    r1, r2, r3, r4 = st.columns(4)
+    for k, v in paper_results.items():
 
+        status = (
 
-    with r1:
+            "PASS"
+            if v > 0.1
 
-        st.metric(
-            "LTZ Score",
-            f"{risk_metrics['LTZ_Score']:.2f}"
+            else "FAIL"
+            if v < -0.1
+
+            else "NEUTRAL"
+
         )
 
+        paper_table.append({
 
-    with r2:
-
-        st.metric(
-            "Spoof Score",
-            f"{risk_metrics['Spoof_Score']:.3f}"
-        )
-
-
-    with r3:
-
-        st.metric(
-            "Squeeze Risk",
-            f"{risk_metrics['Squeeze_Risk']:.2f}"
-        )
-
-
-    with r4:
-
-        st.metric(
-            "Market Risk",
-            f"{risk_metrics['Market_Risk']:.2f}"
-        )
-
-
-    # ========================================================
-    # RESEARCH SCOREBOARD
-    # ========================================================
-
-    st.markdown("---")
-
-    st.subheader(
-        "12-Factor Quantitative Research"
-    )
-
-
-    scoreboard = []
-
-    for key, value in paper_results.items():
-
-        if value > 0.10:
-
-            status = "PASS"
-
-        elif value < -0.10:
-
-            status = "FAIL"
-
-        else:
-
-            status = "NEUTRAL"
-
-
-        scoreboard.append({
-
-            "Factor":
-                key,
+            "Research Factor":
+                k,
 
             "Value":
-                f"{value:+.3f}",
+                f"{v:+.3f}",
 
             "Weight":
-                f"{evolved_weights[key] * 100:.1f}%",
+                f"{evolved_weights[k] * 100:.1f}%",
 
             "Status":
                 status,
@@ -2723,21 +2442,22 @@ if (
 
 
     st.dataframe(
-        pd.DataFrame(scoreboard),
+        pd.DataFrame(
+            paper_table
+        ),
         use_container_width=True,
         hide_index=True,
         height=300
     )
 
 
-    # ========================================================
+    # =====================================================
     # PERFORMANCE
-    # ========================================================
+    # =====================================================
 
-    st.markdown("---")
-
-    st.subheader(
-        "Paper Trading Performance"
+    st.markdown(
+        '<div class="section-title">📊 Paper Trading Performance</div>',
+        unsafe_allow_html=True
     )
 
 
@@ -2754,40 +2474,45 @@ if (
         with f1:
 
             coin_filter = st.selectbox(
-                "Market Filter",
-                ["ALL"] + COINS_LIST
+                "Coin",
+                ["ALL"] + COINS_LIST,
+                key="coin_filter"
             )
 
 
         with f2:
 
             tf_filter = st.selectbox(
-                "Timeframe Filter",
-                ["ALL"] + list(
+                "Timeframe",
+                ["ALL"]
+                +
+                list(
                     TIMEFRAME_MAP.keys()
-                )
+                ),
+                key="tf_filter"
             )
 
 
         with f3:
 
-            direction_filter = st.selectbox(
-                "Direction Filter",
+            dir_filter = st.selectbox(
+                "Direction",
                 [
                     "ALL",
                     "LONG",
                     "SHORT"
-                ]
+                ],
+                key="dir_filter"
             )
 
 
-        filtered = df_log.copy()
+        filtered_df = df_log.copy()
 
 
         if coin_filter != "ALL":
 
-            filtered = filtered[
-                filtered["symbol"]
+            filtered_df = filtered_df[
+                filtered_df["symbol"]
                 ==
                 coin_filter
             ]
@@ -2795,45 +2520,46 @@ if (
 
         if tf_filter != "ALL":
 
-            filtered = filtered[
-                filtered["timeframe"]
+            filtered_df = filtered_df[
+                filtered_df["timeframe"]
                 ==
                 tf_filter
             ]
 
 
-        if direction_filter != "ALL":
+        if dir_filter != "ALL":
 
-            filtered = filtered[
-                filtered["direction"]
+            filtered_df = filtered_df[
+                filtered_df["direction"]
                 ==
-                direction_filter
+                dir_filter
             ]
 
 
-        total = len(filtered)
+        total_signals = len(
+            filtered_df
+        )
 
         wins = len(
-            filtered[
-                filtered["outcome"]
+            filtered_df[
+                filtered_df["outcome"]
                 == "WIN"
             ]
         )
 
         losses = len(
-            filtered[
-                filtered["outcome"]
+            filtered_df[
+                filtered_df["outcome"]
                 == "LOSS"
             ]
         )
 
         pending = len(
-            filtered[
-                filtered["outcome"]
+            filtered_df[
+                filtered_df["outcome"]
                 == "PENDING"
             ]
         )
-
 
         closed = wins + losses
 
@@ -2843,53 +2569,53 @@ if (
             wins
             /
             closed
-            * 100
+            *
+            100
 
             if closed > 0
-
             else 0
-
         )
 
 
-        gross_profit = filtered.loc[
-            filtered["outcome"] == "WIN",
-            "pnl_percent"
-        ].sum()
-
+        gross_profit = (
+            filtered_df[
+                filtered_df["outcome"]
+                == "WIN"
+            ]["pnl_percent"]
+            .sum()
+        )
 
         gross_loss = abs(
-            filtered.loc[
-                filtered["outcome"] == "LOSS",
-                "pnl_percent"
-            ].sum()
+            filtered_df[
+                filtered_df["outcome"]
+                == "LOSS"
+            ]["pnl_percent"]
+            .sum()
         )
 
 
         net_pnl = (
             gross_profit
-            - gross_loss
+            -
+            gross_loss
         )
 
 
-        if gross_loss > 0:
+        profit_factor = (
 
-            profit_factor = (
-                gross_profit
-                /
-                gross_loss
-            )
+            gross_profit
+            /
+            gross_loss
 
-        else:
+            if gross_loss > 0
 
-            profit_factor = (
-                gross_profit
-                if gross_profit > 0
-                else 0
-            )
+            else 0
+        )
 
 
-        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        p1, p2, p3, p4, p5, p6 = (
+            st.columns(6)
+        )
 
 
         with p1:
@@ -2945,7 +2671,7 @@ if (
         )
 
 
-        display_columns = [
+        display_cols = [
 
             "timestamp",
             "symbol",
@@ -2954,34 +2680,34 @@ if (
             "entry_price",
             "stop_loss",
             "tp1",
+            "tp2",
             "exit_price",
+            "confidence",
             "pnl_percent",
             "outcome",
-            "confidence",
+            "status",
 
         ]
 
 
-        available_columns = [
-
-            col
-            for col in display_columns
-            if col in filtered.columns
-
+        available_cols = [
+            c
+            for c in display_cols
+            if c in filtered_df.columns
         ]
 
 
         st.dataframe(
 
-            filtered[
-                available_columns
+            filtered_df[
+                available_cols
             ],
 
             use_container_width=True,
 
             hide_index=True,
 
-            height=300
+            height=330,
 
         )
 
