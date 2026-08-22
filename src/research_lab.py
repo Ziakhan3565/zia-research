@@ -1,2434 +1,1932 @@
-# ============================================================
 # engine.py
-# Research / Quant Signal Engine
-# ============================================================
 
 import numpy as np
 import pandas as pd
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def safe_float(value, default=0.0):
-    try:
-        value = float(value)
-
-        if np.isfinite(value):
-            return value
-
-    except Exception:
-        pass
-
-    return default
-
-
-def clip(value, low=-1.0, high=1.0):
-    return float(np.clip(value, low, high))
+EPS = 1e-12
 
 
 # ============================================================
-# TEN PAPER RESEARCH LAB
+# CONFIGURATION
 # ============================================================
 
-class TenPaperResearchLab:
+@dataclass
+class SignalConfig:
 
-    def __init__(
-        self,
-        target_vol=0.15,
+    # --------------------------------------------------------
+    # MINIMUM MOVE
+    # --------------------------------------------------------
+    # Trade tabhi allow hoga jab expected/recent move >= 0.40%
+    min_move_pct: float = 0.004
 
-        # Main move filter
-        min_move_percent=0.40,
-        move_lookback=5,
+    # --------------------------------------------------------
+    # ORDER BOOK CONFIRMATION
+    # --------------------------------------------------------
+    obi_threshold: float = 0.15
+    ofi_threshold: float = 0.10
 
-        # Order book confirmation
-        obi_threshold=0.15,
-        ofi_threshold=0.10,
+    # --------------------------------------------------------
+    # SIGNAL CONFIDENCE
+    # --------------------------------------------------------
+    min_confidence: float = 0.70
+    strong_confidence: float = 0.80
 
-        # Minimum confidence
-        confidence_threshold=0.60,
+    # --------------------------------------------------------
+    # RISK / REWARD
+    # --------------------------------------------------------
+    rr_tp1: float = 2.0       # 1:2
+    rr_tp2: float = 3.0       # 1:3
 
-        # Risk / reward
-        minimum_rr=2.0,
-        strong_rr=3.0,
+    # --------------------------------------------------------
+    # STOP LOSS
+    # --------------------------------------------------------
+    atr_period: int = 14
+    atr_multiplier: float = 1.0
 
-        # Stop-loss
-        atr_period=14,
-        atr_multiplier=1.0,
+    min_stop_pct: float = 0.0015      # 0.15%
+    max_stop_pct: float = 0.0080      # 0.80%
 
-        # Manipulation
-        spoof_threshold=0.60
+    # --------------------------------------------------------
+    # VOLATILITY REGIME
+    # --------------------------------------------------------
+    vol_window: int = 30
+
+    min_vol_ratio: float = 0.80
+    max_vol_ratio: float = 3.50
+
+    # --------------------------------------------------------
+    # IMPULSE / EXHAUSTION
+    # --------------------------------------------------------
+    impulse_z: float = 2.5
+    exhaustion_z: float = 3.5
+
+    # --------------------------------------------------------
+    # MANIPULATION
+    # --------------------------------------------------------
+    cancel_ratio_limit: float = 0.70
+    persistence_min: float = 0.25
+
+    # --------------------------------------------------------
+    # ONLINE ML
+    # --------------------------------------------------------
+    min_training_samples: int = 30
+    max_training_samples: int = 500
+
+    random_state: int = 42
+
+
+# ============================================================
+# RESEARCH FEATURES
+# ============================================================
+
+class ResearchFeatures:
+
+    names = [
+
+        "HAWKES",
+        "BOOK_IMB",
+        "OFI",
+        "TAKER_FLOW",
+        "DEPTH_SKEW",
+        "BAYESIAN",
+        "QUANTILES",
+        "MOVE_FILTER",
+        "ADAPTIVE_TREND",
+        "CONFORMAL",
+        "KELLY",
+        "RMT_PROXY",
+        "REWARD_RISK",
+        "VOL_REGIME",
+        "IMPULSE",
+        "EXHAUSTION",
+
+    ]
+
+    # ========================================================
+    # SAFE SERIES
+    # ========================================================
+
+    @staticmethod
+    def _safe_series(
+        df: pd.DataFrame,
+        col: str,
+        default=0.0
     ):
 
-        self.target_vol = target_vol
-
-        # ====================================================
-        # MAIN USER RULES
-        # ====================================================
-
-        self.min_move_percent = min_move_percent
-        self.move_lookback = move_lookback
-
-        self.minimum_rr = minimum_rr
-        self.strong_rr = strong_rr
-
-        # ====================================================
-        # SIGNAL SETTINGS
-        # ====================================================
-
-        self.obi_threshold = obi_threshold
-        self.ofi_threshold = ofi_threshold
-        self.confidence_threshold = confidence_threshold
-
-        # ====================================================
-        # STOP LOSS SETTINGS
-        # ====================================================
-
-        self.atr_period = atr_period
-        self.atr_multiplier = atr_multiplier
-
-        # ====================================================
-        # MANIPULATION
-        # ====================================================
-
-        self.spoof_threshold = spoof_threshold
-
-        # ====================================================
-        # MACHINE LEARNING
-        # ====================================================
-
-        self.scaler = StandardScaler()
-
-        self.ml_model = SGDClassifier(
-            loss="log_loss",
-            penalty="l2",
-            alpha=0.0001,
-            max_iter=1000,
-            random_state=42
-        )
-
-        self.is_model_trained = False
-
-        # ====================================================
-        # FEATURES
-        # ====================================================
-
-        self.feature_names = [
-
-            "BOOK_IMB",
-            "OFI",
-            "TAKER_FLOW",
-
-            "MOVE_PERCENT",
-            "MOVE_SIGNIFICANCE",
-            "IMPULSE_SCORE",
-
-            "REALIZED_VOL",
-            "VOLUME_ACCEL",
-
-            "QUANTILES",
-            "BAYESIAN",
-
-            "ADAPT_CONF",
-            "RMT_DOM",
-
-            "REWARD_RISK",
-            "FRAC_KELLY",
-
-            "HAWKES",
-
-            "SPOOF_RISK"
-
-        ]
-
-        # ====================================================
-        # FALLBACK WEIGHTS
-        # ====================================================
-
-        self.dynamic_weights = {
-            name: 1.0 / len(self.feature_names)
-            for name in self.feature_names
-        }
-
-        # ====================================================
-        # ORDER BOOK MEMORY
-        # ====================================================
-
-        self.previous_bids = None
-        self.previous_asks = None
-
-    # ========================================================
-    # ORDER BOOK IMBALANCE
-    # ========================================================
-
-    def calculate_book_imbalance(self, bids, asks):
-
-        if len(bids) == 0 or len(asks) == 0:
-            return 0.0
-
-        try:
-
-            bid_volume = np.sum(bids[:, 1])
-            ask_volume = np.sum(asks[:, 1])
-
-            imbalance = (
-                bid_volume - ask_volume
-            ) / (
-                bid_volume + ask_volume + 1e-8
-            )
-
-            return clip(
-                imbalance,
-                -1.0,
-                1.0
-            )
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # ORDER FLOW IMBALANCE
-    # ========================================================
-
-    def calculate_ofi(self, bids, asks):
-
-        if (
-            self.previous_bids is None
-            or self.previous_asks is None
-            or len(bids) == 0
-            or len(asks) == 0
-        ):
-            return 0.0
-
-        try:
-
-            cbp = float(bids[0, 0])
-            cbs = float(bids[0, 1])
-
-            pbp = float(self.previous_bids[0, 0])
-            pbs = float(self.previous_bids[0, 1])
-
-            cap = float(asks[0, 0])
-            cas = float(asks[0, 1])
-
-            pap = float(self.previous_asks[0, 0])
-            pas = float(self.previous_asks[0, 1])
-
-            # Bid flow
-            if cbp > pbp:
-                bid_event = cbs
-
-            elif cbp < pbp:
-                bid_event = -pbs
-
-            else:
-                bid_event = cbs - pbs
-
-            # Ask flow
-            if cap < pap:
-                ask_event = cas
-
-            elif cap > pap:
-                ask_event = -pas
-
-            else:
-                ask_event = cas - pas
-
-            raw_ofi = bid_event - ask_event
-
-            depth = (
-                cbs
-                + cas
-                + 1e-8
-            )
-
-            normalized_ofi = (
-                raw_ofi / depth
-            )
-
-            return clip(
-                normalized_ofi,
-                -1.0,
-                1.0
-            )
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # MOVE PERCENT
-    #
-    # Last 5 candles by default
-    # ========================================================
-
-    def calculate_move_percent(self, close):
-
-        if len(close) <= self.move_lookback:
-            return 0.0
-
-        try:
-
-            reference = float(
-                close.iloc[-self.move_lookback]
-            )
-
-            current = float(
-                close.iloc[-1]
-            )
-
-            if reference <= 0:
-                return 0.0
-
-            move = (
-                abs(current - reference)
-                /
-                reference
-            ) * 100.0
-
-            return float(move)
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # MOVE DIRECTION
-    # ========================================================
-
-    def calculate_move_direction(self, close):
-
-        if len(close) <= self.move_lookback:
-            return 0.0
-
-        try:
-
-            reference = float(
-                close.iloc[-self.move_lookback]
-            )
-
-            current = float(
-                close.iloc[-1]
-            )
-
-            if current > reference:
-                return 1.0
-
-            if current < reference:
-                return -1.0
-
-            return 0.0
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # REALIZED VOLATILITY
-    # ========================================================
-
-    def calculate_realized_vol(self, returns):
-
-        if len(returns) < 5:
-            return 0.0
-
-        try:
-
-            return float(
-                returns.iloc[-20:].std()
-            )
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # MOVE SIGNIFICANCE
-    # ========================================================
-
-    def calculate_move_significance(self, returns):
-
-        if len(returns) < 5:
-            return 0.0
-
-        try:
-
-            current_move = abs(
-                float(returns.iloc[-1])
-            )
-
-            volatility = (
-                self.calculate_realized_vol(
-                    returns
-                )
-                + 1e-8
-            )
-
-            return float(
-                np.clip(
-                    current_move / volatility,
-                    0.0,
-                    5.0
-                )
-            )
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # VOLUME ACCELERATION
-    # ========================================================
-
-    def calculate_volume_acceleration(
-        self,
-        volume
-    ):
-
-        if len(volume) < 20:
-            return 0.0, 0.0
-
-        try:
-
-            short_volume = float(
-                volume.iloc[-3:].mean()
-            )
-
-            long_volume = float(
-                volume.iloc[-20:].mean()
-            ) + 1e-8
-
-            ratio = (
-                short_volume
-                /
-                long_volume
-            )
-
-            acceleration = ratio - 1.0
+        if col in df.columns:
 
             return (
-                float(acceleration),
-                float(ratio)
-            )
-
-        except Exception:
-
-            return 0.0, 0.0
-
-    # ========================================================
-    # IMPULSE / SUDDEN MOVE
-    # ========================================================
-
-    def calculate_impulse_score(
-        self,
-        returns,
-        volume_ratio,
-        ofi
-    ):
-
-        if len(returns) < 5:
-            return 0.0
-
-        try:
-
-            last_move = abs(
-                float(
-                    returns.iloc[-1]
+                pd.to_numeric(
+                    df[col],
+                    errors="coerce"
                 )
+                .fillna(default)
             )
 
-            volatility = (
-                self.calculate_realized_vol(
-                    returns
-                )
-                + 1e-8
-            )
-
-            normalized_move = (
-                last_move
-                /
-                volatility
-            )
-
-            price_component = np.clip(
-                normalized_move / 3.0,
-                0.0,
-                1.0
-            )
-
-            volume_component = np.clip(
-                (volume_ratio - 1.0) / 3.0,
-                0.0,
-                1.0
-            )
-
-            flow_component = np.clip(
-                abs(ofi),
-                0.0,
-                1.0
-            )
-
-            score = (
-                0.50 * price_component
-                +
-                0.25 * volume_component
-                +
-                0.25 * flow_component
-            )
-
-            return float(
-                np.clip(
-                    score,
-                    0.0,
-                    1.0
-                )
-            )
-
-        except Exception:
-
-            return 0.0
+        return pd.Series(
+            default,
+            index=df.index,
+            dtype=float
+        )
 
     # ========================================================
-    # HAWKES-STYLE ACTIVITY
+    # Z SCORE
     # ========================================================
 
-    def calculate_activity_intensity(
-        self,
-        df
-    ):
+    @staticmethod
+    def _zscore(
+        x: pd.Series,
+        window: int = 30
+    ) -> float:
 
-        if (
-            "Volume" not in df.columns
-            or len(df) < 15
+        x = (
+            pd.to_numeric(
+                x,
+                errors="coerce"
+            )
+            .replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+            .dropna()
+        )
+
+        if len(x) < max(
+            10,
+            window // 2
         ):
             return 0.0
 
-        try:
+        w = x.iloc[-window:]
 
-            volume = (
-                df["Volume"]
-                .astype(float)
-                .replace(
-                    [np.inf, -np.inf],
-                    np.nan
-                )
-                .fillna(0.0)
-            )
+        mu = w.mean()
 
-            short_activity = float(
-                volume.iloc[-3:].mean()
-            )
-
-            long_activity = float(
-                volume.iloc[-15:].mean()
-            ) + 1e-8
-
-            ratio = (
-                short_activity
-                /
-                long_activity
-            )
-
-            return clip(
-                ratio - 1.0,
-                -1.0,
-                1.0
-            )
-
-        except Exception:
-
-            return 0.0
-
-    # ========================================================
-    # SPOOF / MANIPULATION DETECTION
-    #
-    # Uses changes between current and previous book.
-    # ========================================================
-
-    def calculate_spoof_risk(
-        self,
-        bids,
-        asks
-    ):
+        sd = w.std(
+            ddof=1
+        )
 
         if (
-            self.previous_bids is None
-            or self.previous_asks is None
+            not np.isfinite(sd)
+            or sd < EPS
         ):
             return 0.0
 
-        try:
-
-            current_bid = np.sum(
-                bids[:, 1]
-            )
-
-            current_ask = np.sum(
-                asks[:, 1]
-            )
-
-            previous_bid = np.sum(
-                self.previous_bids[:, 1]
-            )
-
-            previous_ask = np.sum(
-                self.previous_asks[:, 1]
-            )
-
-            bid_change = (
-                current_bid
-                -
-                previous_bid
-            ) / (
-                abs(previous_bid)
-                +
-                1e-8
-            )
-
-            ask_change = (
-                current_ask
-                -
-                previous_ask
-            ) / (
-                abs(previous_ask)
-                +
-                1e-8
-            )
-
-            # Large book disappearance
-            bid_cancel = max(
-                -bid_change,
-                0.0
-            )
-
-            ask_cancel = max(
-                -ask_change,
-                0.0
-            )
-
-            risk = max(
-                bid_cancel,
-                ask_cancel
-            )
-
-            return float(
-                np.clip(
-                    risk,
-                    0.0,
-                    1.0
-                )
-            )
-
-        except Exception:
-
-            return 0.0
+        return float(
+            (w.iloc[-1] - mu) /
+            sd
+        )
 
     # ========================================================
     # ATR
     # ========================================================
 
-    def calculate_atr(self, df):
+    @staticmethod
+    def atr(
+        df: pd.DataFrame,
+        period: int = 14
+    ) -> float:
 
-        required = [
-            "High",
-            "Low",
+        if len(df) < 2:
+            return 0.0
+
+        close = ResearchFeatures._safe_series(
+            df,
             "Close"
+        )
+
+        high = ResearchFeatures._safe_series(
+            df,
+            "High",
+            close
+        )
+
+        low = ResearchFeatures._safe_series(
+            df,
+            "Low",
+            close
+        )
+
+        previous_close = close.shift(1)
+
+        tr = pd.concat(
+            [
+
+                high - low,
+
+                (
+                    high -
+                    previous_close
+                ).abs(),
+
+                (
+                    low -
+                    previous_close
+                ).abs(),
+
+            ],
+            axis=1
+        ).max(axis=1)
+
+        value = (
+            tr
+            .rolling(
+                period,
+                min_periods=max(
+                    3,
+                    period // 2
+                )
+            )
+            .mean()
+            .iloc[-1]
+        )
+
+        if np.isfinite(value):
+            return float(value)
+
+        return float(
+            tr.iloc[-1]
+        )
+
+    # ========================================================
+    # HAWKES INTENSITY
+    # ========================================================
+
+    @staticmethod
+    def hawkes_intensity_from_events(
+        event_times: np.ndarray,
+        decay: float = 1.0,
+        baseline: float = 1.0
+    ) -> float:
+
+        t = np.asarray(
+            event_times,
+            dtype=float
+        )
+
+        t = t[
+            np.isfinite(t)
         ]
 
-        if not all(
-            col in df.columns
-            for col in required
+        if len(t) < 3:
+            return 0.0
+
+        t = np.sort(t)
+
+        gaps = np.diff(t)
+
+        positive = gaps[
+            gaps > 0
+        ]
+
+        if len(positive) == 0:
+            return 0.0
+
+        scale = float(
+            np.median(
+                positive
+            )
+        )
+
+        if scale <= 0:
+            return 0.0
+
+        normalized_time = (
+            t - t[-1]
+        ) / scale
+
+        alpha = 1.0
+
+        excitation = np.sum(
+            alpha *
+            np.exp(
+                decay *
+                normalized_time[:-1]
+            )
+        )
+
+        recent = (
+            excitation /
+            max(
+                len(t) - 1,
+                1
+            )
+        )
+
+        return float(
+            np.clip(
+                (
+                    recent -
+                    baseline
+                ) /
+                (
+                    baseline +
+                    EPS
+                ),
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # ORDER BOOK IMBALANCE
+    # ========================================================
+
+    @staticmethod
+    def order_book_imbalance(
+        bids: np.ndarray,
+        asks: np.ndarray,
+        levels: int = 20
+    ) -> float:
+
+        b = np.asarray(
+            bids,
+            dtype=float
+        )[:levels]
+
+        a = np.asarray(
+            asks,
+            dtype=float
+        )[:levels]
+
+        if (
+            len(b) == 0
+            or len(a) == 0
         ):
             return 0.0
 
-        if len(df) < self.atr_period + 2:
+        bid_volume = np.clip(
+            b[:, 1],
+            0,
+            None
+        ).sum()
+
+        ask_volume = np.clip(
+            a[:, 1],
+            0,
+            None
+        ).sum()
+
+        return float(
+            (
+                bid_volume -
+                ask_volume
+            )
+            /
+            (
+                bid_volume +
+                ask_volume +
+                EPS
+            )
+        )
+
+    # ========================================================
+    # DEPTH SKEW
+    # ========================================================
+
+    @staticmethod
+    def depth_skew(
+        bids: np.ndarray,
+        asks: np.ndarray
+    ) -> float:
+
+        b = np.asarray(
+            bids,
+            dtype=float
+        )
+
+        a = np.asarray(
+            asks,
+            dtype=float
+        )
+
+        if (
+            len(b) == 0
+            or len(a) == 0
+        ):
             return 0.0
 
-        try:
+        bid1 = max(
+            float(b[0, 1]),
+            0.0
+        )
 
-            high = df["High"].astype(float)
-            low = df["Low"].astype(float)
-            close = df["Close"].astype(float)
+        ask1 = max(
+            float(a[0, 1]),
+            0.0
+        )
 
-            previous_close = (
-                close.shift(1)
+        return float(
+            (
+                bid1 -
+                ask1
+            )
+            /
+            (
+                bid1 +
+                ask1 +
+                EPS
+            )
+        )
+
+    # ========================================================
+    # OFI
+    # ========================================================
+
+    @staticmethod
+    def ofi_from_snapshots(
+        prev_bids: np.ndarray,
+        prev_asks: np.ndarray,
+        bids: np.ndarray,
+        asks: np.ndarray,
+        levels: int = 1
+    ) -> float:
+
+        pb = np.asarray(
+            prev_bids,
+            dtype=float
+        )[:levels]
+
+        pa = np.asarray(
+            prev_asks,
+            dtype=float
+        )[:levels]
+
+        cb = np.asarray(
+            bids,
+            dtype=float
+        )[:levels]
+
+        ca = np.asarray(
+            asks,
+            dtype=float
+        )[:levels]
+
+        if (
+            len(pb) == 0
+            or len(pa) == 0
+            or len(cb) == 0
+            or len(ca) == 0
+        ):
+            return 0.0
+
+        previous_bid_price, previous_bid_size = pb[0]
+
+        previous_ask_price, previous_ask_size = pa[0]
+
+        current_bid_price, current_bid_size = cb[0]
+
+        current_ask_price, current_ask_size = ca[0]
+
+        # Bid event
+        if current_bid_price > previous_bid_price:
+
+            bid_event = current_bid_size
+
+        elif current_bid_price < previous_bid_price:
+
+            bid_event = -previous_bid_size
+
+        else:
+
+            bid_event = (
+                current_bid_size -
+                previous_bid_size
             )
 
-            tr1 = high - low
+        # Ask event
+        if current_ask_price < previous_ask_price:
 
-            tr2 = (
-                high
-                -
-                previous_close
-            ).abs()
+            ask_event = current_ask_size
 
-            tr3 = (
-                low
-                -
-                previous_close
-            ).abs()
+        elif current_ask_price > previous_ask_price:
 
-            true_range = pd.concat(
-                [
-                    tr1,
-                    tr2,
-                    tr3
-                ],
-                axis=1
-            ).max(axis=1)
+            ask_event = -previous_ask_size
 
-            atr = float(
-                true_range
-                .rolling(
-                    self.atr_period
+        else:
+
+            ask_event = (
+                current_ask_size -
+                previous_ask_size
+            )
+
+        raw_ofi = (
+            bid_event -
+            ask_event
+        )
+
+        depth = (
+            abs(current_bid_size) +
+            abs(current_ask_size) +
+            EPS
+        )
+
+        return float(
+            np.tanh(
+                raw_ofi /
+                depth
+            )
+        )
+
+    # ========================================================
+    # TAKER FLOW
+    # ========================================================
+
+    @staticmethod
+    def taker_flow(
+        df: pd.DataFrame
+    ) -> float:
+
+        # Prefer actual taker data
+        if (
+            "TakerBuyVolume" in df.columns
+            and
+            "TakerSellVolume" in df.columns
+        ):
+
+            buy = float(
+                pd.to_numeric(
+                    df[
+                        "TakerBuyVolume"
+                    ],
+                    errors="coerce"
                 )
-                .mean()
+                .fillna(0)
                 .iloc[-1]
             )
 
-            if not np.isfinite(atr):
-                return 0.0
+            sell = float(
+                pd.to_numeric(
+                    df[
+                        "TakerSellVolume"
+                    ],
+                    errors="coerce"
+                )
+                .fillna(0)
+                .iloc[-1]
+            )
 
-            return atr
+            return float(
+                (
+                    buy -
+                    sell
+                )
+                /
+                (
+                    buy +
+                    sell +
+                    EPS
+                )
+            )
 
-        except Exception:
+        # Fallback signed volume
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
 
+        volume = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Volume"
+            )
+        )
+
+        if len(close) < 2:
             return 0.0
 
-    # ========================================================
-    # DYNAMIC SL
-    # ========================================================
-
-    def calculate_stop_loss(
-        self,
-        df,
-        direction,
-        entry_price
-    ):
-
-        close = df["Close"].astype(float)
-
-        atr = self.calculate_atr(df)
-
-        # ====================================================
-        # ATR based risk
-        # ====================================================
-
-        if atr > 0:
-
-            volatility_risk = (
-                atr
-                *
-                self.atr_multiplier
+        direction = (
+            np.sign(
+                close.diff()
             )
-
-        else:
-
-            volatility_risk = (
-                entry_price
-                *
-                0.0015
-            )
-
-        # ====================================================
-        # Recent structure
-        # ====================================================
-
-        structure_lookback = min(
-            10,
-            len(df)
+            .fillna(0)
         )
 
-        recent_low = float(
-            close.iloc[
-                -structure_lookback:
-            ].min()
-        )
-
-        recent_high = float(
-            close.iloc[
-                -structure_lookback:
-            ].max()
-        )
-
-        if direction == "BUY":
-
-            structure_risk = (
-                entry_price
-                -
-                recent_low
-            )
-
-        else:
-
-            structure_risk = (
-                recent_high
-                -
-                entry_price
-            )
-
-        structure_risk = max(
-            structure_risk,
-            0.0
-        )
-
-        # ====================================================
-        # Use conservative risk
-        # ====================================================
-
-        risk_distance = max(
-            volatility_risk,
-            structure_risk * 0.50,
-            entry_price * 0.001
-        )
-
-        if direction == "BUY":
-
-            stop_loss = (
-                entry_price
-                -
-                risk_distance
-            )
-
-        else:
-
-            stop_loss = (
-                entry_price
-                +
-                risk_distance
-            )
-
-        return (
-            float(stop_loss),
-            float(risk_distance),
-            float(atr)
-        )
-
-    # ========================================================
-    # TP LEVELS
-    #
-    # TP1 = 1:2
-    # TP2 = 1:3
-    # ========================================================
-
-    def calculate_targets(
-        self,
-        direction,
-        entry_price,
-        risk_distance
-    ):
-
-        if risk_distance <= 0:
-            return 0.0, 0.0
-
-        tp1_distance = (
-            risk_distance
-            *
-            2.0
-        )
-
-        tp2_distance = (
-            risk_distance
-            *
-            3.0
-        )
-
-        if direction == "BUY":
-
-            tp1 = (
-                entry_price
-                +
-                tp1_distance
-            )
-
-            tp2 = (
-                entry_price
-                +
-                tp2_distance
-            )
-
-        else:
-
-            tp1 = (
-                entry_price
-                -
-                tp1_distance
-            )
-
-            tp2 = (
-                entry_price
-                -
-                tp2_distance
-            )
-
-        return (
-            float(tp1),
-            float(tp2)
-        )
-
-    # ========================================================
-    # DIRECTION SCORE
-    # ========================================================
-
-    def calculate_direction_score(
-        self,
-        features
-    ):
-
-        values = [
-
-            features.get(
-                "BOOK_IMB",
-                0.0
-            ),
-
-            features.get(
-                "OFI",
-                0.0
-            ),
-
-            features.get(
-                "TAKER_FLOW",
-                0.0
-            ),
-
-            features.get(
-                "BAYESIAN",
-                0.0
-            ),
-
-            features.get(
-                "ADAPT_CONF",
-                0.0
-            ),
-
-            features.get(
-                "RMT_DOM",
-                0.0
-            ),
-
-            features.get(
-                "HAWKES",
-                0.0
-            )
-
-        ]
-
-        return float(
-            np.clip(
-                np.mean(values),
-                -1.0,
-                1.0
-            )
-        )
-
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    def calculate_confidence(
-        self,
-        features,
-        ml_probability=None
-    ):
-
-        direction_strength = abs(
-            self.calculate_direction_score(
-                features
-            )
-        )
-
-        move_percent = features.get(
-            "MOVE_PERCENT",
-            0.0
-        )
-
-        move_strength = np.clip(
-            move_percent
-            /
+        signed_volume = float(
             (
-                self.min_move_percent
-                +
-                1e-8
-            ),
-            0.0,
-            2.0
+                direction *
+                volume
+            )
+            .tail(5)
+            .sum()
         )
 
-        move_strength = (
-            move_strength / 2.0
-        )
-
-        impulse = features.get(
-            "IMPULSE_SCORE",
-            0.0
-        )
-
-        spoof_risk = features.get(
-            "SPOOF_RISK",
-            0.0
-        )
-
-        if ml_probability is not None:
-
-            ml_confidence = abs(
-                ml_probability
-                -
-                0.5
-            ) * 2.0
-
-        else:
-
-            ml_confidence = 0.0
-
-        confidence = (
-            0.35 * direction_strength
-            +
-            0.20 * move_strength
-            +
-            0.20 * impulse
-            +
-            0.15 * ml_confidence
-            +
-            0.10 * (1.0 - spoof_risk)
+        total_volume = float(
+            volume
+            .tail(5)
+            .sum()
         )
 
         return float(
             np.clip(
-                confidence,
-                0.0,
-                1.0
+                signed_volume /
+                (
+                    total_volume +
+                    EPS
+                ),
+                -1,
+                1
             )
         )
 
     # ========================================================
-    # FEATURE EXTRACTION
+    # EMPIRICAL BAYES
     # ========================================================
 
-    def extract_features(
-        self,
-        df,
-        bids,
-        asks
-    ):
+    @staticmethod
+    def empirical_bayesian(
+        book_imb: float,
+        history: Optional[
+            List[dict]
+        ]
+    ) -> float:
 
-        results = {
-            name: 0.0
-            for name in self.feature_names
-        }
+        wins = 1.0
+        losses = 1.0
+
+        if history:
+
+            for h in history[-500:]:
+
+                outcome = str(
+                    h.get(
+                        "outcome",
+                        ""
+                    )
+                ).upper()
+
+                direction = str(
+                    h.get(
+                        "direction",
+                        ""
+                    )
+                ).upper()
+
+                if outcome not in {
+                    "WIN",
+                    "LOSS"
+                }:
+                    continue
+
+                if (
+                    book_imb >= 0
+                    and
+                    direction == "BUY"
+                ):
+
+                    if outcome == "WIN":
+                        wins += 1
+                    else:
+                        losses += 1
+
+                elif (
+                    book_imb < 0
+                    and
+                    direction == "SELL"
+                ):
+
+                    if outcome == "WIN":
+                        wins += 1
+                    else:
+                        losses += 1
+
+        probability = (
+            wins /
+            (
+                wins +
+                losses
+            )
+        )
+
+        score = (
+            probability -
+            0.5
+        ) * 2.0
+
+        return float(
+            np.clip(
+                score *
+                np.sign(book_imb),
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # QUANTILE
+    # ========================================================
+
+    @staticmethod
+    def quantile_score(
+        returns: pd.Series
+    ) -> float:
+
+        r = returns.dropna()
+
+        if len(r) < 10:
+            return 0.0
+
+        q10 = r.quantile(
+            0.10
+        )
+
+        q50 = r.quantile(
+            0.50
+        )
+
+        q90 = r.quantile(
+            0.90
+        )
+
+        current = float(
+            r.iloc[-1]
+        )
+
+        if current >= q50:
+
+            denominator = max(
+                q90 - q50,
+                EPS
+            )
+
+            score = (
+                current -
+                q50
+            ) / denominator
+
+        else:
+
+            denominator = max(
+                q50 - q10,
+                EPS
+            )
+
+            score = (
+                current -
+                q50
+            ) / denominator
+
+        return float(
+            np.clip(
+                score,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # ADAPTIVE TREND
+    # ========================================================
+
+    @staticmethod
+    def adaptive_trend(
+        df: pd.DataFrame
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        if len(close) < 20:
+            return 0.0
+
+        fast = (
+            close
+            .ewm(
+                span=5,
+                adjust=False
+            )
+            .mean()
+            .iloc[-1]
+        )
+
+        slow = (
+            close
+            .ewm(
+                span=20,
+                adjust=False
+            )
+            .mean()
+            .iloc[-1]
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        volatility = (
+            returns
+            .tail(20)
+            .std()
+        )
 
         if (
-            df is None
-            or df.empty
+            not np.isfinite(
+                volatility
+            )
+            or
+            volatility < EPS
+        ):
+            return 0.0
+
+        return float(
+            np.clip(
+                (
+                    (
+                        fast -
+                        slow
+                    )
+                    /
+                    close.iloc[-1]
+                )
+                /
+                volatility,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # CONFORMAL
+    # ========================================================
+
+    @staticmethod
+    def conformal_score(
+        df: pd.DataFrame,
+        window: int = 50
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(returns) < 20:
+            return 0.0
+
+        history = (
+            returns
+            .iloc[:-1]
+            .tail(window)
+        )
+
+        current = float(
+            returns.iloc[-1]
+        )
+
+        center = float(
+            history.median()
+        )
+
+        scores = (
+            history -
+            center
+        ).abs()
+
+        threshold = float(
+            scores.quantile(
+                0.90
+            )
+        )
+
+        if threshold < EPS:
+            return float(
+                np.sign(current)
+            )
+
+        magnitude = (
+            abs(
+                current -
+                center
+            )
+            /
+            threshold
+        )
+
+        return float(
+            np.clip(
+                np.sign(current) *
+                magnitude,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # KELLY
+    # ========================================================
+
+    @staticmethod
+    def empirical_kelly(
+        history: Optional[
+            List[dict]
+        ],
+        rr: float = 2.0,
+        max_fraction: float = 0.25
+    ) -> float:
+
+        wins = 0
+        losses = 0
+
+        if history:
+
+            for h in history[-500:]:
+
+                outcome = str(
+                    h.get(
+                        "outcome",
+                        ""
+                    )
+                ).upper()
+
+                if outcome == "WIN":
+                    wins += 1
+
+                elif outcome == "LOSS":
+                    losses += 1
+
+        probability = (
+            wins + 1
+        ) / (
+            wins +
+            losses +
+            2
+        )
+
+        q = (
+            1 -
+            probability
+        )
+
+        b = max(
+            rr,
+            0.1
+        )
+
+        kelly = (
+            b *
+            probability -
+            q
+        ) / b
+
+        return float(
+            np.clip(
+                kelly,
+                -max_fraction,
+                max_fraction
+            )
+        )
+
+    # ========================================================
+    # RMT PROXY
+    # ========================================================
+
+    @staticmethod
+    def rmt_proxy(
+        df: pd.DataFrame
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(returns) < 20:
+            return 0.0
+
+        current = float(
+            returns.iloc[-1]
+        )
+
+        volatility = float(
+            returns
+            .tail(20)
+            .std()
+        )
+
+        if volatility < EPS:
+            return 0.0
+
+        z = (
+            current /
+            volatility
+        )
+
+        return float(
+            np.clip(
+                z / 3.0,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # REWARD / RISK DISTRIBUTION
+    # ========================================================
+
+    @staticmethod
+    def reward_risk_from_distribution(
+        df: pd.DataFrame
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(returns) < 20:
+            return 0.0
+
+        upside = returns[
+            returns > 0
+        ]
+
+        downside = -returns[
+            returns < 0
+        ]
+
+        if (
+            len(upside) < 3
+            or
+            len(downside) < 3
+        ):
+            return 0.0
+
+        expected_up = float(
+            upside.quantile(
+                0.75
+            )
+        )
+
+        expected_down = float(
+            downside.quantile(
+                0.75
+            )
+        )
+
+        ratio = (
+            expected_up /
+            (
+                expected_down +
+                EPS
+            )
+        )
+
+        if ratio >= 1.2:
+
+            return float(
+                np.clip(
+                    ratio - 1.0,
+                    0,
+                    1
+                )
+            )
+
+        if ratio <= 0.8:
+
+            return float(
+                -np.clip(
+                    1.0 - ratio,
+                    0,
+                    1
+                )
+            )
+
+        return float(
+            (
+                ratio -
+                1.0
+            ) * 2.0
+        )
+
+    # ========================================================
+    # VOLATILITY REGIME
+    # ========================================================
+
+    @staticmethod
+    def volatility_regime(
+        df: pd.DataFrame,
+        window: int = 30
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(returns) < (
+            window + 5
+        ):
+            return 1.0
+
+        short_vol = float(
+            returns
+            .tail(5)
+            .std()
+        )
+
+        long_vol = float(
+            returns
+            .tail(window)
+            .std()
+        )
+
+        if long_vol < EPS:
+            return 1.0
+
+        return float(
+            short_vol /
+            long_vol
+        )
+
+    # ========================================================
+    # IMPULSE
+    # ========================================================
+
+    @staticmethod
+    def impulse_score(
+        df: pd.DataFrame
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        volume = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Volume"
+            )
+        )
+
+        if len(close) < 20:
+            return 0.0
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        price_z = (
+            ResearchFeatures
+            ._zscore(
+                returns,
+                30
+            )
+        )
+
+        volume_change = (
+            volume
+            .pct_change()
+            .replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+        )
+
+        volume_z = (
+            ResearchFeatures
+            ._zscore(
+                volume_change,
+                30
+            )
+        )
+
+        score = (
+            0.6 *
+            price_z
+            +
+            0.4 *
+            volume_z
+        )
+
+        return float(
+            np.clip(
+                score / 3.0,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # EXHAUSTION
+    # ========================================================
+
+    @staticmethod
+    def exhaustion_score(
+        df: pd.DataFrame
+    ) -> float:
+
+        close = (
+            ResearchFeatures
+            ._safe_series(
+                df,
+                "Close"
+            )
+        )
+
+        if len(close) < 30:
+            return 0.0
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        z = (
+            ResearchFeatures
+            ._zscore(
+                returns,
+                30
+            )
+        )
+
+        if abs(z) < 2.0:
+            return 0.0
+
+        return float(
+            np.clip(
+                np.sign(z)
+                *
+                (
+                    abs(z) -
+                    2.0
+                )
+                /
+                2.0,
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # MAIN FEATURE EXTRACTION
+    # ========================================================
+
+    @classmethod
+    def extract(
+        cls,
+        df: pd.DataFrame,
+        bids: np.ndarray,
+        asks: np.ndarray,
+        prev_bids=None,
+        prev_asks=None,
+        performance_history=None,
+        config=None
+    ) -> Dict[str, float]:
+
+        cfg = (
+            config
+            if config is not None
+            else SignalConfig()
+        )
+
+        if (
+            df.empty
             or len(df) < 20
             or len(bids) == 0
             or len(asks) == 0
         ):
 
-            return results
+            return {
+                key: 0.0
+                for key in cls.names
+            }
 
-        try:
-
-            close = (
-                df["Close"]
-                .astype(float)
+        close = (
+            cls
+            ._safe_series(
+                df,
+                "Close"
             )
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(close) >= 6:
+
+            move_5 = float(
+                (
+                    close.iloc[-1] -
+                    close.iloc[-6]
+                )
+                /
+                (
+                    abs(
+                        close.iloc[-6]
+                    )
+                    +
+                    EPS
+                )
+            )
+
+        else:
+
+            move_5 = 0.0
+
+        # ----------------------------------------------------
+        # HAWKES
+        # ----------------------------------------------------
+
+        event_times = None
+
+        if "EventTime" in df.columns:
+
+            event_times = (
+                pd.to_numeric(
+                    df["EventTime"],
+                    errors="coerce"
+                )
+                .dropna()
+                .values
+            )
+
+        elif "Timestamp" in df.columns:
+
+            event_times = (
+                pd.to_numeric(
+                    df["Timestamp"],
+                    errors="coerce"
+                )
+                .dropna()
+                .values
+            )
+
+        if (
+            event_times is not None
+            and
+            len(event_times) >= 5
+        ):
+
+            hawkes = (
+                cls
+                .hawkes_intensity_from_events(
+                    event_times
+                )
+            )
+
+            hawkes *= np.sign(
+                move_5
+            )
+
+        else:
 
             volume = (
-                df["Volume"]
-                .astype(float)
+                cls
+                ._safe_series(
+                    df,
+                    "Volume"
+                )
             )
 
-            returns = (
-                close
+            volume_change = (
+                volume
                 .pct_change()
-                .dropna()
-            )
-
-            # =================================================
-            # BOOK
-            # =================================================
-
-            bid_volume = float(
-                np.sum(
-                    bids[:, 1]
+                .replace(
+                    [np.inf, -np.inf],
+                    np.nan
                 )
             )
 
-            ask_volume = float(
-                np.sum(
-                    asks[:, 1]
+            z = cls._zscore(
+                volume_change,
+                30
+            )
+
+            hawkes = float(
+                np.clip(
+                    z / 3.0,
+                    -1,
+                    1
                 )
+            ) * np.sign(
+                move_5
             )
 
-            mid_price = (
-                float(bids[0, 0])
-                +
-                float(asks[0, 0])
-            ) / 2.0
+        # ----------------------------------------------------
+        # ORDER BOOK
+        # ----------------------------------------------------
 
-            # =================================================
-            # 1. BOOK IMBALANCE
-            # =================================================
-
-            book_imbalance = (
-                bid_volume
-                -
-                ask_volume
-            ) / (
-                bid_volume
-                +
-                ask_volume
-                +
-                1e-8
+        obi = (
+            cls
+            .order_book_imbalance(
+                bids,
+                asks,
+                20
             )
+        )
 
-            results["BOOK_IMB"] = clip(
-                book_imbalance
-            )
-
-            # =================================================
-            # 2. OFI
-            # =================================================
-
-            ofi = self.calculate_ofi(
+        depth = (
+            cls
+            .depth_skew(
                 bids,
                 asks
             )
+        )
 
-            results["OFI"] = ofi
+        # ----------------------------------------------------
+        # OFI
+        # ----------------------------------------------------
 
-            # =================================================
-            # 3. TAKER FLOW
-            #
-            # Approximation unless actual
-            # trade aggressor data is available.
-            # =================================================
+        if (
+            prev_bids is not None
+            and
+            prev_asks is not None
+        ):
 
-            if len(returns) > 0:
-
-                last_return = float(
-                    returns.iloc[-1]
-                )
-
-            else:
-
-                last_return = 0.0
-
-            results["TAKER_FLOW"] = (
-                1.0
-                if last_return > 0
-                else
-                -1.0
-                if last_return < 0
-                else
-                0.0
-            )
-
-            # =================================================
-            # 4. MOVE %
-            # =================================================
-
-            move_percent = (
-                self.calculate_move_percent(
-                    close
-                )
-            )
-
-            results["MOVE_PERCENT"] = (
-                move_percent
-            )
-
-            # =================================================
-            # 5. MOVE SIGNIFICANCE
-            # =================================================
-
-            move_significance = (
-                self.calculate_move_significance(
-                    returns
-                )
-            )
-
-            results["MOVE_SIGNIFICANCE"] = float(
-                np.clip(
-                    move_significance / 3.0,
-                    0.0,
-                    1.0
-                )
-            )
-
-            # =================================================
-            # 6. REALIZED VOL
-            # =================================================
-
-            realized_vol = (
-                self.calculate_realized_vol(
-                    returns
-                )
-            )
-
-            results["REALIZED_VOL"] = float(
-                np.clip(
-                    realized_vol
-                    /
-                    (
-                        self.target_vol
-                        +
-                        1e-8
-                    ),
-                    0.0,
-                    5.0
-                )
-            )
-
-            # =================================================
-            # 7. VOLUME
-            # =================================================
-
-            volume_accel, volume_ratio = (
-                self.calculate_volume_acceleration(
-                    volume
-                )
-            )
-
-            results["VOLUME_ACCEL"] = float(
-                np.clip(
-                    volume_accel,
-                    -1.0,
-                    3.0
-                )
-            )
-
-            # =================================================
-            # 8. IMPULSE
-            # =================================================
-
-            results["IMPULSE_SCORE"] = (
-                self.calculate_impulse_score(
-                    returns,
-                    volume_ratio,
-                    ofi
-                )
-            )
-
-            # =================================================
-            # 9. QUANTILES
-            # =================================================
-
-            q90 = float(
-                returns.iloc[-20:].quantile(
-                    0.90
-                )
-            )
-
-            q10 = float(
-                returns.iloc[-20:].quantile(
-                    0.10
-                )
-            )
-
-            q_range = (
-                q90
-                -
-                q10
-                +
-                1e-8
-            )
-
-            move_5 = (
-                close.iloc[-1]
-                /
-                (
-                    close.iloc[-5]
-                    +
-                    1e-8
-                )
-                -
-                1.0
-            )
-
-            q_position = (
-                move_5
-                -
-                q10
-            ) / q_range
-
-            results["QUANTILES"] = float(
-                np.clip(
-                    q_position * 2.0 - 1.0,
-                    -1.0,
-                    1.0
-                )
-            )
-
-            # =================================================
-            # 10. BAYESIAN EVIDENCE
-            # =================================================
-
-            evidence = np.mean([
-                book_imbalance,
-                ofi,
-                results["TAKER_FLOW"]
-            ])
-
-            results["BAYESIAN"] = clip(
-                evidence
-            )
-
-            # =================================================
-            # 11. ADAPTIVE TREND
-            # =================================================
-
-            fast_ma = float(
-                close.rolling(
-                    5
-                ).mean().iloc[-1]
-            )
-
-            slow_ma = float(
-                close.rolling(
-                    20
-                ).mean().iloc[-1]
-            )
-
-            trend_strength = (
-                fast_ma
-                -
-                slow_ma
-            ) / (
-                mid_price
-                *
-                (
-                    realized_vol
-                    +
-                    1e-8
-                )
-                +
-                1e-8
-            )
-
-            results["ADAPT_CONF"] = clip(
-                trend_strength
-            )
-
-            # =================================================
-            # 12. RMT-STYLE DOMINANCE
-            # =================================================
-
-            dominance = (
-                abs(move_5)
-                /
-                (
-                    realized_vol
-                    *
-                    np.sqrt(5)
-                    +
-                    1e-8
-                )
-            )
-
-            results["RMT_DOM"] = float(
-                np.clip(
-                    (
-                        dominance / 3.0
-                    )
-                    *
-                    np.sign(move_5),
-                    -1.0,
-                    1.0
-                )
-            )
-
-            # =================================================
-            # 13. REWARD/RISK MARKET CONDITION
-            # =================================================
-
-            rr_market = (
-                abs(q90)
-                /
-                (
-                    abs(q10)
-                    +
-                    1e-8
-                )
-            )
-
-            if rr_market >= 1.2:
-
-                results["REWARD_RISK"] = 1.0
-
-            elif rr_market < 0.8:
-
-                results["REWARD_RISK"] = -1.0
-
-            else:
-
-                results["REWARD_RISK"] = 0.0
-
-            # =================================================
-            # 14. FRACTIONAL KELLY
-            # =================================================
-
-            estimated_probability = (
-                0.50
-                +
-                0.20
-                *
-                abs(book_imbalance)
-            )
-
-            kelly = (
-                estimated_probability
-                -
-                (
-                    1.0
-                    -
-                    estimated_probability
-                )
-                /
-                max(
-                    rr_market,
-                    1.0
-                )
-            )
-
-            results["FRAC_KELLY"] = float(
-                np.clip(
-                    kelly,
-                    -1.0,
-                    1.0
-                )
-            )
-
-            # =================================================
-            # 15. ACTIVITY
-            # =================================================
-
-            activity = (
-                self.calculate_activity_intensity(
-                    df
-                )
-            )
-
-            results["HAWKES"] = clip(
-                activity
-                *
-                np.sign(move_5)
-            )
-
-            # =================================================
-            # 16. SPOOF RISK
-            # =================================================
-
-            spoof_risk = (
-                self.calculate_spoof_risk(
+            ofi = (
+                cls
+                .ofi_from_snapshots(
+                    prev_bids,
+                    prev_asks,
                     bids,
                     asks
                 )
             )
 
-            results["SPOOF_RISK"] = (
-                spoof_risk
-            )
+        else:
 
-            # =================================================
-            # SAVE BOOK FOR NEXT UPDATE
-            # =================================================
+            ofi = 0.0
 
-            self.previous_bids = np.copy(
-                bids
-            )
+        # ----------------------------------------------------
+        # OTHER FEATURES
+        # ----------------------------------------------------
 
-            self.previous_asks = np.copy(
-                asks
-            )
-
-            return results
-
-        except Exception:
-
-            return results
-
-    # ========================================================
-    # TRAIN ML USING REAL FEATURES
-    # ========================================================
-
-    def train_from_history(
-        self,
-        performance_history
-    ):
-
-        if not performance_history:
-            return False
-
-        X = []
-        y = []
-
-        for record in performance_history:
-
-            features = record.get(
-                "features"
-            )
-
-            outcome = record.get(
-                "outcome"
-            )
-
-            if not isinstance(
-                features,
-                dict
-            ):
-                continue
-
-            if outcome not in (
-                "WIN",
-                "LOSS"
-            ):
-                continue
-
-            row = []
-            valid = True
-
-            for name in self.feature_names:
-
-                value = features.get(
-                    name
-                )
-
-                try:
-
-                    value = float(value)
-
-                    if not np.isfinite(
-                        value
-                    ):
-
-                        valid = False
-                        break
-
-                except Exception:
-
-                    valid = False
-                    break
-
-                row.append(value)
-
-            if not valid:
-                continue
-
-            X.append(row)
-
-            y.append(
-                1
-                if outcome == "WIN"
-                else 0
-            )
-
-        # Need real history
-        if len(X) < 20:
-            return False
-
-        # Need WIN + LOSS
-        if len(set(y)) < 2:
-            return False
-
-        try:
-
-            X = np.asarray(
-                X,
-                dtype=float
-            )
-
-            y = np.asarray(
-                y,
-                dtype=int
-            )
-
-            self.scaler.fit(X)
-
-            X_scaled = (
-                self.scaler.transform(X)
-            )
-
-            self.ml_model.fit(
-                X_scaled,
-                y
-            )
-
-            self.is_model_trained = True
-
-            return True
-
-        except Exception:
-
-            return False
-
-    # ========================================================
-    # MAIN SIGNAL CALCULATION
-    # ========================================================
-
-    def calculate_all_signals(
-        self,
-        df,
-        bids,
-        asks,
-        current_inventory=0,
-        performance_history=None
-    ):
-
-        # ====================================================
-        # FEATURES
-        # ====================================================
-
-        features = self.extract_features(
-            df,
-            bids,
-            asks
+        taker = cls.taker_flow(
+            df
         )
 
-        feature_vector = np.array([
-            features[name]
-            for name in self.feature_names
-        ]).reshape(
-            1,
-            -1
-        )
-
-        # ====================================================
-        # ML TRAINING
-        # ====================================================
-
-        if performance_history:
-
-            self.train_from_history(
+        bayesian = (
+            cls
+            .empirical_bayesian(
+                obi,
                 performance_history
             )
+        )
 
-        # ====================================================
-        # DIRECTION
-        # ====================================================
+        quantiles = cls.quantile_score(
+            returns
+        )
 
-        direction_score = (
-            self.calculate_direction_score(
-                features
+        trend = cls.adaptive_trend(
+            df
+        )
+
+        conformal = cls.conformal_score(
+            df
+        )
+
+        kelly = cls.empirical_kelly(
+            performance_history,
+            cfg.rr_tp1
+        )
+
+        rmt = cls.rmt_proxy(
+            df
+        )
+
+        rr = (
+            cls
+            .reward_risk_from_distribution(
+                df
             )
         )
 
-        # ====================================================
-        # ML PROBABILITY
-        # ====================================================
-
-        ml_probability = None
-
-        if self.is_model_trained:
-
-            try:
-
-                scaled = (
-                    self.scaler.transform(
-                        feature_vector
-                    )
-                )
-
-                ml_probability = float(
-                    self.ml_model.predict_proba(
-                        scaled
-                    )[0][1]
-                )
-
-            except Exception:
-
-                ml_probability = None
-
-        # ====================================================
-        # CONFIDENCE
-        # ====================================================
-
-        confidence = (
-            self.calculate_confidence(
-                features,
-                ml_probability
+        vol_ratio = (
+            cls
+            .volatility_regime(
+                df,
+                cfg.vol_window
             )
         )
 
-        # ====================================================
-        # PRICE
-        # ====================================================
-
-        try:
-
-            entry_price = float(
-                df["Close"].iloc[-1]
-            )
-
-        except Exception:
-
-            entry_price = 0.0
-
-        # ====================================================
-        # MAIN 0.40% FILTER
-        # ====================================================
-
-        move_percent = float(
-            features.get(
-                "MOVE_PERCENT",
-                0.0
-            )
+        impulse = cls.impulse_score(
+            df
         )
 
-        # Default values
-        signal = "NO TRADE"
-        reason = "NO_SETUP"
-
-        stop_loss = 0.0
-        tp1 = 0.0
-        tp2 = 0.0
-        risk_distance = 0.0
-        rr_tp1 = 0.0
-        rr_tp2 = 0.0
-
-        # ====================================================
-        # RULE 1:
-        # MOVE MUST BE >= 0.40%
-        # ====================================================
-
-        if move_percent < self.min_move_percent:
-
-            signal = "NO TRADE"
-
-            reason = (
-                f"MOVE_BELOW_"
-                f"{self.min_move_percent:.2f}%"
-            )
-
-        else:
-
-            # =================================================
-            # DIRECTION
-            # =================================================
-
-            move_direction = (
-                self.calculate_move_direction(
-                    df["Close"]
-                )
-            )
-
-            # =================================================
-            # OBI / OFI CONFIRMATION
-            # =================================================
-
-            bullish_confirmation = (
-                features["BOOK_IMB"]
-                >= self.obi_threshold
-                and
-                features["OFI"]
-                >= self.ofi_threshold
-            )
-
-            bearish_confirmation = (
-                features["BOOK_IMB"]
-                <= -self.obi_threshold
-                and
-                features["OFI"]
-                <= -self.ofi_threshold
-            )
-
-            # =================================================
-            # MANIPULATION FILTER
-            # =================================================
-
-            spoof_risk = features.get(
-                "SPOOF_RISK",
-                0.0
-            )
-
-            manipulation_detected = (
-                spoof_risk
-                >=
-                self.spoof_threshold
-            )
-
-            # =================================================
-            # DETERMINE DIRECTION
-            # =================================================
-
-            direction = None
-
-            if (
-                bullish_confirmation
-                and
-                direction_score > 0
-                and
-                move_direction > 0
-            ):
-
-                direction = "BUY"
-
-            elif (
-                bearish_confirmation
-                and
-                direction_score < 0
-                and
-                move_direction < 0
-            ):
-
-                direction = "SELL"
-
-            # =================================================
-            # NO DIRECTION
-            # =================================================
-
-            if direction is None:
-
-                signal = "WAIT"
-
-                reason = (
-                    "MOVE_WITHOUT_DIRECTION_CONFIRMATION"
-                )
-
-            # =================================================
-            # MANIPULATION
-            # =================================================
-
-            elif manipulation_detected:
-
-                signal = "NO TRADE"
-
-                reason = (
-                    "POSSIBLE_ORDERBOOK_MANIPULATION"
-                )
-
-            else:
-
-                # =================================================
-                # DYNAMIC STOP LOSS
-                # =================================================
-
-                (
-                    stop_loss,
-                    risk_distance,
-                    atr
-                ) = self.calculate_stop_loss(
-                    df,
-                    direction,
-                    entry_price
-                )
-
-                # =================================================
-                # TARGETS
-                # =================================================
-
-                (
-                    tp1,
-                    tp2
-                ) = self.calculate_targets(
-                    direction,
-                    entry_price,
-                    risk_distance
-                )
-
-                # =================================================
-                # ACTUAL RR
-                # =================================================
-
-                if risk_distance > 0:
-
-                    rr_tp1 = (
-                        abs(
-                            tp1
-                            -
-                            entry_price
-                        )
-                        /
-                        risk_distance
-                    )
-
-                    rr_tp2 = (
-                        abs(
-                            tp2
-                            -
-                            entry_price
-                        )
-                        /
-                        risk_distance
-                    )
-
-                # =================================================
-                # MINIMUM RR CHECK
-                # =================================================
-
-                if rr_tp1 < self.minimum_rr:
-
-                    signal = "NO TRADE"
-
-                    reason = (
-                        "RR_BELOW_1_2"
-                    )
-
-                # =================================================
-                # CONFIDENCE CHECK
-                # =================================================
-
-                elif (
-                    confidence
-                    <
-                    self.confidence_threshold
-                ):
-
-                    signal = "WAIT"
-
-                    reason = (
-                        "CONFIDENCE_TOO_LOW"
-                    )
-
-                # =================================================
-                # STRONG 1:3 SETUP
-                # =================================================
-
-                elif rr_tp2 >= self.strong_rr:
-
-                    signal = direction
-
-                    reason = (
-                        "STRONG_1_3_RR_SETUP"
-                    )
-
-                # =================================================
-                # NORMAL 1:2 SETUP
-                # =================================================
-
-                else:
-
-                    signal = direction
-
-                    reason = (
-                        "VALID_1_2_RR_SETUP"
-                    )
-
-        # ====================================================
-        # FINAL SCORE
-        # ====================================================
-
-        ml_direction = 0.0
-
-        if ml_probability is not None:
-
-            ml_direction = (
-                ml_probability
-                -
-                0.5
-            ) * 2.0
-
-        final_score = (
-            0.65 * direction_score
-            +
-            0.35 * ml_direction
+        exhaustion = cls.exhaustion_score(
+            df
         )
 
-        final_score = float(
-            np.clip(
-                final_score,
-                -1.0,
-                1.0
-            )
-        )
+        return {
 
-        # ====================================================
-        # RESULT
-        # ====================================================
-
-        results = {
-
-            # ------------------------------
-            # SIGNAL
-            # ------------------------------
-
-            "SIGNAL":
-                signal,
-
-            "RAW_SIGNAL":
-                signal,
-
-            "REASON":
-                reason,
-
-            # ------------------------------
-            # SCORE
-            # ------------------------------
-
-            "SCORE":
-                final_score,
-
-            "FINAL_SCORE":
-                final_score,
-
-            "DIRECTION_SCORE":
-                direction_score,
-
-            # ------------------------------
-            # CONFIDENCE
-            # ------------------------------
-
-            "CONFIDENCE":
-                confidence,
-
-            "ML_PROBABILITY":
-                ml_probability,
-
-            "MODEL_TRAINED":
-                self.is_model_trained,
-
-            # ------------------------------
-            # MOVE
-            # ------------------------------
-
-            "MOVE_PERCENT":
-                move_percent,
-
-            "MIN_MOVE_PERCENT":
-                self.min_move_percent,
-
-            "MOVE_LOOKBACK":
-                self.move_lookback,
-
-            # ------------------------------
-            # ORDER BOOK
-            # ------------------------------
-
-            "OBI":
-                features["BOOK_IMB"],
-
-            "BOOK_IMB":
-                features["BOOK_IMB"],
-
-            "OFI":
-                features["OFI"],
-
-            # ------------------------------
-            # IMPULSE
-            # ------------------------------
-
-            "IMPULSE_SCORE":
-                features["IMPULSE_SCORE"],
-
-            "MOVE_SIGNIFICANCE":
-                features["MOVE_SIGNIFICANCE"],
-
-            # ------------------------------
-            # MANIPULATION
-            # ------------------------------
-
-            "SPOOF_RISK":
-                features["SPOOF_RISK"],
-
-            "MANIPULATION":
-                (
-                    features["SPOOF_RISK"]
-                    >=
-                    self.spoof_threshold
+            "HAWKES":
+                float(
+                    np.clip(
+                        hawkes,
+                        -1,
+                        1
+                    )
                 ),
 
-            # ------------------------------
-            # PRICE
-            # ------------------------------
+            "BOOK_IMB":
+                float(
+                    np.clip(
+                        obi,
+                        -1,
+                        1
+                    )
+                ),
 
-            "ENTRY_PRICE":
-                entry_price,
+            "OFI":
+                float(
+                    np.clip(
+                        ofi,
+                        -1,
+                        1
+                    )
+                ),
 
-            # ------------------------------
-            # STOP LOSS
-            # ------------------------------
+            "TAKER_FLOW":
+                float(
+                    np.clip(
+                        taker,
+                        -1,
+                        1
+                    )
+                ),
 
-            "STOP_LOSS":
-                stop_loss,
+            "DEPTH_SKEW":
+                float(
+                    np.clip(
+                        depth,
+                        -1,
+                        1
+                    )
+                ),
 
-            "RISK_DISTANCE":
-                risk_distance,
+            "BAYESIAN":
+                float(
+                    np.clip(
+                        bayesian,
+                        -1,
+                        1
+                    )
+                ),
 
-            # ------------------------------
-            # TARGETS
-            # ------------------------------
+            "QUANTILES":
+                float(
+                    np.clip(
+                        quantiles,
+                        -1,
+                        1
+                    )
+                ),
 
-            "TP1":
-                tp1,
+            # 0.40% move filter
+            "MOVE_FILTER":
+                float(
+                    np.clip(
+                        move_5 /
+                        cfg.min_move_pct,
+                        -1,
+                        1
+                    )
+                ),
 
-            "TP2":
-                tp2,
+            "ADAPTIVE_TREND":
+                float(
+                    np.clip(
+                        trend,
+                        -1,
+                        1
+                    )
+                ),
 
-            # ------------------------------
-            # RISK REWARD
-            # ------------------------------
+            "CONFORMAL":
+                float(
+                    np.clip(
+                        conformal,
+                        -1,
+                        1
+                    )
+                ),
 
-            "RR_TP1":
-                rr_tp1,
+            "KELLY":
+                float(
+                    np.clip(
+                        kelly * 4.0,
+                        -1,
+                        1
+                    )
+                ),
 
-            "RR_TP2":
-                rr_tp2,
+            "RMT_PROXY":
+                float(
+                    np.clip(
+                        rmt,
+                        -1,
+                        1
+                    )
+                ),
 
-            "MINIMUM_RR":
-                self.minimum_rr,
+            "REWARD_RISK":
+                float(
+                    np.clip(
+                        rr,
+                        -1,
+                        1
+                    )
+                ),
 
-            "STRONG_RR":
-                self.strong_rr,
+            "VOL_REGIME":
+                float(
+                    np.clip(
+                        (
+                            vol_ratio -
+                            1.0
+                        ) / 2.0,
+                        -1,
+                        1
+                    )
+                ),
 
-            # ------------------------------
-            # VOLATILITY
-            # ------------------------------
+            "IMPULSE":
+                float(
+                    np.clip(
+                        impulse,
+                        -1,
+                        1
+                    )
+                ),
 
-            "REALIZED_VOL":
-                features["REALIZED_VOL"],
-
-            "VOLUME_ACCEL":
-                features["VOLUME_ACCEL"],
-
-            # ------------------------------
-            # ALL FEATURES
-            # ------------------------------
-
-            "FEATURES":
-                features
+            "EXHAUSTION":
+                float(
+                    np.clip(
+                        exhaustion,
+                        -1,
+                        1
+                    )
+                ),
         }
-
-        return (
-            results,
-            final_score,
-            self.dynamic_weights
-        )
 
 
 # ============================================================
-# POWER TRADING RISK ENGINE
+# ONLINE ML MODEL
 # ============================================================
 
-class PowerTradingRiskEngine:
+class OnlineSignalModel:
 
-    def __init__(self):
-
-        self.risk_levels = {
-            "LOW": 25.0,
-            "MEDIUM": 50.0,
-            "HIGH": 75.0
-        }
-
-    # ========================================================
-    # RISK METRICS
-    # ========================================================
-
-    def calculate_risk_metrics(
+    def __init__(
         self,
-        liquidation_volumes,
-        displayed_vol,
-        cancelled_vol,
-        time_exists,
-        obs_window,
-        open_interest,
-        leverage,
-        volatility
+        feature_names,
+        random_state=42
     ):
 
-        # ====================================================
-        # LIQUIDATION DATA
-        # ====================================================
+        self.feature_names = list(
+            feature_names
+        )
 
-        try:
+        self.scaler = (
+            StandardScaler()
+        )
 
-            liquidation_volumes = np.asarray(
-                liquidation_volumes,
-                dtype=float
+        self.model = (
+            SGDClassifier(
+                loss="log_loss",
+                penalty="l2",
+                alpha=1e-4,
+                learning_rate="optimal",
+                random_state=random_state,
+                max_iter=1,
+                tol=None
             )
+        )
 
-            liquidation_volumes = (
-                liquidation_volumes[
-                    np.isfinite(
-                        liquidation_volumes
+        self.ready = False
+
+        self.samples = 0
+
+        self.classes = np.array(
+            [0, 1]
+        )
+
+    # ========================================================
+    # ONLINE UPDATE
+    # ========================================================
+
+    def update(
+        self,
+        features,
+        outcome
+    ):
+
+        x = np.array(
+            [
+                [
+                    features.get(
+                        name,
+                        0.0
                     )
+                    for name in
+                    self.feature_names
                 ]
-            )
-
-        except Exception:
-
-            liquidation_volumes = np.array([])
-
-        if len(
-            liquidation_volumes
-        ) > 0:
-
-            total_ltz = float(
-                np.sum(
-                    liquidation_volumes
-                )
-            )
-
-            max_ltz = float(
-                np.max(
-                    liquidation_volumes
-                )
-            )
-
-        else:
-
-            total_ltz = 0.0
-            max_ltz = 0.0
-
-        # ====================================================
-        # LTZ SCORE
-        # ====================================================
-
-        ltz_score = (
-            max_ltz
-            /
-            (
-                total_ltz
-                +
-                1e-8
-            )
-        ) * 100.0
-
-        ltz_score = float(
-            np.clip(
-                ltz_score,
-                0.0,
-                100.0
-            )
+            ],
+            dtype=float
         )
 
-        # ====================================================
-        # SPOOF SCORE
-        # ====================================================
+        if not np.isfinite(
+            x
+        ).all():
 
-        displayed_vol = max(
-            safe_float(
-                displayed_vol
+            return
+
+        self.scaler.partial_fit(
+            x
+        )
+
+        x_scaled = (
+            self.scaler
+            .transform(x)
+        )
+
+        self.model.partial_fit(
+            x_scaled,
+            np.array(
+                [
+                    int(outcome)
+                ]
             ),
+            classes=self.classes
+        )
+
+        self.ready = True
+
+        self.samples += 1
+
+    # ========================================================
+    # PROBABILITY
+    # ========================================================
+
+    def probability(
+        self,
+        features
+    ) -> float:
+
+        if not self.ready:
+
+            return 0.5
+
+        x = np.array(
+            [
+                [
+                    features.get(
+                        name,
+                        0.0
+                    )
+                    for name in
+                    self.feature_names
+                ]
+            ],
+            dtype=float
+        )
+
+        x_scaled = (
+            self.scaler
+            .transform(x)
+        )
+
+        return float(
+            self.model
+            .predict_proba(
+                x_scaled
+            )[0][1]
+        )
+
+
+# ============================================================
+# MANIPULATION RISK
+# ============================================================
+
+class ManipulationRisk:
+
+    @staticmethod
+    def score(
+        displayed_volume,
+        cancelled_volume,
+        time_exists,
+        observation_window
+    ) -> float:
+
+        displayed_volume = max(
+            float(displayed_volume),
             0.0
         )
 
-        cancelled_vol = max(
-            safe_float(
-                cancelled_vol
-            ),
+        cancelled_volume = max(
+            float(cancelled_volume),
             0.0
         )
 
-        spoof_ratio = (
-            cancelled_vol
-            /
+        observation_window = max(
+            float(observation_window),
+            EPS
+        )
+
+        cancel_ratio = (
+            cancelled_volume /
             (
-                displayed_vol
-                +
-                1e-8
+                displayed_volume +
+                EPS
             )
         )
 
         persistence = np.clip(
-            safe_float(
-                time_exists
-            )
-            /
-            (
-                safe_float(
-                    obs_window
-                )
-                +
-                1e-8
-            ),
-            0.0,
-            1.0
+            float(time_exists) /
+            observation_window,
+            0,
+            1
         )
 
-        spoof_score = (
-            spoof_ratio
-            *
+        risk = (
+            cancel_ratio *
             (
-                1.0
-                -
+                1 -
                 persistence
             )
-            *
-            100.0
         )
 
-        spoof_score = float(
+        return float(
             np.clip(
-                spoof_score,
-                0.0,
-                100.0
+                risk,
+                0,
+                1
             )
         )
-
-        # ====================================================
-        # SQUEEZE RISK
-        # ====================================================
-
-        open_interest = max(
-            safe_float(
-                open_interest
-            ),
-            0.0
-        )
-
-        leverage = max(
-            safe_float(
-                leverage
-            ),
-            0.0
-        )
-
-        volatility = max(
-            safe_float(
-                volatility
-            ),
-            0.0
-        )
-
-        raw_squeeze = (
-            total_ltz
-            *
-            open_interest
-            *
-            leverage
-            *
-            volatility
-        )
-
-        # Log scaling prevents giant raw values
-        squeeze_score = float(
-            np.clip(
-                np.log1p(
-                    raw_squeeze
-                )
-                *
-                10.0,
-                0.0,
-                100.0
-            )
-        )
-
-        # ====================================================
-        # COMBINED RISK
-        # ====================================================
-
-        market_risk = (
-            0.35 * ltz_score
-            +
-            0.35 * spoof_score
-            +
-            0.30 * squeeze_score
-        )
-
-        market_risk = float(
-            np.clip(
-                market_risk,
-                0.0,
-                100.0
-            )
-        )
-
-        # ====================================================
-        # LEVEL
-        # ====================================================
-
-        if market_risk >= 75:
-
-            risk_level = "EXTREME"
-
-        elif market_risk >= 50:
-
-            risk_level = "HIGH"
-
-        elif market_risk >= 25:
-
-            risk_level = "MEDIUM"
-
-        else:
-
-            risk_level = "LOW"
-
-        return {
-
-            "LTZ_Score":
-                ltz_score,
-
-            "Spoof_Score":
-                spoof_score,
-
-            "Squeeze_Risk":
-                squeeze_score,
-
-            "Market_Risk":
-                market_risk,
-
-            "Risk_Level":
-                risk_level
-        }
 
 
 # ============================================================
-# INTEGRATED TRADING ENGINE
-#
-# Optional wrapper if dashboard.py imports:
-# from engine import IntegratedTradingEngine
+# POWER RISK ENGINE
 # ============================================================
 
-class IntegratedTradingEngine:
+class PowerTradingRiskEngine:
 
-    def __init__(
+    def calculate_risk_metrics(
         self,
-        target_vol=0.15,
-        min_move_percent=0.40,
-        move_lookback=5
-    ):
-
-        self.research = TenPaperResearchLab(
-
-            target_vol=target_vol,
-
-            min_move_percent=min_move_percent,
-
-            move_lookback=move_lookback,
-
-            # OBI
-            obi_threshold=0.15,
-
-            # OFI
-            ofi_threshold=0.10,
-
-            # Confidence
-            confidence_threshold=0.60,
-
-            # RR
-            minimum_rr=2.0,
-            strong_rr=3.0,
-
-            # SL
-            atr_period=14,
-            atr_multiplier=1.0,
-
-            # Manipulation
-            spoof_threshold=0.60
-        )
-
-        self.risk = (
-            PowerTradingRiskEngine()
-        )
-
-    # ========================================================
-    # ANALYZE
-    # ========================================================
-
-    def analyze(
-        self,
-        df,
-        bids,
-        asks,
-        current_inventory=0,
-        performance_history=None,
-        liquidation_volumes=None,
+        liquidation_volumes,
         displayed_vol=0.0,
         cancelled_vol=0.0,
         time_exists=0.0,
@@ -2438,137 +1936,1267 @@ class IntegratedTradingEngine:
         volatility=0.0
     ):
 
-        if liquidation_volumes is None:
-            liquidation_volumes = []
-
-        # ====================================================
-        # RESEARCH ENGINE
-        # ====================================================
-
-        (
-            signal_data,
-            final_score,
-            weights
-        ) = self.research.calculate_all_signals(
-
-            df=df,
-
-            bids=bids,
-
-            asks=asks,
-
-            current_inventory=current_inventory,
-
-            performance_history=performance_history
+        liquidation_volumes = np.asarray(
+            liquidation_volumes,
+            dtype=float
         )
 
-        # ====================================================
-        # RISK ENGINE
-        # ====================================================
+        liquidation_volumes = (
+            liquidation_volumes[
+                np.isfinite(
+                    liquidation_volumes
+                )
+            ]
+        )
 
-        risk_data = (
-            self.risk.calculate_risk_metrics(
+        liquidation_volumes = np.clip(
+            liquidation_volumes,
+            0,
+            None
+        )
 
-                liquidation_volumes=
-                    liquidation_volumes,
+        total_ltz = (
+            float(
+                liquidation_volumes.sum()
+            )
+            if len(
+                liquidation_volumes
+            )
+            else 0.0
+        )
 
-                displayed_vol=
-                    displayed_vol,
+        max_ltz = (
+            float(
+                liquidation_volumes.max()
+            )
+            if len(
+                liquidation_volumes
+            )
+            else 0.0
+        )
 
-                cancelled_vol=
-                    cancelled_vol,
+        if total_ltz > 0:
 
-                time_exists=
-                    time_exists,
+            ltz_score = (
+                max_ltz /
+                (
+                    total_ltz +
+                    EPS
+                )
+            ) * 100
 
-                obs_window=
-                    obs_window,
+        else:
 
-                open_interest=
-                    open_interest,
+            ltz_score = 0.0
 
-                leverage=
-                    leverage,
-
-                volatility=
-                    volatility
+        spoof_score = (
+            ManipulationRisk
+            .score(
+                displayed_vol,
+                cancelled_vol,
+                time_exists,
+                obs_window
             )
         )
 
-        # ====================================================
-        # FINAL OUTPUT
-        # ====================================================
+        # Log scaling prevents huge OI/leverage numbers
+        # from completely dominating the risk score.
 
-        output = {
+        squeeze_raw = (
+
+            np.log1p(
+                total_ltz
+            )
+
+            *
+
+            np.log1p(
+                max(
+                    float(
+                        open_interest
+                    ),
+                    0.0
+                )
+            )
+
+            *
+
+            np.log1p(
+                max(
+                    float(
+                        leverage
+                    ),
+                    1.0
+                )
+            )
+
+            *
+
+            max(
+                float(
+                    volatility
+                ),
+                0.0
+            )
+        )
+
+        squeeze_score = float(
+            np.clip(
+                squeeze_raw *
+                10.0,
+                0,
+                100
+            )
+        )
+
+        market_risk = float(
+            np.clip(
+
+                0.50 *
+                min(
+                    ltz_score,
+                    100
+                )
+
+                +
+
+                0.25 *
+                spoof_score *
+                100
+
+                +
+
+                0.25 *
+                squeeze_score,
+
+                0,
+                100
+            )
+        )
+
+        return {
+
+            "LTZ_Score":
+                float(
+                    np.clip(
+                        ltz_score,
+                        0,
+                        100
+                    )
+                ),
+
+            "Spoof_Score":
+                float(
+                    spoof_score
+                ),
+
+            "Squeeze_Risk":
+                squeeze_score,
+
+            "Market_Risk":
+                market_risk,
+        }
+
+
+# ============================================================
+# MAIN RESEARCH LAB
+# ============================================================
+
+class TenPaperResearchLab:
+
+    def __init__(
+        self,
+        target_vol=0.15,
+        config=None
+    ):
+
+        self.target_vol = (
+            target_vol
+        )
+
+        self.config = (
+            config
+            if config is not None
+            else SignalConfig()
+        )
+
+        self.feature_names = (
+            ResearchFeatures.names
+        )
+
+        # ----------------------------------------------------
+        # INITIAL WEIGHTS
+        # ----------------------------------------------------
+
+        raw_weights = {
+
+            "HAWKES": 0.07,
+
+            "BOOK_IMB": 0.10,
+
+            "OFI": 0.12,
+
+            "TAKER_FLOW": 0.10,
+
+            "DEPTH_SKEW": 0.05,
+
+            "BAYESIAN": 0.05,
+
+            "QUANTILES": 0.05,
+
+            "MOVE_FILTER": 0.08,
+
+            "ADAPTIVE_TREND": 0.08,
+
+            "CONFORMAL": 0.05,
+
+            "KELLY": 0.03,
+
+            "RMT_PROXY": 0.06,
+
+            "REWARD_RISK": 0.07,
+
+            "VOL_REGIME": 0.04,
+
+            "IMPULSE": 0.08,
+
+            "EXHAUSTION": 0.07,
+        }
+
+        total = sum(
+            raw_weights.values()
+        )
+
+        self.dynamic_weights = {
+
+            key:
+            value / total
+
+            for key, value
+            in raw_weights.items()
+        }
+
+        # ----------------------------------------------------
+        # ONLINE ML
+        # ----------------------------------------------------
+
+        self.ml_model = (
+            OnlineSignalModel(
+                self.feature_names,
+                self.config.random_state
+            )
+        )
+
+        self.last_features = None
+
+    # ========================================================
+    # EXTRACT
+    # ========================================================
+
+    def extract_features(
+        self,
+        df,
+        bids,
+        asks,
+        prev_bids=None,
+        prev_asks=None,
+        performance_history=None
+    ):
+
+        features = (
+            ResearchFeatures
+            .extract(
+
+                df=pd.DataFrame(
+                    df
+                ),
+
+                bids=np.asarray(
+                    bids,
+                    dtype=float
+                ),
+
+                asks=np.asarray(
+                    asks,
+                    dtype=float
+                ),
+
+                prev_bids=(
+                    None
+                    if prev_bids is None
+                    else
+                    np.asarray(
+                        prev_bids,
+                        dtype=float
+                    )
+                ),
+
+                prev_asks=(
+                    None
+                    if prev_asks is None
+                    else
+                    np.asarray(
+                        prev_asks,
+                        dtype=float
+                    )
+                ),
+
+                performance_history=
+                performance_history,
+
+                config=self.config
+            )
+        )
+
+        self.last_features = (
+            features
+        )
+
+        return features
+
+    # ========================================================
+    # WEIGHTED SCORE
+    # ========================================================
+
+    def _weighted_score(
+        self,
+        features
+    ):
+
+        values = np.array(
+            [
+                features.get(
+                    key,
+                    0.0
+                )
+                for key in
+                self.feature_names
+            ],
+            dtype=float
+        )
+
+        weights = np.array(
+            [
+                self.dynamic_weights[
+                    key
+                ]
+                for key in
+                self.feature_names
+            ],
+            dtype=float
+        )
+
+        return float(
+            np.clip(
+                np.dot(
+                    values,
+                    weights
+                ),
+                -1,
+                1
+            )
+        )
+
+    # ========================================================
+    # UPDATE ML AFTER TRADE
+    # ========================================================
+
+    def update_model(
+        self,
+        features,
+        outcome
+    ):
+
+        outcome = str(
+            outcome
+        ).upper()
+
+        if outcome not in {
+            "WIN",
+            "LOSS"
+        }:
+
+            return
+
+        self.ml_model.update(
+
+            features,
+
+            1
+            if outcome == "WIN"
+            else 0
+        )
+
+    # ========================================================
+    # RECENT MOVE
+    # ========================================================
+
+    def _actual_move_pct(
+        self,
+        df
+    ):
+
+        close = (
+            pd.to_numeric(
+                df["Close"],
+                errors="coerce"
+            )
+            .dropna()
+        )
+
+        if len(close) < 6:
+
+            return 0.0
+
+        return float(
+
+            abs(
+                close.iloc[-1] -
+                close.iloc[-6]
+            )
+
+            /
+
+            (
+                abs(
+                    close.iloc[-6]
+                )
+                +
+                EPS
+            )
+        )
+
+    # ========================================================
+    # VOLATILITY
+    # ========================================================
+
+    def _volatility_ratio(
+        self,
+        df
+    ):
+
+        close = (
+            pd.to_numeric(
+                df["Close"],
+                errors="coerce"
+            )
+            .dropna()
+        )
+
+        returns = (
+            close
+            .pct_change()
+            .dropna()
+        )
+
+        if len(returns) < (
+            self.config.vol_window +
+            5
+        ):
+
+            return 1.0
+
+        short_vol = (
+            returns
+            .tail(5)
+            .std()
+        )
+
+        long_vol = (
+            returns
+            .tail(
+                self.config.vol_window
+            )
+            .std()
+        )
+
+        if (
+            not np.isfinite(
+                long_vol
+            )
+            or
+            long_vol < EPS
+        ):
+
+            return 1.0
+
+        return float(
+            short_vol /
+            long_vol
+        )
+
+    # ========================================================
+    # TRADE LEVELS
+    # ========================================================
+
+    def _build_trade(
+        self,
+        direction,
+        entry,
+        stop_distance
+    ):
+
+        stop_distance = max(
+
+            stop_distance,
+
+            entry *
+            self.config
+            .min_stop_pct
+        )
+
+        stop_distance = min(
+
+            stop_distance,
+
+            entry *
+            self.config
+            .max_stop_pct
+        )
+
+        # ----------------------------------------------------
+        # BUY
+        # ----------------------------------------------------
+
+        if direction == "BUY":
+
+            stop_loss = (
+                entry -
+                stop_distance
+            )
+
+            tp1 = (
+                entry +
+                stop_distance *
+                self.config.rr_tp1
+            )
+
+            tp2 = (
+                entry +
+                stop_distance *
+                self.config.rr_tp2
+            )
+
+        # ----------------------------------------------------
+        # SELL
+        # ----------------------------------------------------
+
+        else:
+
+            stop_loss = (
+                entry +
+                stop_distance
+            )
+
+            tp1 = (
+                entry -
+                stop_distance *
+                self.config.rr_tp1
+            )
+
+            tp2 = (
+                entry -
+                stop_distance *
+                self.config.rr_tp2
+            )
+
+        return {
+
+            "ENTRY":
+                float(entry),
+
+            "SL":
+                float(stop_loss),
+
+            "TP1_1_2":
+                float(tp1),
+
+            "TP2_1_3":
+                float(tp2),
+
+            "RISK_DISTANCE":
+                float(stop_distance),
+
+            "RR_TP1":
+                float(
+                    self.config.rr_tp1
+                ),
+
+            "RR_TP2":
+                float(
+                    self.config.rr_tp2
+                ),
+        }
+
+    # ========================================================
+    # FINAL SIGNAL
+    # ========================================================
+
+    def calculate_all_signals(
+
+        self,
+
+        df,
+
+        bids,
+
+        asks,
+
+        current_inventory=0,
+
+        performance_history=None,
+
+        prev_bids=None,
+
+        prev_asks=None,
+
+        manipulation_risk=0.0,
+
+        liquidation_volumes=None,
+
+        displayed_vol=0.0,
+
+        cancelled_vol=0.0,
+
+        time_exists=0.0,
+
+        obs_window=1.0,
+
+        open_interest=0.0,
+
+        leverage=1.0
+    ):
+
+        df = pd.DataFrame(
+            df
+        )
+
+        # ----------------------------------------------------
+        # DATA CHECK
+        # ----------------------------------------------------
+
+        if (
+            df.empty
+            or
+            "Close" not in df.columns
+        ):
+
+            return {
+
+                "SIGNAL":
+                    "NO_DATA",
+
+                "CONFIDENCE":
+                    0.0,
+
+                "SCORE":
+                    0.0,
+
+                "REASON":
+                    "Missing OHLC data"
+            }
+
+        # ----------------------------------------------------
+        # FEATURES
+        # ----------------------------------------------------
+
+        features = (
+            self.extract_features(
+
+                df,
+
+                bids,
+
+                asks,
+
+                prev_bids,
+
+                prev_asks,
+
+                performance_history
+            )
+        )
+
+        # ----------------------------------------------------
+        # WEIGHTED RESEARCH SCORE
+        # ----------------------------------------------------
+
+        weighted_score = (
+            self._weighted_score(
+                features
+            )
+        )
+
+        # ----------------------------------------------------
+        # ML
+        # ----------------------------------------------------
+
+        ml_probability = (
+            self.ml_model
+            .probability(
+                features
+            )
+        )
+
+        ml_score = (
+            ml_probability -
+            0.5
+        ) * 2.0
+
+        # ----------------------------------------------------
+        # ENSEMBLE
+        # ----------------------------------------------------
+
+        if (
+            self.ml_model.ready
+            and
+            self.ml_model.samples
+            >=
+            self.config
+            .min_training_samples
+        ):
+
+            final_score = (
+
+                0.55 *
+                weighted_score
+
+                +
+
+                0.45 *
+                ml_score
+            )
+
+        else:
+
+            final_score = (
+                weighted_score
+            )
+
+        final_score = float(
+            np.clip(
+                final_score,
+                -1,
+                1
+            )
+        )
+
+        confidence = abs(
+            final_score
+        )
+
+        # ----------------------------------------------------
+        # MOVE FILTER
+        # ----------------------------------------------------
+
+        move_pct = (
+            self._actual_move_pct(
+                df
+            )
+        )
+
+        move_ok = (
+            move_pct >=
+            self.config
+            .min_move_pct
+        )
+
+        # ----------------------------------------------------
+        # VOLATILITY FILTER
+        # ----------------------------------------------------
+
+        volatility_ratio = (
+            self._volatility_ratio(
+                df
+            )
+        )
+
+        volatility_ok = (
+
+            self.config
+            .min_vol_ratio
+
+            <=
+
+            volatility_ratio
+
+            <=
+
+            self.config
+            .max_vol_ratio
+        )
+
+        # ----------------------------------------------------
+        # DIRECTION
+        # ----------------------------------------------------
+
+        direction = (
+
+            "BUY"
+            if final_score > 0
+            else
+            "SELL"
+        )
+
+        # ----------------------------------------------------
+        # OBI / OFI
+        # ----------------------------------------------------
+
+        obi = features[
+            "BOOK_IMB"
+        ]
+
+        ofi = features[
+            "OFI"
+        ]
+
+        buy_confirmation = (
+
+            obi >=
+            self.config
+            .obi_threshold
+
+            and
+
+            ofi >=
+            self.config
+            .ofi_threshold
+        )
+
+        sell_confirmation = (
+
+            obi <=
+            -self.config
+            .obi_threshold
+
+            and
+
+            ofi <=
+            -self.config
+            .ofi_threshold
+        )
+
+        if direction == "BUY":
+
+            flow_confirmation = (
+                buy_confirmation
+            )
+
+        else:
+
+            flow_confirmation = (
+                sell_confirmation
+            )
+
+        # ----------------------------------------------------
+        # IMPULSE / EXHAUSTION
+        # ----------------------------------------------------
+
+        impulse = features[
+            "IMPULSE"
+        ]
+
+        exhaustion = features[
+            "EXHAUSTION"
+        ]
+
+        if direction == "BUY":
+
+            impulse_confirmation = (
+                impulse >= 0.25
+            )
+
+            exhaustion_bad = (
+
+                exhaustion >=
+                0.75
+
+                and
+
+                not
+                buy_confirmation
+            )
+
+        else:
+
+            impulse_confirmation = (
+                impulse <= -0.25
+            )
+
+            exhaustion_bad = (
+
+                exhaustion <=
+                -0.75
+
+                and
+
+                not
+                sell_confirmation
+            )
+
+        # ----------------------------------------------------
+        # MANIPULATION
+        # ----------------------------------------------------
+
+        calculated_manipulation = (
+
+            ManipulationRisk
+            .score(
+
+                displayed_vol,
+
+                cancelled_vol,
+
+                time_exists,
+
+                obs_window
+            )
+        )
+
+        manipulation = max(
+
+            float(
+                manipulation_risk
+            ),
+
+            calculated_manipulation
+        )
+
+        # ----------------------------------------------------
+        # REASONS
+        # ----------------------------------------------------
+
+        reasons = []
+
+        if not move_ok:
+
+            reasons.append(
+                "MOVE_BELOW_0.40_PERCENT"
+            )
+
+        if not flow_confirmation:
+
+            reasons.append(
+                "OBI_OFI_NOT_CONFIRMED"
+            )
+
+        if not volatility_ok:
+
+            reasons.append(
+                "BAD_VOLATILITY_REGIME"
+            )
+
+        if manipulation >= 0.70:
+
+            reasons.append(
+                "HIGH_MANIPULATION_RISK"
+            )
+
+        if exhaustion_bad:
+
+            reasons.append(
+                "EXTREME_UNCONFIRMED_MOVE"
+            )
+
+        if features[
+            "REWARD_RISK"
+        ] < -0.50:
+
+            reasons.append(
+                "WEAK_REWARD_RISK"
+            )
+
+        # ----------------------------------------------------
+        # FINAL TRADE GATE
+        # ----------------------------------------------------
+
+        can_trade = (
+
+            move_ok
+
+            and
+
+            flow_confirmation
+
+            and
+
+            volatility_ok
+
+            and
+
+            manipulation < 0.70
+
+            and
+
+            not exhaustion_bad
+
+            and
+
+            confidence >=
+            self.config
+            .min_confidence
+
+            and
+
+            (
+                (
+                    direction ==
+                    "BUY"
+                    and
+                    final_score > 0
+                )
+
+                or
+
+                (
+                    direction ==
+                    "SELL"
+                    and
+                    final_score < 0
+                )
+            )
+        )
+
+        if can_trade:
+
+            signal = direction
+
+        else:
+
+            signal = "NO TRADE"
+
+        # ----------------------------------------------------
+        # ENTRY
+        # ----------------------------------------------------
+
+        close = float(
+
+            pd.to_numeric(
+                df["Close"],
+                errors="coerce"
+            )
+            .dropna()
+            .iloc[-1]
+        )
+
+        # ----------------------------------------------------
+        # ATR STOP
+        # ----------------------------------------------------
+
+        atr = (
+            ResearchFeatures
+            .atr(
+                df,
+                self.config
+                .atr_period
+            )
+        )
+
+        if atr <= 0:
+
+            stop_distance = (
+
+                close *
+                self.config
+                .min_stop_pct
+            )
+
+        else:
+
+            stop_distance = (
+
+                atr *
+                self.config
+                .atr_multiplier
+            )
+
+        trade = (
+            self._build_trade(
+
+                direction,
+
+                close,
+
+                stop_distance
+            )
+        )
+
+        # ----------------------------------------------------
+        # RESULT
+        # ----------------------------------------------------
+
+        return {
 
             "SIGNAL":
-                signal_data["SIGNAL"],
+                signal,
 
-            "RAW_SIGNAL":
-                signal_data["RAW_SIGNAL"],
-
-            "REASON":
-                signal_data["REASON"],
+            "DIRECTION":
+                direction,
 
             "SCORE":
-                signal_data["SCORE"],
-
-            "FINAL_SCORE":
                 final_score,
 
             "CONFIDENCE":
-                signal_data["CONFIDENCE"],
+                confidence,
 
-            "RISK":
-                risk_data,
+            "ML_PROBABILITY":
+                ml_probability,
 
-            "ENTRY_PRICE":
-                signal_data["ENTRY_PRICE"],
+            "ML_READY":
+                self.ml_model.ready,
 
-            "STOP_LOSS":
-                signal_data["STOP_LOSS"],
+            "ML_SAMPLES":
+                self.ml_model.samples,
 
-            "TP1":
-                signal_data["TP1"],
+            # -----------------------------------------------
+            # MOVE
+            # -----------------------------------------------
 
-            "TP2":
-                signal_data["TP2"],
+            "MOVE_5_CANDLE_PCT":
+                move_pct * 100.0,
 
-            "RR_TP1":
-                signal_data["RR_TP1"],
+            "MIN_MOVE_PCT":
+                self.config
+                .min_move_pct *
+                100.0,
 
-            "RR_TP2":
-                signal_data["RR_TP2"],
-
-            "MOVE_PERCENT":
-                signal_data["MOVE_PERCENT"],
-
-            "MIN_MOVE_PERCENT":
-                signal_data["MIN_MOVE_PERCENT"],
+            # -----------------------------------------------
+            # MICROSTRUCTURE
+            # -----------------------------------------------
 
             "OBI":
-                signal_data["OBI"],
+                obi,
 
             "OFI":
-                signal_data["OFI"],
+                ofi,
 
-            "SPOOF_RISK":
-                signal_data["SPOOF_RISK"],
+            # -----------------------------------------------
+            # RISK FILTERS
+            # -----------------------------------------------
 
-            "MANIPULATION":
-                signal_data["MANIPULATION"],
+            "IMPULSE":
+                impulse,
 
-            "IMPULSE_SCORE":
-                signal_data["IMPULSE_SCORE"],
+            "EXHAUSTION":
+                exhaustion,
 
-            "MOVE_SIGNIFICANCE":
-                signal_data["MOVE_SIGNIFICANCE"],
+            "VOLATILITY_RATIO":
+                volatility_ratio,
+
+            "MANIPULATION_RISK":
+                manipulation,
+
+            # -----------------------------------------------
+            # FEATURES
+            # -----------------------------------------------
 
             "FEATURES":
-                signal_data["FEATURES"],
+                features,
 
             "WEIGHTS":
-                weights
+                self.dynamic_weights,
+
+            # -----------------------------------------------
+            # TRADE LEVELS
+            # -----------------------------------------------
+
+            "ENTRY":
+                trade["ENTRY"],
+
+            "SL":
+                trade["SL"],
+
+            "TP1_1_2":
+                trade["TP1_1_2"],
+
+            "TP2_1_3":
+                trade["TP2_1_3"],
+
+            "RISK_DISTANCE":
+                trade["RISK_DISTANCE"],
+
+            "RR_TP1":
+                trade["RR_TP1"],
+
+            "RR_TP2":
+                trade["RR_TP2"],
+
+            # -----------------------------------------------
+            # STATUS
+            # -----------------------------------------------
+
+            "CAN_TRADE":
+                can_trade,
+
+            "REASON":
+
+                "OK"
+                if can_trade
+                else
+                " | ".join(
+                    reasons
+                ),
         }
 
-        return output
+
+# ============================================================
+# BACKWARD COMPATIBILITY
+# ============================================================
+
+PowerTradingRiskEngine = (
+    PowerTradingRiskEngine
+)
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    config = SignalConfig()
+
+    print(
+        "===================================="
+    )
+
+    print(
+        "Research Lab Engine Loaded"
+    )
+
+    print(
+        "===================================="
+    )
+
+    print(
+        "Minimum Move:",
+        config.min_move_pct * 100,
+        "%"
+    )
+
+    print(
+        "TP1:",
+        "1:",
+        config.rr_tp1
+    )
+
+    print(
+        "TP2:",
+        "1:",
+        config.rr_tp2
+    )
+
+    print(
+        "OBI Threshold:",
+        config.obi_threshold
+    )
+
+    print(
+        "OFI Threshold:",
+        config.ofi_threshold
+    )
+
+    print(
+        "ML Training Samples:",
+        config.min_training_samples
+    )
