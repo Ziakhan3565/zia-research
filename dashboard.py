@@ -624,10 +624,19 @@ def get_all_tri_levels(symbol):
     return levels
 
 
-def add_tri_lines(fig, tri_levels, visible_low=None, visible_high=None):
-    """Add clean TRI horizontal levels. Far-away levels are hidden so the
-    current candle chart stays readable; the calculation itself is unchanged."""
+def add_tri_lines(
+    fig,
+    tri_levels,
+    visible_low=None,
+    visible_high=None,
+    enabled_timeframes=None,
+):
+    """Add clean TRI horizontal levels with per-timeframe visibility control."""
     for tri_tf, tri in tri_levels.items():
+
+        # If the user disabled this timeframe, do not draw its lines.
+        if enabled_timeframes is not None and tri_tf not in enabled_timeframes:
+            continue
         color = TRI_COLORS.get(tri_tf, "#38bdf8")
 
         for level_name, width, opacity, dash in [
@@ -992,6 +1001,56 @@ forecast_horizon = st.sidebar.slider(
     30,
     15
 )
+
+# ============================================================
+# TRI LINE CONTROLS
+# ============================================================
+# Every TRI timeframe can be turned ON/OFF independently.
+# All are ON by default.
+
+st.sidebar.markdown("---")
+
+with st.sidebar.expander("📏 TRI Line Controls", expanded=True):
+    tri_master = st.checkbox(
+        "Show TRI Lines",
+        value=True,
+        key="tri_master_visibility"
+    )
+
+    tri_enabled = set()
+
+    tri_control_order = [
+        "YEARLY",
+        "MONTHLY",
+        "WEEKLY",
+        "DAILY",
+        "4H",
+        "1H",
+        "30M",
+        "15M",
+    ]
+
+    tri_labels = {
+        "YEARLY": "YEARLY",
+        "MONTHLY": "MONTHLY",
+        "WEEKLY": "WEEKLY",
+        "DAILY": "DAILY",
+        "4H": "4H",
+        "1H": "1H",
+        "30M": "30M",
+        "15M": "15M",
+    }
+
+    for tri_tf in tri_control_order:
+        enabled = st.checkbox(
+            tri_labels[tri_tf],
+            value=True,
+            disabled=not tri_master,
+            key=f"tri_visibility_{tri_tf}"
+        )
+
+        if tri_master and enabled:
+            tri_enabled.add(tri_tf)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -1419,6 +1478,7 @@ with left:
         tri_levels,
         visible_low=visible_low,
         visible_high=visible_high,
+        enabled_timeframes=tri_enabled,
     )
 
     if direction in {"LONG", "SHORT"}:
@@ -1450,6 +1510,7 @@ with left:
             showgrid=False,
             rangeslider_visible=False,
         ),
+        dragmode="pan",
         yaxis=dict(
             showgrid=True,
             gridcolor="#202938",
@@ -1473,7 +1534,23 @@ with left:
 
     st.plotly_chart(
         fig,
-        use_container_width=True
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "doubleClick": "reset+autosize",
+            "modeBarButtonsToAdd": [
+                "zoom2d",
+                "pan2d",
+                "select2d",
+                "lasso2d",
+                "autoScale2d",
+                "resetScale2d",
+            ],
+            "modeBarButtonsToRemove": [
+                "toImage",
+            ],
+        },
     )
 
 
