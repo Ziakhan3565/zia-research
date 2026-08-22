@@ -6,26 +6,26 @@ import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score,
-    precision_score,
-    recall_score,
     classification_report,
     confusion_matrix
 )
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 DATA_FILE = "market_data_log.csv"
-MODEL_FILE = "xgboost_obi_model.pkl"
+MODEL_FILE = "xgboost_direction_model.pkl"
 
-MIN_MOVE = 0.0040       # 0.40%
-FUTURE_HORIZON = 5      # next 5 observations
-
+MIN_MOVE = 0.0040          # 0.40%
+FUTURE_HORIZON = 5         # next 5 observations
 TEST_SIZE = 0.20
-
 RANDOM_STATE = 42
+
+# Classes:
+# 0 = NO TRADE
+# 1 = LONG
+# 2 = SHORT
 
 
 # ============================================================
@@ -35,30 +35,10 @@ RANDOM_STATE = 42
 def load_data():
 
     if not os.path.exists(DATA_FILE):
-
-        print(
-            f"❌ '{DATA_FILE}' nahi mili!"
-        )
-
+        print(f"ERROR: {DATA_FILE} not found.")
         return None
 
-    try:
-
-        df = pd.read_csv(
-            DATA_FILE
-        )
-
-    except Exception as e:
-
-        print(
-            f"❌ CSV error: {e}"
-        )
-
-        return None
-
-    print(
-        f"📥 Raw rows: {len(df):,}"
-    )
+    df = pd.read_csv(DATA_FILE)
 
     required = [
         "timestamp",
@@ -69,44 +49,28 @@ def load_data():
     ]
 
     missing = [
-        col
-        for col in required
-        if col not in df.columns
+        c for c in required
+        if c not in df.columns
     ]
 
     if missing:
-
-        print(
-            "\n❌ Missing columns:"
-        )
-
-        for col in missing:
-            print(
-                f"   {col}"
-            )
-
+        print("Missing columns:", missing)
         return None
 
-    # Timestamp
     df["timestamp"] = pd.to_datetime(
         df["timestamp"],
         errors="coerce"
     )
 
-    # Price
     df["current_price"] = pd.to_numeric(
         df["current_price"],
         errors="coerce"
     )
 
-    # Numeric columns
-    numeric_columns = [
+    for col in [
         "obi_top20",
         "spread"
-    ]
-
-    for col in numeric_columns:
-
+    ]:
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce"
@@ -121,123 +85,117 @@ def load_data():
     )
 
     df = df.sort_values(
-        [
-            "symbol",
-            "timestamp"
-        ]
-    ).reset_index(
-        drop=True
-    )
+        ["symbol", "timestamp"]
+    ).reset_index(drop=True)
 
     return df
 
 
 # ============================================================
-# FEATURE ENGINEERING
+# FEATURES
 # ============================================================
+
+FEATURES = [
+    "top20_bid_sum",
+    "top20_ask_sum",
+    "obi_top20",
+    "obi_top50",
+    "spread",
+    "bid_ask_ratio",
+    "total_depth",
+    "trend_10",
+    "trend_20",
+    "return_1",
+    "return_3",
+    "return_5",
+    "volatility",
+    "ofi_normalized",
+    "obi_alignment",
+    "spread_pct"
+]
+
 
 def create_features(df):
 
     df = df.copy()
 
     # --------------------------------------------------------
-    # Bid / Ask depth
+    # DEPTH
     # --------------------------------------------------------
 
     if (
-        "top20_bid_sum" in df.columns and
-        "top20_ask_sum" in df.columns
+        "top20_bid_sum" not in df.columns
+        and
+        "top20_bid_volume" in df.columns
     ):
-
-        df["bid_ask_ratio"] = (
-            df["top20_bid_sum"] /
-            (
-                df["top20_ask_sum"] +
-                1e-12
-            )
+        df["top20_bid_sum"] = (
+            df["top20_bid_volume"]
         )
 
-        df["total_depth"] = (
-            df["top20_bid_sum"] +
-            df["top20_ask_sum"]
-        )
-
-    elif (
-        "top20_bid_volume" in df.columns and
+    if (
+        "top20_ask_sum" not in df.columns
+        and
         "top20_ask_volume" in df.columns
     ):
-
-        df["bid_ask_ratio"] = (
-            df["top20_bid_volume"] /
-            (
-                df["top20_ask_volume"] +
-                1e-12
-            )
-        )
-
-        df["total_depth"] = (
-            df["top20_bid_volume"] +
+        df["top20_ask_sum"] = (
             df["top20_ask_volume"]
         )
 
-    else:
-
-        print(
-            "❌ Top20 bid/ask columns missing."
-        )
-
+    if (
+        "top20_bid_sum" not in df.columns
+        or
+        "top20_ask_sum" not in df.columns
+    ):
+        print("ERROR: Top20 bid/ask data missing.")
         return None
 
     # --------------------------------------------------------
-    # Top 50 OBI
+    # TOP50
     # --------------------------------------------------------
 
     if "obi_top50" not in df.columns:
-
-        # If Top50 does not exist, use Top20
         print(
-            "⚠️ obi_top50 nahi mila. "
-            "Top20 OBI use hoga."
+            "WARNING: obi_top50 missing. "
+            "Using top20 as fallback."
         )
 
-        df["obi_top50"] = (
-            df["obi_top20"]
+        df["obi_top50"] = df["obi_top20"]
+
+    # --------------------------------------------------------
+    # PRICE RETURNS
+    # --------------------------------------------------------
+
+    grouped = df.groupby("symbol")["current_price"]
+
+    df["return_1"] = grouped.pct_change(1)
+    df["return_3"] = grouped.pct_change(3)
+    df["return_5"] = grouped.pct_change(5)
+
+    # --------------------------------------------------------
+    # DEPTH FEATURES
+    # --------------------------------------------------------
+
+    df["bid_ask_ratio"] = (
+        df["top20_bid_sum"]
+        /
+        (
+            df["top20_ask_sum"]
+            + 1e-12
         )
-
-    # --------------------------------------------------------
-    # Price returns
-    # --------------------------------------------------------
-
-    df["return_1"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
-        .pct_change(1)
     )
 
-    df["return_3"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
-        .pct_change(3)
-    )
-
-    df["return_5"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
-        .pct_change(5)
+    df["total_depth"] = (
+        df["top20_bid_sum"]
+        +
+        df["top20_ask_sum"]
     )
 
     # --------------------------------------------------------
-    # SMA trend
+    # TREND
     # --------------------------------------------------------
 
     df["sma_10"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
-        .transform(
+        grouped.transform(
             lambda x:
             x.rolling(
                 10,
@@ -247,10 +205,7 @@ def create_features(df):
     )
 
     df["sma_20"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
-        .transform(
+        grouped.transform(
             lambda x:
             x.rolling(
                 20,
@@ -259,39 +214,38 @@ def create_features(df):
         )
     )
 
-    # Trend percentage
     df["trend_10"] = (
         (
-            df["current_price"] -
+            df["current_price"]
+            -
             df["sma_10"]
         )
         /
         (
-            df["sma_10"] +
-            1e-12
+            df["sma_10"]
+            + 1e-12
         )
     )
 
     df["trend_20"] = (
         (
-            df["current_price"] -
+            df["current_price"]
+            -
             df["sma_20"]
         )
         /
         (
-            df["sma_20"] +
-            1e-12
+            df["sma_20"]
+            + 1e-12
         )
     )
 
     # --------------------------------------------------------
-    # Volatility
+    # VOLATILITY
     # --------------------------------------------------------
 
     df["volatility"] = (
-        df.groupby("symbol")[
-            "return_1"
-        ]
+        df.groupby("symbol")["return_1"]
         .transform(
             lambda x:
             x.rolling(
@@ -312,44 +266,38 @@ def create_features(df):
             errors="coerce"
         )
 
-        if "total_depth" in df.columns:
-
-            df["ofi_normalized"] = (
-                df["ofi"] /
-                (
-                    df["total_depth"] +
-                    1e-12
-                )
+        df["ofi_normalized"] = (
+            df["ofi"]
+            /
+            (
+                df["total_depth"]
+                + 1e-12
             )
-
-        else:
-
-            df["ofi_normalized"] = (
-                df["ofi"]
-            )
+        )
 
     else:
-
         df["ofi_normalized"] = 0.0
 
     # --------------------------------------------------------
-    # OBI agreement
+    # OBI AGREEMENT
     # --------------------------------------------------------
 
     df["obi_alignment"] = (
-        df["obi_top20"] *
+        df["obi_top20"]
+        *
         df["obi_top50"]
     )
 
     # --------------------------------------------------------
-    # Spread percentage
+    # SPREAD
     # --------------------------------------------------------
 
     df["spread_pct"] = (
-        df["spread"] /
+        df["spread"]
+        /
         (
-            df["current_price"] +
-            1e-12
+            df["current_price"]
+            + 1e-12
         )
     )
 
@@ -357,85 +305,17 @@ def create_features(df):
 
 
 # ============================================================
-# CREATE 0.40% TARGET
+# DIRECTION TARGET
 # ============================================================
 
 def create_target(df):
 
     df = df.copy()
 
-    print(
-        "\n🎯 Creating 0.40% future-move target..."
-    )
+    grouped = df.groupby("symbol")["current_price"]
 
-    # --------------------------------------------------------
-    # Future maximum / minimum
-    # --------------------------------------------------------
-
-    future_max = []
-    future_min = []
-
-    for symbol, group in df.groupby(
-        "symbol",
-        sort=False
-    ):
-
-        prices = (
-            group["current_price"]
-            .values
-        )
-
-        max_values = np.full(
-            len(prices),
-            np.nan
-        )
-
-        min_values = np.full(
-            len(prices),
-            np.nan
-        )
-
-        for i in range(
-            len(prices)
-        ):
-
-            start = i + 1
-
-            end = min(
-                i + 1 +
-                FUTURE_HORIZON,
-                len(prices)
-            )
-
-            if start >= end:
-                continue
-
-            future = prices[
-                start:end
-            ]
-
-            max_values[i] = np.max(
-                future
-            )
-
-            min_values[i] = np.min(
-                future
-            )
-
-        future_max.extend(
-            max_values
-        )
-
-        future_min.extend(
-            min_values
-        )
-
-    # The above order is grouped order, therefore
-    # recreate safely using groupby transform logic.
-    df["future_max"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
+    future_max = (
+        grouped
         .transform(
             lambda x:
             x.shift(-1)
@@ -447,10 +327,8 @@ def create_target(df):
         )
     )
 
-    df["future_min"] = (
-        df.groupby("symbol")[
-            "current_price"
-        ]
+    future_min = (
+        grouped
         .transform(
             lambda x:
             x.shift(-1)
@@ -462,369 +340,192 @@ def create_target(df):
         )
     )
 
-    # --------------------------------------------------------
-    # Future move
-    # --------------------------------------------------------
-
     df["future_up_move"] = (
         (
-            df["future_max"] -
+            future_max
+            -
             df["current_price"]
         )
         /
         (
-            df["current_price"] +
-            1e-12
+            df["current_price"]
+            + 1e-12
         )
     )
 
     df["future_down_move"] = (
         (
-            df["current_price"] -
-            df["future_min"]
+            df["current_price"]
+            -
+            future_min
         )
         /
         (
-            df["current_price"] +
-            1e-12
+            df["current_price"]
+            + 1e-12
         )
     )
 
     # --------------------------------------------------------
-    # Target
-    #
-    # 1 = meaningful bullish move >= 0.40%
-    # 0 = no bullish move >= 0.40%
-    #
-    # Short opportunities are stored separately.
+    # 0 = NO TRADE
+    # 1 = LONG
+    # 2 = SHORT
     # --------------------------------------------------------
 
-    df["target"] = (
-        df["future_up_move"] >=
-        MIN_MOVE
-    ).astype(int)
-
-    # --------------------------------------------------------
-    # Direction target
-    #
-    # 1  = Long
-    # -1 = Short
-    # 0  = No meaningful move
-    # --------------------------------------------------------
-
-    df["direction_target"] = 0
+    df["target"] = 0
 
     long_condition = (
-        (df["future_up_move"] >= MIN_MOVE) &
+        (df["future_up_move"] >= MIN_MOVE)
+        &
         (
-            df["future_up_move"] >=
+            df["future_up_move"]
+            >=
             df["future_down_move"]
         )
     )
 
     short_condition = (
-        (df["future_down_move"] >= MIN_MOVE) &
+        (df["future_down_move"] >= MIN_MOVE)
+        &
         (
-            df["future_down_move"] >
+            df["future_down_move"]
+            >
             df["future_up_move"]
         )
     )
 
     df.loc[
         long_condition,
-        "direction_target"
+        "target"
     ] = 1
 
     df.loc[
         short_condition,
-        "direction_target"
-    ] = -1
+        "target"
+    ] = 2
 
     return df
 
 
 # ============================================================
-# PREPARE DATASET
+# PREPARE DATA
 # ============================================================
 
 def prepare_dataset(df):
 
-    features = [
-        "top20_bid_sum",
-        "top20_ask_sum",
-        "obi_top20",
-        "obi_top50",
-        "spread",
-        "bid_ask_ratio",
-        "total_depth",
-        "trend_10",
-        "trend_20",
-        "return_1",
-        "return_3",
-        "return_5",
-        "volatility",
-        "ofi_normalized",
-        "obi_alignment",
-        "spread_pct"
-    ]
-
-    # Support alternate column names
-    if (
-        "top20_bid_sum" not in df.columns
-    ):
-
-        df["top20_bid_sum"] = (
-            df["top20_bid_volume"]
-        )
-
-        df["top20_ask_sum"] = (
-            df["top20_ask_volume"]
-        )
-
-    # Make numeric
-    for col in features:
-
-        if col in df.columns:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
     missing = [
-        col
-        for col in features
-        if col not in df.columns
+        c for c in FEATURES
+        if c not in df.columns
     ]
 
     if missing:
-
-        print(
-            "\n❌ Missing training features:"
-        )
-
-        for col in missing:
-            print(
-                f"   - {col}"
-            )
-
+        print("Missing features:")
+        for c in missing:
+            print(" -", c)
         return None, None
-
-    # --------------------------------------------------------
-    # Remove NaN
-    # --------------------------------------------------------
 
     df = df.dropna(
-        subset=
-        features +
-        [
-            "target",
-            "direction_target"
-        ]
+        subset=FEATURES + ["target"]
     ).copy()
 
-    if len(df) < 100:
-
+    if len(df) < 300:
         print(
-            f"\n❌ Only {len(df)} usable rows."
+            f"Only {len(df)} usable rows."
         )
-
         print(
-            "Training ke liye zyada "
-            "historical data collect karo."
+            "At least 300+ rows recommended."
         )
-
         return None, None
 
-    X = df[
-        features
-    ]
-
-    y = df[
-        "target"
-    ]
+    X = df[FEATURES]
+    y = df["target"]
 
     return X, y
 
 
 # ============================================================
-# TIME SERIES SPLIT
-# ============================================================
-
-def time_split(
-    X,
-    y
-):
-
-    split_index = int(
-        len(X) *
-        (
-            1 -
-            TEST_SIZE
-        )
-    )
-
-    X_train = X.iloc[
-        :split_index
-    ]
-
-    X_test = X.iloc[
-        split_index:
-    ]
-
-    y_train = y.iloc[
-        :split_index
-    ]
-
-    y_test = y.iloc[
-        split_index:
-    ]
-
-    return (
-        X_train,
-        X_test,
-        y_train,
-        y_test
-    )
-
-
-# ============================================================
-# TRAIN MODEL
+# TRAIN
 # ============================================================
 
 def train_model():
 
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "🚀 TRAINING 0.40% MICROSTRUCTURE MODEL"
-    )
-
-    print(
-        "=" * 60
-    )
+    print("=" * 70)
+    print("XGBOOST DIRECTION MODEL")
+    print("=" * 70)
 
     df = load_data()
 
     if df is None:
         return
 
-    # --------------------------------------------------------
-    # Features
-    # --------------------------------------------------------
-
-    df = create_features(
-        df
-    )
+    df = create_features(df)
 
     if df is None:
         return
 
-    # --------------------------------------------------------
-    # Target
-    # --------------------------------------------------------
+    df = create_target(df)
 
-    df = create_target(
-        df
-    )
-
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
-
-    X, y = prepare_dataset(
-        df
-    )
+    X, y = prepare_dataset(df)
 
     if X is None:
         return
 
-    print(
-        f"\n📊 Usable samples: "
-        f"{len(X):,}"
-    )
+    print()
+    print("Samples:", len(X))
+    print()
+    print("Target distribution:")
 
     print(
-        "\n🎯 Target distribution:"
-    )
-
-    print(
-        y.value_counts(
-            normalize=True
-        )
-        .rename(
-            {
-                0: "NO_0.40%_UP_MOVE",
-                1: "UP_MOVE_>=_0.40%"
-            }
-        )
-        .mul(100)
-        .round(2)
+        y.value_counts()
+        .sort_index()
     )
 
     # --------------------------------------------------------
-    # Time split
+    # TIME SERIES SPLIT
     # --------------------------------------------------------
 
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test
-    ) = time_split(
-        X,
-        y
+    split = int(
+        len(X)
+        *
+        (1 - TEST_SIZE)
     )
 
-    print(
-        f"\nTraining samples: "
-        f"{len(X_train):,}"
-    )
+    X_train = X.iloc[:split]
+    X_test = X.iloc[split:]
 
-    print(
-        f"Testing samples : "
-        f"{len(X_test):,}"
-    )
+    y_train = y.iloc[:split]
+    y_test = y.iloc[split:]
+
+    print()
+    print("Training:", len(X_train))
+    print("Testing :", len(X_test))
 
     # --------------------------------------------------------
-    # XGBoost
+    # XGBOOST
     # --------------------------------------------------------
 
     model = XGBClassifier(
-
-        n_estimators=300,
-
+        n_estimators=400,
         learning_rate=0.03,
-
         max_depth=4,
-
         min_child_weight=5,
-
         subsample=0.80,
-
         colsample_bytree=0.80,
-
         gamma=0.10,
-
         reg_alpha=0.10,
-
         reg_lambda=1.0,
 
-        objective="binary:logistic",
+        objective="multi:softprob",
+        num_class=3,
 
-        eval_metric="logloss",
+        eval_metric="mlogloss",
 
         random_state=RANDOM_STATE,
-
         n_jobs=-1
     )
 
-    print(
-        "\n🧠 Training XGBoost..."
-    )
+    print()
+    print("Training XGBoost...")
 
     model.fit(
         X_train,
@@ -832,194 +533,80 @@ def train_model():
     )
 
     # --------------------------------------------------------
-    # Prediction
+    # VALIDATION
     # --------------------------------------------------------
 
-    y_pred = model.predict(
+    predictions = model.predict(
         X_test
     )
 
-    probabilities = (
-        model.predict_proba(
-            X_test
-        )[:, 1]
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
     accuracy = accuracy_score(
         y_test,
-        y_pred
+        predictions
     )
 
-    precision = precision_score(
-        y_test,
-        y_pred,
-        zero_division=0
-    )
-
-    recall = recall_score(
-        y_test,
-        y_pred,
-        zero_division=0
-    )
+    print()
+    print("=" * 70)
+    print("VALIDATION")
+    print("=" * 70)
 
     print(
-        "\n"
-        + "=" * 60
+        f"Accuracy: {accuracy * 100:.2f}%"
     )
 
-    print(
-        "📊 MODEL VALIDATION"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"Accuracy  : "
-        f"{accuracy * 100:.2f}%"
-    )
-
-    print(
-        f"Precision : "
-        f"{precision * 100:.2f}%"
-    )
-
-    print(
-        f"Recall    : "
-        f"{recall * 100:.2f}%"
-    )
-
-    print(
-        "\nClassification Report:"
-    )
-
+    print()
     print(
         classification_report(
             y_test,
-            y_pred,
+            predictions,
+            labels=[0, 1, 2],
+            target_names=[
+                "NO_TRADE",
+                "LONG",
+                "SHORT"
+            ],
             zero_division=0
         )
     )
 
-    print(
-        "Confusion Matrix:"
-    )
-
+    print("Confusion Matrix:")
     print(
         confusion_matrix(
             y_test,
-            y_pred
+            predictions,
+            labels=[0, 1, 2]
         )
     )
 
     # --------------------------------------------------------
-    # Feature Importance
+    # SAVE
     # --------------------------------------------------------
 
-    importance = pd.DataFrame({
-
-        "feature":
-            X.columns,
-
-        "importance":
-            model.feature_importances_
-
-    })
-
-    importance = (
-        importance
-        .sort_values(
-            "importance",
-            ascending=False
-        )
-    )
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "🔬 FEATURE IMPORTANCE"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        importance.to_string(
-            index=False
-        )
-    )
-
-    # --------------------------------------------------------
-    # Save model package
-    # --------------------------------------------------------
-
-    model_package = {
-
-        "model":
-            model,
-
-        "features":
-            list(X.columns),
-
-        "min_move":
-            MIN_MOVE,
-
-        "future_horizon":
-            FUTURE_HORIZON,
-
-        "training_rows":
-            len(X_train),
-
-        "test_rows":
-            len(X_test),
-
-        "accuracy":
-            accuracy,
-
-        "precision":
-            precision,
-
-        "recall":
-            recall
+    package = {
+        "model": model,
+        "features": FEATURES,
+        "min_move": MIN_MOVE,
+        "future_horizon": FUTURE_HORIZON,
+        "classes": {
+            0: "NO_TRADE",
+            1: "LONG",
+            2: "SHORT"
+        }
     }
 
     joblib.dump(
-        model_package,
+        package,
         MODEL_FILE
     )
 
+    print()
     print(
-        "\n"
-        + "=" * 60
+        f"MODEL SAVED: {MODEL_FILE}"
     )
 
-    print(
-        f"💾 Model saved:"
-        f" {MODEL_FILE}"
-    )
+    print("=" * 70)
 
-    print(
-        "=" * 60
-    )
-
-    print(
-        "\n✅ Training completed."
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
-
     train_model()
+    
