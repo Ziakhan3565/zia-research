@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+import joblib
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh  # <-- 1. Yahan library import ki hai
@@ -30,7 +31,7 @@ def load_persistent_history():
             expected_cols = [
                 "trade_id", "timestamp", "symbol", "timeframe", "direction",
                 "entry_price", "stop_loss", "tp1", "tp2", "exit_price",
-                "confidence", "final_score", "outcome", "pnl_percent", "duration", "status"
+                "confidence", "xgb_confidence", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
             ]
             for col in expected_cols:
                 if col not in df_hist.columns:
@@ -49,6 +50,116 @@ def save_persistent_history(history_list):
 
 if "trade_history_log" not in st.session_state:
     st.session_state.trade_history_log = load_persistent_history()
+
+MODEL_PATH = "xgboost_obi_model.pkl"
+
+@st.cache_resource
+def load_xgb_model():
+    if not os.path.exists(MODEL_PATH):
+        return None, f"Model file not found: {MODEL_PATH}"
+    try:
+        model = joblib.load(MODEL_PATH)
+        return model, None
+    except Exception as e:
+        return None, f"XGBoost load error: {e}"
+
+xgb_model, xgb_model_error = load_xgb_model()
+
+XGB_FEATURES = [
+    "top20_bid_sum", "top20_ask_sum", "obi_top20", "spread",
+    "bid_ask_ratio", "total_depth", "trend_signal"
+]
+
+def build_xgb_features(df, bids, asks):
+    bid_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi = (bid_sum - ask_sum) / (bid_sum + ask_sum + 1e-8)
+    spread = abs(float(asks[0, 0]) - float(bids[0, 0])) if len(bids) and len(asks) else 0.0
+    ratio = bid_sum / (ask_sum + 1e-5)
+    total_depth = bid_sum + ask_sum
+    sma20 = df["Close"].rolling(20, min_periods=1).mean().iloc[-1]
+    trend_signal = float(df["Close"].iloc[-1] - sma20)
+    return pd.DataFrame([{
+        "top20_bid_sum": bid_sum,
+        "top20_ask_sum": ask_sum,
+        "obi_top20": obi,
+        "spread": spread,
+        "bid_ask_ratio": ratio,
+        "total_depth": total_depth,
+        "trend_signal": trend_signal,
+    }], columns=XGB_FEATURES)
+
+def normalize_trade(trade):
+    trade["outcome"] = str(trade.get("outcome", "PENDING")).upper()
+    trade["status"] = "Closed" if trade["outcome"] in ("WIN", "LOSS") else "Open"
+    for key in ("entry_price", "stop_loss", "tp1", "tp2"):
+        try: trade[key] = float(trade.get(key, 0.0))
+        except Exception: trade[key] = 0.0
+    if not trade.get("exit_reason"):
+        trade["exit_reason"] = ""
+    if not trade.get("entry_candle_time"):
+        trade["entry_candle_time"] = trade.get("timestamp", "")
+    return trade
+
+st.session_state.trade_history_log = [normalize_trade(t) for t in st.session_state.trade_history_log]
+
+def resolve_pending_trades(history, symbol, timeframe, current_candle_time, candle_high, candle_low, current_price):
+    changed = False
+    current_candle_str = pd.Timestamp(current_candle_time).strftime("%Y-%m-%d %H:%M:%S")
+    for trade in history:
+        if str(trade.get("outcome", "")).upper() != "PENDING":
+            continue
+        if trade.get("symbol") != symbol or trade.get("timeframe") != timeframe:
+            continue
+
+        # Never evaluate the same candle that created the trade; its high/low
+        # may have happened before the entry at the candle close.
+        entry_candle = str(trade.get("entry_candle_time", ""))
+        if entry_candle == current_candle_str:
+            continue
+
+        direction = str(trade.get("direction", "")).upper()
+        entry = float(trade.get("entry_price", 0.0))
+        sl = float(trade.get("stop_loss", 0.0))
+        tp = float(trade.get("tp1", 0.0))
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            continue
+
+        tp_hit = float(candle_high) >= tp if direction == "LONG" else float(candle_low) <= tp
+        sl_hit = float(candle_low) <= sl if direction == "LONG" else float(candle_high) >= sl
+
+        if not tp_hit and not sl_hit:
+            continue
+
+        # If both levels were touched in one OHLC candle, the exact sequence
+        # is unknowable. Use conservative SL-first accounting instead of leaving it pending.
+        if sl_hit and tp_hit:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL & TP touched in same candle (SL-first conservative)"
+        elif tp_hit:
+            result = "WIN"
+            exit_price = tp
+            reason = "TP1 HIT"
+        else:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL HIT"
+
+        if direction == "LONG":
+            pnl = ((exit_price - entry) / entry) * 100.0
+        else:
+            pnl = ((entry - exit_price) / entry) * 100.0
+
+        trade["outcome"] = result
+        trade["exit_price"] = round(float(exit_price), 2)
+        trade["pnl_percent"] = round(float(pnl), 4)
+        trade["status"] = "Closed"
+        trade["duration"] = "Closed"
+        trade["exit_reason"] = reason
+        trade["exit_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        changed = True
+    return changed
 
 
 # ==========================================
@@ -222,6 +333,13 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎛️ Paper Trading Mode")
 paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
 
+if xgb_model is not None:
+    st.sidebar.success("XGBoost model: LOADED")
+else:
+    st.sidebar.error("XGBoost model: NOT LOADED")
+    if xgb_model_error:
+        st.sidebar.caption(xgb_model_error)
+
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
@@ -229,7 +347,7 @@ api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 # 5. DATA FETCHING (SAFE API WITH FALLBACK)
 # ==========================================
 @st.cache_data(ttl=15)
-def fetch_klines_data(symbol, tf_key, limit=100):
+def fetch_klines_data(symbol, tf_key, limit=100, allow_fallback=True):
     binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("30m" if "30m" in tf_key else ("1h" if "1h" in tf_key else "4h")))
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
     try:
@@ -243,6 +361,8 @@ def fetch_klines_data(symbol, tf_key, limit=100):
         df.set_index("Time", inplace=True)
         return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
     except Exception:
+        if not allow_fallback:
+            return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
         dates = pd.date_range(end=datetime.datetime.now(), periods=limit, freq=binance_tf)
         base_p = 60000.0
         closes = base_p + np.cumsum(np.random.normal(0, 10, limit))
@@ -272,42 +392,99 @@ df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
 
 
+def resolve_all_pending_trades(history, selected_symbol, selected_tf_label, selected_df):
+    """Resolve pending trades for ALL symbol/timeframe combinations, not only the one selected in the sidebar."""
+    pairs = {(t.get("symbol"), t.get("timeframe")) for t in history
+             if str(t.get("outcome", "")).upper() == "PENDING"}
+    for symbol, timeframe in pairs:
+        if not symbol or not timeframe:
+            continue
+        if symbol == selected_symbol and timeframe == selected_tf_label:
+            local_df = selected_df
+        else:
+            try:
+                local_df = fetch_klines_data(symbol, timeframe, limit=2, allow_fallback=False)
+            except Exception:
+                continue
+        if local_df is None or local_df.empty:
+            continue
+        last = local_df.iloc[-1]
+        resolve_pending_trades(
+            history, symbol, timeframe, pd.Timestamp(last["Time"]),
+            float(last["High"]), float(last["Low"]), float(last["Close"])
+        )
+
+resolve_all_pending_trades(
+    st.session_state.trade_history_log, selected_symbol, selected_tf_label, df
+)
+save_persistent_history(st.session_state.trade_history_log)
+
+
 # ==========================================
 # 6. ENGINE EXECUTION & SIGNAL GENERATION
 # ==========================================
-if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
+if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     lab = TenPaperResearchLab()
     paper_results, final_score, evolved_weights = lab.calculate_all_signals(
         df, bids, asks, current_inventory=0, performance_history=st.session_state.trade_history_log
     )
 
-    close_p = df["Close"].iloc[-1]
+    close_p = float(df["Close"].iloc[-1])
+    high_p = float(df["High"].iloc[-1])
+    low_p = float(df["Low"].iloc[-1])
+    candle_time = pd.Timestamp(df["Time"].iloc[-1])
+
     atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
-    if np.isnan(atr_val): 
+    if np.isnan(atr_val) or atr_val <= 0:
         atr_val = close_p * 0.005
 
-    beam_level = close_p + (1.8 * atr_val)
-    base_level = close_p - (1.8 * atr_val)
-    tp1_val = close_p + (1.0 * atr_val) if final_score >= 0 else close_p - (1.0 * atr_val)
-    tp2_val = beam_level if final_score >= 0 else base_level
-    sl_val = close_p - (1.0 * atr_val) if final_score >= 0 else close_p + (1.0 * atr_val)
+    # ---- XGBoost live prediction: EXACT same 7 features used by train_model.py ----
+    xgb_features = build_xgb_features(df, bids, asks)
+    xgb_signal = "NEUTRAL"
+    xgb_confidence = 0.0
+    xgb_prediction = None
 
-    direction = "LONG" if final_score >= 0.15 else ("SHORT" if final_score <= -0.15 else "NEUTRAL")
-    confidence = int(min(max(abs(final_score) * 100, 15), 98))
+    if xgb_model is not None:
+        try:
+            xgb_prediction = int(xgb_model.predict(xgb_features)[0])
+            probs = xgb_model.predict_proba(xgb_features)[0]
+            xgb_confidence = float(np.max(probs) * 100.0)
+            xgb_signal = "LONG" if xgb_prediction == 1 else "SHORT"
+        except Exception as e:
+            xgb_model_error = f"XGBoost prediction error: {e}"
+
+    research_direction = "LONG" if final_score >= 0.15 else ("SHORT" if final_score <= -0.15 else "NEUTRAL")
+
+    # XGBoost is now the primary direction model; Research Lab is a confirmation filter.
+    if xgb_signal != "NEUTRAL" and xgb_confidence >= 55:
+        if research_direction == "NEUTRAL" or research_direction == xgb_signal:
+            direction = xgb_signal
+        else:
+            direction = "NEUTRAL"
+    else:
+        direction = "NEUTRAL"
+
+    confidence = int(min(max(xgb_confidence, 0), 99)) if xgb_model is not None else int(min(max(abs(final_score) * 100, 15), 98))
+
+    beam_level = close_p + (1.8 * atr_val) if direction == "LONG" else close_p - (1.8 * atr_val)
+    base_level = close_p - (1.8 * atr_val) if direction == "LONG" else close_p + (1.8 * atr_val)
+    tp1_val = close_p + (1.0 * atr_val) if direction == "LONG" else close_p - (1.0 * atr_val)
+    tp2_val = beam_level
+    sl_val = close_p - (1.0 * atr_val) if direction == "LONG" else close_p + (1.0 * atr_val)
 
     lock_seconds = tf_minutes * 60
     current_time_sec = int(time.time())
     time_bucket = current_time_sec - (current_time_sec % lock_seconds)
     time_remaining = lock_seconds - (current_time_sec % lock_seconds)
-    
     trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
 
     if paper_trading_mode and direction != "NEUTRAL":
-        existing_trade_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
+        existing_trade_ids = {item.get("trade_id") for item in st.session_state.trade_history_log}
         if trade_id not in existing_trade_ids:
             new_trade = {
                 "trade_id": trade_id,
                 "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_candle_time": candle_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol": selected_symbol,
                 "timeframe": selected_tf_label,
                 "direction": direction,
@@ -315,45 +492,19 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 "stop_loss": round(sl_val, 2),
                 "tp1": round(tp1_val, 2),
                 "tp2": round(tp2_val, 2),
-                "exit_price": round(close_p, 2),
+                "exit_price": None,
                 "confidence": confidence,
+                "xgb_confidence": round(xgb_confidence, 2),
                 "final_score": round(final_score, 3),
                 "outcome": "PENDING",
                 "pnl_percent": 0.0,
                 "duration": "Active",
-                "status": "Open"
+                "status": "Open",
+                "exit_reason": ""
             }
             st.session_state.trade_history_log.insert(0, new_trade)
-            save_persistent_history(st.session_state.trade_history_log)
 
-    for trade in st.session_state.trade_history_log:
-        if trade["outcome"] == "PENDING" and trade["symbol"] == selected_symbol:
-            curr_price = close_p
-            entry = trade["entry_price"]
-            sl = trade["stop_loss"]
-            tp = trade["tp1"]
-            if trade["direction"] == "LONG":
-                if curr_price >= tp:
-                    trade["outcome"] = "WIN"
-                    trade["exit_price"] = curr_price
-                    trade["pnl_percent"] = round(((curr_price - entry) / entry) * 100, 2)
-                    trade["status"] = "Closed"
-                elif curr_price <= sl:
-                    trade["outcome"] = "LOSS"
-                    trade["exit_price"] = curr_price
-                    trade["pnl_percent"] = round(((curr_price - entry) / entry) * 100, 2)
-                    trade["status"] = "Closed"
-            elif trade["direction"] == "SHORT":
-                if curr_price <= tp:
-                    trade["outcome"] = "WIN"
-                    trade["exit_price"] = curr_price
-                    trade["pnl_percent"] = round(((entry - curr_price) / entry) * 100, 2)
-                    trade["status"] = "Closed"
-                elif curr_price >= sl:
-                    trade["outcome"] = "LOSS"
-                    trade["exit_price"] = curr_price
-                    trade["pnl_percent"] = round(((entry - curr_price) / entry) * 100, 2)
-                    trade["status"] = "Closed"
+    # Persist every refresh so a closed trade cannot remain visually pending after rerun.
     save_persistent_history(st.session_state.trade_history_log)
 
     risk_engine = PowerTradingRiskEngine()
@@ -374,7 +525,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     <div class="top-status-bar">
         🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
         TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
+        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
         ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
     </div>
     """, unsafe_allow_html=True)
@@ -542,7 +693,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
 
         st.markdown("##### Detailed Trade History Table")
-        display_cols = ["timestamp", "symbol", "timeframe", "direction", "entry_price", "stop_loss", "tp1", "exit_price", "pnl_percent", "outcome", "confidence"]
+        display_cols = ["timestamp", "symbol", "timeframe", "direction", "entry_price", "stop_loss", "tp1", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
         st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True, height=280)
 
         if st.sidebar.button("Clear Trade History Log"):
