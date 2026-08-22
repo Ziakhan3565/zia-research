@@ -655,8 +655,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             xaxis_rangeslider_visible=False,
             dragmode="pan",
             hovermode="x unified",
-            paper_bgcolor="#111622",
+            paper_bgcolor="#0b0f17",
             plot_bgcolor="#111622",
+            font=dict(color="#e5e7eb"),
             margin=dict(l=10, r=90, t=10, b=10),
             xaxis=dict(
                 showgrid=True,
@@ -780,9 +781,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         fig_obi.update_layout(
             height=190,
             margin=dict(l=0, r=5, t=18, b=0),
-            paper_bgcolor="#111622",
+            paper_bgcolor="#0b0f17",
             plot_bgcolor="#111622",
-            font=dict(size=10),
+            font=dict(size=10, color="#e5e7eb"),
             yaxis=dict(range=[-1, 1], gridcolor="#202938", zeroline=False),
             xaxis=dict(showgrid=False),
             showlegend=False,
