@@ -1,3 +1,6 @@
+
+
+
 import datetime
 import os
 import time
@@ -650,23 +653,22 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         # TradingView-style mouse controls
         # --------------------------------------------------
         fig.update_layout(
-            template="plotly_white",
+            template="plotly_dark",
             height=470,
             xaxis_rangeslider_visible=False,
             dragmode="pan",
             hovermode="x unified",
-            paper_bgcolor="#0b0f17",
-            plot_bgcolor="#FFFFFF",
-            font=dict(color="#e5e7eb"),
+            paper_bgcolor="#111622",
+            plot_bgcolor="#111622",
             margin=dict(l=10, r=90, t=10, b=10),
             xaxis=dict(
                 showgrid=True,
-                gridcolor="#E5E7EB",
+                gridcolor="#202938",
                 rangeslider_visible=False,
             ),
             yaxis=dict(
                 showgrid=True,
-                gridcolor="#E5E7EB",
+                gridcolor="#202938",
                 zeroline=False,
                 fixedrange=False,
                 range=[visible_low, visible_high],
@@ -688,7 +690,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         st.plotly_chart(
             fig,
             use_container_width=True,
-            theme=None,
             config={
                 "displaylogo": False,
                 "scrollZoom": True,
@@ -782,17 +783,16 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         fig_obi.update_layout(
             height=190,
             margin=dict(l=0, r=5, t=18, b=0),
-            paper_bgcolor="#0b0f17",
-            plot_bgcolor="#FFFFFF",
-            font=dict(size=10, color="#e5e7eb"),
-            yaxis=dict(range=[-1, 1], gridcolor="#E5E7EB", zeroline=False),
+            paper_bgcolor="#111622",
+            plot_bgcolor="#111622",
+            font=dict(size=10),
+            yaxis=dict(range=[-1, 1], gridcolor="#202938", zeroline=False),
             xaxis=dict(showgrid=False),
             showlegend=False,
         )
         st.plotly_chart(
             fig_obi,
             use_container_width=True,
-            theme=None,
             config={"displayModeBar": False, "displaylogo": False},
         )
 
