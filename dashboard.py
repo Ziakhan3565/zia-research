@@ -513,6 +513,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
     # ==========================================
+    # ==========================================
     # 9. CHART & MICROSTRUCTURE SECTION
     # ==========================================
     col_chart, col_risk_panel = st.columns([2.5, 1], gap="medium")
@@ -536,6 +537,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
         fig = go.Figure()
 
+        # Existing candles — unchanged
         fig.add_trace(
             go.Candlestick(
                 x=df["Time"],
@@ -549,6 +551,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             )
         )
 
+        # Existing trajectory — unchanged
         fig.add_trace(
             go.Scatter(
                 x=[df["Time"].iloc[-1]] + future_times,
@@ -560,7 +563,34 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             )
         )
 
-        # Existing levels — unchanged
+        # --------------------------------------------------
+        # CLEAN CHART RANGE
+        # Prevent distant TRI levels from shrinking candles.
+        # --------------------------------------------------
+        recent_df = df.tail(min(120, len(df)))
+        chart_low = float(recent_df["Low"].min())
+        chart_high = float(recent_df["High"].max())
+
+        if len(forecast_prices) > 0:
+            chart_low = min(chart_low, float(np.min(forecast_prices)))
+            chart_high = max(chart_high, float(np.max(forecast_prices)))
+
+        # Keep existing BEAM / BASE / SL visible when they are
+        # reasonably close to the active market area.
+        active_levels = [beam_level, base_level, sl_val]
+        for level in active_levels:
+            if chart_low <= level <= chart_high:
+                continue
+            if abs(level - close_p) <= max(close_p * 0.025, (chart_high - chart_low) * 0.50):
+                chart_low = min(chart_low, float(level))
+                chart_high = max(chart_high, float(level))
+
+        chart_span = max(chart_high - chart_low, close_p * 0.005)
+        chart_padding = chart_span * 0.08
+        visible_low = chart_low - chart_padding
+        visible_high = chart_high + chart_padding
+
+        # Existing BEAM / BASE / SL
         fig.add_hline(
             y=beam_level,
             line_dash="dash",
@@ -583,20 +613,42 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             annotation_position="right",
         )
 
-        # TRI lines
+        # --------------------------------------------------
+        # TRI LINES — same ON/OFF authorization
+        # --------------------------------------------------
         if show_tri:
             tri_levels = get_all_tri_levels(selected_symbol)
-            fig = add_tri_lines(fig, tri_levels, tri_enabled)
+            for tri_tf, tri in tri_levels.items():
+                if not tri_enabled.get(tri_tf, True):
+                    continue
 
-        # TradingView-like interaction: mouse wheel zoom + drag pan + reset
-        chart_config = {
-            "scrollZoom": True,
-            "displayModeBar": True,
-            "displaylogo": False,
-            "doubleClick": "reset",
-            "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-        }
+                tri_color = TRI_COLORS.get(tri_tf, "#38bdf8")
 
+                for level_name, width, opacity, dash in [
+                    ("body_50", 3, 0.95, "solid"),
+                    ("upper_50", 1, 0.55, "dot"),
+                    ("lower_50", 1, 0.55, "dot"),
+                ]:
+                    level = float(tri[level_name])
+
+                    # Do not allow far-away TRI levels to distort the chart.
+                    # They can still become visible after zoom/pan if the
+                    # chart is reset/expanded manually.
+                    if level < visible_low or level > visible_high:
+                        continue
+
+                    fig.add_hline(
+                        y=level,
+                        line_color=tri_color,
+                        line_width=width,
+                        line_dash=dash,
+                        opacity=opacity,
+                        layer="above",
+                    )
+
+        # --------------------------------------------------
+        # TradingView-style mouse controls
+        # --------------------------------------------------
         fig.update_layout(
             template="plotly_dark",
             height=470,
@@ -606,19 +658,55 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             paper_bgcolor="#111622",
             plot_bgcolor="#111622",
             margin=dict(l=10, r=90, t=10, b=10),
-            xaxis=dict(showgrid=True, gridcolor="#202938"),
-            yaxis=dict(showgrid=True, gridcolor="#202938", fixedrange=False),
-            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+            xaxis=dict(
+                showgrid=True,
+                gridcolor="#202938",
+                rangeslider_visible=False,
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor="#202938",
+                zeroline=False,
+                fixedrange=False,
+                range=[visible_low, visible_high],
+                autorange=False,
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=1.0,
+                xanchor="right",
+                x=1.0,
+                bgcolor="rgba(17,22,34,0.75)",
+                bordercolor="#202938",
+                borderwidth=1,
+                font=dict(size=10),
+            ),
         )
 
         st.plotly_chart(
             fig,
             use_container_width=True,
-            config=chart_config,
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "doubleClick": "reset+autosize",
+                "modeBarButtonsToAdd": [
+                    "zoom2d",
+                    "pan2d",
+                    "autoScale2d",
+                    "resetScale2d",
+                ],
+                "modeBarButtonsToRemove": [
+                    "lasso2d",
+                    "select2d",
+                    "toImage",
+                ],
+            },
         )
 
     with col_risk_panel:
-        # Compact right-side Market Microstructure panel
+        # Compact right-side Market Microstructure panel — unchanged
         st.subheader("Market Microstructure & OB")
 
         bid_vol_sum = float(np.sum(bids[:, 1])) if len(bids) > 0 else 0.0
