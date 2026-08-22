@@ -30,7 +30,7 @@ def load_persistent_history():
             df_hist = pd.read_csv(CSV_FILE)
             expected_cols = [
                 "trade_id", "timestamp", "symbol", "timeframe", "direction",
-                "entry_price", "stop_loss", "tp1", "tp2", "exit_price",
+                "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
                 "confidence", "xgb_confidence", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
             ]
             for col in expected_cols:
@@ -89,12 +89,28 @@ def build_xgb_features(df, bids, asks):
         "trend_signal": trend_signal,
     }], columns=XGB_FEATURES)
 
+def calculate_ofi(current_bids, current_asks):
+    """Approximate top-20 order-book flow from consecutive snapshots."""
+    prev = st.session_state.get("previous_orderbook")
+    current_bid_sum = float(np.sum(current_bids[:, 1])) if len(current_bids) else 0.0
+    current_ask_sum = float(np.sum(current_asks[:, 1])) if len(current_asks) else 0.0
+    if prev is None:
+        ofi = 0.0
+    else:
+        prev_bid_sum, prev_ask_sum = prev
+        ofi = (current_bid_sum - prev_bid_sum) - (current_ask_sum - prev_ask_sum)
+    st.session_state.previous_orderbook = (current_bid_sum, current_ask_sum)
+    return float(ofi)
+
+
 def normalize_trade(trade):
     trade["outcome"] = str(trade.get("outcome", "PENDING")).upper()
     trade["status"] = "Closed" if trade["outcome"] in ("WIN", "LOSS") else "Open"
     for key in ("entry_price", "stop_loss", "tp1", "tp2"):
         try: trade[key] = float(trade.get(key, 0.0))
         except Exception: trade[key] = 0.0
+    if not trade.get("rr_target"):
+        trade["rr_target"] = "1:2"
     if not trade.get("exit_reason"):
         trade["exit_reason"] = ""
     if not trade.get("entry_candle_time"):
@@ -328,6 +344,8 @@ st.sidebar.markdown("### ⚡ Terminal Controls")
 selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
 selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1)
 forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
+rr_choice = st.sidebar.selectbox("Risk / Reward", ["1:2", "1:3"], index=0)
+rr_multiple = 2.0 if rr_choice == "1:2" else 3.0
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎛️ Paper Trading Mode")
@@ -425,7 +443,7 @@ save_persistent_history(st.session_state.trade_history_log)
 # ==========================================
 if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     lab = TenPaperResearchLab()
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(
+    paper_results, research_score, evolved_weights = lab.calculate_all_signals(
         df, bids, asks, current_inventory=0, performance_history=st.session_state.trade_history_log
     )
 
@@ -438,12 +456,11 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     if np.isnan(atr_val) or atr_val <= 0:
         atr_val = close_p * 0.005
 
-    # ---- XGBoost live prediction: EXACT same 7 features used by train_model.py ----
+    # ----- XGBoost live prediction: same 7 features used during training -----
     xgb_features = build_xgb_features(df, bids, asks)
     xgb_signal = "NEUTRAL"
     xgb_confidence = 0.0
     xgb_prediction = None
-
     if xgb_model is not None:
         try:
             xgb_prediction = int(xgb_model.predict(xgb_features)[0])
@@ -453,24 +470,54 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         except Exception as e:
             xgb_model_error = f"XGBoost prediction error: {e}"
 
-    research_direction = "LONG" if final_score >= 0.15 else ("SHORT" if final_score <= -0.15 else "NEUTRAL")
+    # ----- OBI / OFI confirmation -----
+    bid_vol_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_vol_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum + 1e-8)
+    ofi_val = calculate_ofi(bids, asks)
+    ofi_scale = max(abs(bid_vol_sum) + abs(ask_vol_sum), 1.0)
+    ofi_norm = float(np.clip(ofi_val / ofi_scale, -1.0, 1.0))
+    micro_score = float(np.clip(0.65 * obi_val + 0.35 * ofi_norm, -1.0, 1.0))
+    micro_direction = "LONG" if micro_score >= 0.08 else ("SHORT" if micro_score <= -0.08 else "NEUTRAL")
 
-    # XGBoost is now the primary direction model; Research Lab is a confirmation filter.
-    if xgb_signal != "NEUTRAL" and xgb_confidence >= 55:
-        if research_direction == "NEUTRAL" or research_direction == xgb_signal:
-            direction = xgb_signal
-        else:
-            direction = "NEUTRAL"
+    research_direction = "LONG" if research_score >= 0.15 else ("SHORT" if research_score <= -0.15 else "NEUTRAL")
+    xgb_signed = ((xgb_confidence / 100.0) * (1 if xgb_signal == "LONG" else -1)) if xgb_signal != "NEUTRAL" else 0.0
+
+    # ----- Combined decision engine -----
+    agreement_votes = [d for d in (xgb_signal, research_direction, micro_direction) if d != "NEUTRAL"]
+    long_votes = agreement_votes.count("LONG")
+    short_votes = agreement_votes.count("SHORT")
+
+    combined_score = float(np.clip(0.50 * xgb_signed + 0.30 * research_score + 0.20 * micro_score, -1.0, 1.0))
+    if long_votes >= 2 and combined_score >= 0.15 and xgb_confidence >= 55:
+        direction = "LONG"
+    elif short_votes >= 2 and combined_score <= -0.15 and xgb_confidence >= 55:
+        direction = "SHORT"
     else:
         direction = "NEUTRAL"
 
-    confidence = int(min(max(xgb_confidence, 0), 99)) if xgb_model is not None else int(min(max(abs(final_score) * 100, 15), 98))
+    confidence = int(np.clip(abs(combined_score) * 100.0, 0, 99))
 
-    beam_level = close_p + (1.8 * atr_val) if direction == "LONG" else close_p - (1.8 * atr_val)
-    base_level = close_p - (1.8 * atr_val) if direction == "LONG" else close_p + (1.8 * atr_val)
-    tp1_val = close_p + (1.0 * atr_val) if direction == "LONG" else close_p - (1.0 * atr_val)
-    tp2_val = beam_level
-    sl_val = close_p - (1.0 * atr_val) if direction == "LONG" else close_p + (1.0 * atr_val)
+    # ----- ATR based SL and selectable 1:2 / 1:3 target -----
+    risk_distance = max(float(atr_val), close_p * 0.001)
+    if direction == "LONG":
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * rr_multiple)
+        tp2_val = close_p + (risk_distance * rr_multiple * 1.5)
+    elif direction == "SHORT":
+        sl_val = close_p + risk_distance
+        tp1_val = close_p - (risk_distance * rr_multiple)
+        tp2_val = close_p - (risk_distance * rr_multiple * 1.5)
+    else:
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * rr_multiple)
+        tp2_val = close_p + (risk_distance * rr_multiple * 1.5)
+
+    actual_risk = abs(close_p - sl_val)
+    actual_reward = abs(tp1_val - close_p)
+    actual_rr = actual_reward / actual_risk if actual_risk > 0 else 0.0
+    beam_level = tp2_val
+    base_level = sl_val
 
     lock_seconds = tf_minutes * 60
     current_time_sec = int(time.time())
@@ -492,10 +539,11 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
                 "stop_loss": round(sl_val, 2),
                 "tp1": round(tp1_val, 2),
                 "tp2": round(tp2_val, 2),
+                "rr_target": rr_choice,
                 "exit_price": None,
                 "confidence": confidence,
                 "xgb_confidence": round(xgb_confidence, 2),
-                "final_score": round(final_score, 3),
+                "final_score": round(combined_score, 3),
                 "outcome": "PENDING",
                 "pnl_percent": 0.0,
                 "duration": "Active",
@@ -525,7 +573,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     <div class="top-status-bar">
         🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
         TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
+        Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
         ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
     </div>
     """, unsafe_allow_html=True)
@@ -549,7 +597,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">BEAM Target</div><div class="metric-val-blue">${beam_level:,.2f}</div></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-card"><div class="metric-label">BASE Target</div><div class="metric-val-red">${base_level:,.2f}</div></div>', unsafe_allow_html=True)
     with col_m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">1 : 2.15</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">1 : {actual_rr:.0f}</div><div style="font-size:10px;color:#8b949e;">Target: {rr_choice}</div></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-card"><div class="metric-label">Signal Strength</div><div class="metric-val-green">HIGH</div></div>', unsafe_allow_html=True)
     with col_m3:
         st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
@@ -693,7 +741,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
 
         st.markdown("##### Detailed Trade History Table")
-        display_cols = ["timestamp", "symbol", "timeframe", "direction", "entry_price", "stop_loss", "tp1", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
+        display_cols = ["timestamp", "symbol", "timeframe", "direction", "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
         st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True, height=280)
 
         if st.sidebar.button("Clear Trade History Log"):
