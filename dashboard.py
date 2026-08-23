@@ -625,6 +625,24 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
 
     confidence = int(np.clip(abs(combined_score) * 100.0, 0, 99))
 
+    # ----- Signal strength / high-confluence labels -----
+    # Keep direction as LONG/SHORT/NEUTRAL internally so TP/SL and trade tracking
+    # continue to work. The stronger label is a presentation/quality layer.
+    if direction == "LONG":
+        if (xgb_confidence >= 80.0 and long_votes >= 4 and
+                combined_score >= 0.45 and trend_direction != "SHORT"):
+            signal_strength = "STRONG LONG"
+        else:
+            signal_strength = "LONG"
+    elif direction == "SHORT":
+        if (xgb_confidence >= 80.0 and short_votes >= 4 and
+                combined_score <= -0.45 and trend_direction != "LONG"):
+            signal_strength = "STRONG SELL"
+        else:
+            signal_strength = "SHORT"
+    else:
+        signal_strength = "WAIT"
+
     # ----- ATR based SL and selectable 1:2 / 1:3 target -----
     risk_distance = max(float(atr_val), close_p * 0.001)
     if direction == "LONG":
@@ -662,6 +680,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
                 "symbol": selected_symbol,
                 "timeframe": selected_tf_label,
                 "direction": direction,
+                "signal_strength": signal_strength,
                 "entry_price": round(close_p, 2),
                 "stop_loss": round(sl_val, 2),
                 "tp1": round(tp1_val, 2),
@@ -695,12 +714,13 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     # 7. TOP HEADER STATUS BAR
     # ==========================================
     dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    signal_color = "#00e676" if signal_strength == "STRONG LONG" else ("#ff5252" if signal_strength == "STRONG SELL" else dir_color)
     mins_rem, secs_rem = divmod(time_remaining, 60)
 
     st.markdown(f"""
     <div class="top-status-bar">
         🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
-        TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
+        TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{signal_color};">{signal_strength}</span> &nbsp;|&nbsp; 
         Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Trend: <b>{trend_direction}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
         ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
     </div>
@@ -715,7 +735,8 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f"""
         <div class="metric-card" style="border-left: 4px solid {dir_color};">
             <div class="metric-label">Signal Execution Panel</div>
-            <div style="font-size:22px; font-weight:700; color:{dir_color};">{direction}</div>
+            <div style="font-size:22px; font-weight:700; color:{signal_color};">{signal_strength}</div>
+            <div style="font-size:10px; color:#8b949e; margin-top:3px;">Direction: {direction} | XGB: {xgb_confidence:.1f}% | Votes: {long_votes if direction == "LONG" else short_votes}/4</div>
             <div style="font-size:11px; color:#8b949e; margin-top:4px;">Entry: ${close_p:,.2f} | SL: ${sl_val:,.2f}</div>
             <div style="font-size:11px; color:#38bdf8;">TP1: ${tp1_val:,.2f} | TP2: ${tp2_val:,.2f}</div>
         </div>
@@ -869,7 +890,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
 
         st.markdown("##### Detailed Trade History Table")
-        display_cols = ["timestamp", "symbol", "timeframe", "direction", "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
+        display_cols = ["timestamp", "symbol", "timeframe", "direction", "signal_strength", "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
         st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True, height=280)
 
         if st.sidebar.button("Clear Trade History Log"):
