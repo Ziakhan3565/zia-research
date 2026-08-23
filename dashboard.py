@@ -313,109 +313,126 @@ def fetch_order_book_depth(symbol, depth_limit=20):
 df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
 
-
 # ==========================================
-# 6. ENGINE EXECUTION & SIGNAL GENERATION
+# 6. ENGINE EXECUTION & SIGNAL GENERATION (FIXED)
 # ==========================================
 if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
-    lab = TenPaperResearchLab()
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(df, bids, asks)
+  lab = TenPaperResearchLab()
+  paper_results, final_score, evolved_weights = lab.calculate_all_signals(
+      df, bids, asks
+  )
 
-    close_p = df["Close"].iloc[-1]
-    atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
-    if np.isnan(atr_val): 
-        atr_val = close_p * 0.005
+  close_p = df["Close"].iloc[-1]
+  atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+  if np.isnan(atr_val):
+    atr_val = close_p * 0.005
 
-    direction = "LONG" if final_score >= 0.12 else ("SHORT" if final_score <= -0.12 else "NEUTRAL")
-    confidence = int(min(max(abs(final_score) * 100, 20), 99))
+  direction = (
+      "LONG"
+      if final_score >= 0.12
+      else ("SHORT" if final_score <= -0.12 else "NEUTRAL")
+  )
+  confidence = int(min(max(abs(final_score) * 100, 20), 99))
 
-    risk_distance = 1.5 * atr_val
+  # Proper 1:2 and 1:3 Risk/Reward Target & Stop Loss Calculation
+  risk_distance = 1.5 * atr_val
 
-    if direction == "LONG":
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
-    elif direction == "SHORT":
-        sl_val = close_p + risk_distance
-        tp1_val = close_p - (2.0 * risk_distance)
-        tp2_val = close_p - (3.0 * risk_distance)
-    else:
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
+  if direction == "LONG":
+    sl_val = close_p - risk_distance
+    tp1_val = close_p + (2.0 * risk_distance)  # 1:2 Ratio
+    tp2_val = close_p + (3.0 * risk_distance)  # 1:3 Ratio
+  elif direction == "SHORT":
+    sl_val = close_p + risk_distance
+    tp1_val = close_p - (2.0 * risk_distance)  # 1:2 Ratio
+    tp2_val = close_p - (3.0 * risk_distance)  # 1:3 Ratio
+  else:
+    sl_val = close_p - risk_distance
+    tp1_val = close_p + (2.0 * risk_distance)
+    tp2_val = close_p + (3.0 * risk_distance)
 
-    lock_seconds = tf_minutes * 60
-    current_time_sec = int(time.time())
-    time_bucket = current_time_sec - (current_time_sec % lock_seconds)
-    time_remaining = lock_seconds - (current_time_sec % lock_seconds)
-    
-    trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
+  lock_seconds = tf_minutes * 60
+  current_time_sec = int(time.time())
+  time_bucket = current_time_sec - (current_time_sec % lock_seconds)
+  time_remaining = lock_seconds - (current_time_sec % lock_seconds)
 
-    if paper_trading_mode and direction != "NEUTRAL":
-        existing_trade_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
-        if trade_id not in existing_trade_ids:
-            new_trade = {
-                "trade_id": trade_id,
-                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "symbol": selected_symbol,
-                "timeframe": selected_tf_label,
-                "direction": direction,
-                "entry_price": round(close_p, 4),
-                "stop_loss": round(sl_val, 4),
-                "tp1": round(tp1_val, 4),
-                "tp2": round(tp2_val, 4),
-                "exit_price": round(close_p, 4),
-                "confidence": confidence,
-                "final_score": round(final_score, 3),
-                "outcome": "PENDING",
-                "pnl_percent": 0.0,
-                "duration": "Active",
-                "status": "Open"
-            }
-            st.session_state.trade_history_log.insert(0, new_trade)
-            save_persistent_history(st.session_state.trade_history_log)
+  trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
 
-    for trade in st.session_state.trade_history_log:
-        if trade["outcome"] == "PENDING":
-            trade_symbol = trade["symbol"]
-            temp_df = fetch_klines_data(trade_symbol, trade["timeframe"], limit=10)
-            if not temp_df.empty:
-                historical_candles = temp_df.iloc[:-1] if len(temp_df) > 1 else temp_df
-                for idx, row in historical_candles.iterrows():
-                    curr_high = row["High"]
-                    curr_low = row["Low"]
-                    
-                    entry = trade["entry_price"]
-                    sl = trade["stop_loss"]
-                    tp = trade["tp1"]
-                    
-                    if trade["direction"] == "LONG":
-                        if curr_high >= tp:
-                            trade["outcome"] = "WIN"
-                            trade["exit_price"] = tp
-                            trade["pnl_percent"] = round(((tp - entry) / entry) * 100, 2)
-                            trade["status"] = "Closed"
-                            break
-                        elif curr_low <= sl:
-                            trade["outcome"] = "LOSS"
-                            trade["exit_price"] = sl
-                            trade["pnl_percent"] = round(((sl - entry) / entry) * 100, 2)
-                            trade["status"] = "Closed"
-                            break
-                    elif trade["direction"] == "SHORT":
-                        if curr_low <= tp:
-                            trade["outcome"] = "WIN"
-                            trade["exit_price"] = tp
-                            trade["pnl_percent"] = round(((entry - tp) / entry) * 100, 2)
-                            trade["status"] = "Closed"
-                            break
-                        elif curr_high >= sl:
-                            trade["outcome"] = "LOSS"
-                            trade["exit_price"] = sl
-                            trade["pnl_percent"] = round(((entry - sl) / entry) * 100, 2)
-                            trade["status"] = "Closed"
-                            break
-                    
+  # New Trade Entry Log
+  if paper_trading_mode and direction != "NEUTRAL":
+    existing_trade_ids = [
+        item.get("trade_id") for item in st.session_state.trade_history_log
+    ]
+    if trade_id not in existing_trade_ids:
+      new_trade = {
+          "trade_id": trade_id,
+          "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+          "symbol": selected_symbol,
+          "timeframe": selected_tf_label,
+          "direction": direction,
+          "entry_price": round(close_p, 4),
+          "stop_loss": round(sl_val, 4),
+          "tp1": round(tp1_val, 4),
+          "tp2": round(tp2_val, 4),
+          "exit_price": round(close_p, 4),
+          "confidence": confidence,
+          "final_score": round(final_score, 3),
+          "outcome": "PENDING",  # Shuru mein PENDING rahegi
+          "pnl_percent": 0.0,
+          "duration": "Active",
+          "status": "Open",
+          "entry_timestamp_sec": time.time(),  # Time tracking for realistic outcome evaluation
+      }
+      st.session_state.trade_history_log.insert(0, new_trade)
+      save_persistent_history(st.session_state.trade_history_log)
+
+  # Safe Trade Outcome Evaluation (Sirf aage wali price action par check hoga)
+  for trade in st.session_state.trade_history_log:
+    if trade["outcome"] == "PENDING":
+      trade_symbol = trade["symbol"]
+      temp_df = fetch_klines_data(trade_symbol, trade["timeframe"], limit=15)
+      if not temp_df.empty:
+        # Sirf woh candles jo trade enter hone ke baad ki hain
+        entry_time_str = trade.get("timestamp")
+
+        for idx, row in temp_df.iterrows():
+          candle_time = str(row["Time"])
+          # Agar candle entry time ke baad ki hai tabhi outcome check karo
+          if entry_time_str and candle_time >= entry_time_str:
+            curr_high = row["High"]
+            curr_low = row["Low"]
+
+            entry = trade["entry_price"]
+            sl = trade["stop_loss"]
+            tp = trade["tp1"]
+
+            if trade["direction"] == "LONG":
+              if curr_high >= tp:
+                trade["outcome"] = "WIN"
+                trade["exit_price"] = tp
+                trade["pnl_percent"] = round(((tp - entry) / entry) * 100, 2)
+                trade["status"] = "Closed"
+                break
+              elif curr_low <= sl:
+                trade["outcome"] = "LOSS"
+                trade["exit_price"] = sl
+                trade["pnl_percent"] = round(((sl - entry) / entry) * 100, 2)
+                trade["status"] = "Closed"
+                break
+            elif trade["direction"] == "SHORT":
+              if curr_low <= tp:
+                trade["outcome"] = "WIN"
+                trade["exit_price"] = tp
+                trade["pnl_percent"] = round(((entry - tp) / entry) * 100, 2)
+                trade["status"] = "Closed"
+                break
+              elif curr_high >= sl:
+                trade["outcome"] = "LOSS"
+                trade["exit_price"] = sl
+                trade["pnl_percent"] = round(((entry - sl) / entry) * 100, 2)
+                trade["status"] = "Closed"
+                break
+
+  save_persistent_history(st.session_state.trade_history_log)
     save_persistent_history(st.session_state.trade_history_log)
 
     closed_count = len([t for t in st.session_state.trade_history_log if t["outcome"] in ["WIN", "LOSS"]])
