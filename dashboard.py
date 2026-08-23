@@ -890,8 +890,27 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
 
         st.markdown("##### Detailed Trade History Table")
-        display_cols = ["timestamp", "symbol", "timeframe", "direction", "signal_strength", "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price", "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"]
-        st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True, height=280)
+        display_cols = [
+            "timestamp", "symbol", "timeframe", "direction", "signal_strength",
+            "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
+            "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"
+        ]
+
+        # Backward compatibility: older signal_history.csv files do not contain
+        # columns introduced by newer dashboard versions. Never let a missing
+        # history column crash the whole Streamlit app.
+        default_values = {
+            "timestamp": "", "symbol": "", "timeframe": "", "direction": "",
+            "signal_strength": "", "entry_price": 0.0, "stop_loss": 0.0,
+            "tp1": 0.0, "tp2": 0.0, "rr_target": "1:2", "exit_price": 0.0,
+            "pnl_percent": 0.0, "outcome": "PENDING", "confidence": 0.0,
+            "xgb_confidence": 0.0, "exit_reason": ""
+        }
+        for col in display_cols:
+            if col not in filtered_df.columns:
+                filtered_df[col] = default_values[col]
+
+        st.dataframe(filtered_df.loc[:, display_cols], use_container_width=True, hide_index=True, height=280)
 
         if st.sidebar.button("Clear Trade History Log"):
             st.session_state.trade_history_log = []
