@@ -3,8 +3,6 @@ pandas
 numpy
 plotly
 requests
-ccxt
 streamlit-autorefresh
-scikit-learn
 xgboost
-joblib
+scikit-learn
