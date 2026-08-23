@@ -6,6 +6,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import joblib
+import json
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh  # <-- 1. Yahan library import ki hai
@@ -31,7 +34,7 @@ def load_persistent_history():
             expected_cols = [
                 "trade_id", "timestamp", "symbol", "timeframe", "direction",
                 "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
-                "confidence", "xgb_confidence", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
+                "confidence", "xgb_confidence", "xgb_features_json", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
             ]
             for col in expected_cols:
                 if col not in df_hist.columns:
@@ -69,6 +72,88 @@ XGB_FEATURES = [
     "top20_bid_sum", "top20_ask_sum", "obi_top20", "spread",
     "bid_ask_ratio", "total_depth", "trend_signal"
 ]
+
+# Controlled online-learning settings. XGBoost is retrained periodically from
+# completed paper trades; it is never changed after every single tick/trade.
+FEEDBACK_FILE = "xgb_trade_feedback.csv"
+MIN_FEEDBACK_TO_RETRAIN = 30
+RETRAIN_EVERY = 10
+MIN_TEST_ACCURACY = 0.55
+
+def _load_feedback():
+    if not os.path.exists(FEEDBACK_FILE):
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+    try:
+        fb = pd.read_csv(FEEDBACK_FILE)
+        for c in XGB_FEATURES + ["target"]:
+            if c not in fb.columns:
+                return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+        return fb.dropna(subset=XGB_FEATURES + ["target"]).copy()
+    except Exception:
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+
+def _append_feedback(trade):
+    raw = trade.get("xgb_features_json", "")
+    if not raw or str(trade.get("outcome", "")).upper() not in ("WIN", "LOSS"):
+        return
+    try:
+        features = json.loads(raw) if isinstance(raw, str) else raw
+        row = {k: float(features[k]) for k in XGB_FEATURES}
+        direction = str(trade.get("direction", "")).upper()
+        outcome = str(trade.get("outcome", "")).upper()
+        # Target means: which entry direction would have reached TP before SL?
+        # WIN LONG=1, LOSS LONG=0; WIN SHORT=0, LOSS SHORT=1.
+        row["target"] = int((direction == "LONG") == (outcome == "WIN"))
+        row["trade_id"] = trade.get("trade_id", "")
+        row["closed_at"] = trade.get("exit_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        fb = _load_feedback()
+        if str(row["trade_id"]) in set(fb.get("trade_id", pd.Series(dtype=str)).astype(str)):
+            return
+        fb = pd.concat([fb, pd.DataFrame([row])], ignore_index=True)
+        fb.to_csv(FEEDBACK_FILE, index=False)
+    except Exception:
+        pass
+
+def _retrain_xgb_from_feedback(current_model):
+    """Train a candidate on completed trade outcomes and replace only if it passes a time-ordered holdout test."""
+    fb = _load_feedback()
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or fb["target"].nunique() < 2:
+        return current_model, None
+
+    # Retrain only at 30, 40, 50... completed examples.
+    last_count = int(st.session_state.get("xgb_last_retrain_count", 0))
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or len(fb) < last_count + RETRAIN_EVERY:
+        return current_model, None
+
+    fb = fb.sort_values("closed_at", kind="stable")
+    split = max(int(len(fb) * 0.80), 1)
+    if split >= len(fb):
+        return current_model, None
+    X_train, X_test = fb.iloc[:split][XGB_FEATURES], fb.iloc[split:][XGB_FEATURES]
+    y_train, y_test = fb.iloc[:split]["target"].astype(int), fb.iloc[split:]["target"].astype(int)
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        return current_model, None
+
+    candidate = XGBClassifier(
+        n_estimators=180, learning_rate=0.03, max_depth=3,
+        min_child_weight=2, subsample=0.90, colsample_bytree=0.90,
+        reg_lambda=1.5, random_state=42, eval_metric="logloss",
+        n_jobs=2
+    )
+    candidate.fit(X_train, y_train)
+    test_acc = float(accuracy_score(y_test, candidate.predict(X_test)))
+
+    # A simple direction-quality gate: don't replace the model with a candidate
+    # that cannot beat a 55% chronological holdout.
+    if test_acc < MIN_TEST_ACCURACY:
+        st.session_state.xgb_last_retrain_count = len(fb)
+        return current_model, f"XGB retrain rejected: holdout accuracy {test_acc*100:.1f}% < {MIN_TEST_ACCURACY*100:.0f}%"
+
+    tmp_path = MODEL_PATH + ".tmp"
+    joblib.dump(candidate, tmp_path)
+    os.replace(tmp_path, MODEL_PATH)
+    st.session_state.xgb_last_retrain_count = len(fb)
+    return candidate, f"XGB retrained from {len(fb)} completed trades | holdout accuracy {test_acc*100:.1f}%"
 
 def build_xgb_features(df, bids, asks):
     bid_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
@@ -115,6 +200,8 @@ def normalize_trade(trade):
         trade["exit_reason"] = ""
     if not trade.get("entry_candle_time"):
         trade["entry_candle_time"] = trade.get("timestamp", "")
+    if "xgb_features_json" not in trade:
+        trade["xgb_features_json"] = ""
     return trade
 
 st.session_state.trade_history_log = [normalize_trade(t) for t in st.session_state.trade_history_log]
@@ -174,6 +261,7 @@ def resolve_pending_trades(history, symbol, timeframe, current_candle_time, cand
         trade["duration"] = "Closed"
         trade["exit_reason"] = reason
         trade["exit_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append_feedback(trade)
         changed = True
     return changed
 
@@ -358,6 +446,11 @@ else:
     if xgb_model_error:
         st.sidebar.caption(xgb_model_error)
 
+feedback_count = len(_load_feedback())
+st.sidebar.caption(f"Auto-learning feedback: {feedback_count} completed trades")
+if st.session_state.get("xgb_retrain_message"):
+    st.sidebar.info(st.session_state["xgb_retrain_message"])
+
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
@@ -437,6 +530,14 @@ resolve_all_pending_trades(
 )
 save_persistent_history(st.session_state.trade_history_log)
 
+# Controlled automatic learning from completed TP/SL trades.
+try:
+    xgb_model, retrain_message = _retrain_xgb_from_feedback(xgb_model)
+    if retrain_message:
+        st.session_state.xgb_retrain_message = retrain_message
+except Exception as _retrain_err:
+    st.session_state.xgb_retrain_message = f"XGB retrain skipped: {_retrain_err}"
+
 
 # ==========================================
 # 6. ENGINE EXECUTION & SIGNAL GENERATION
@@ -483,18 +584,44 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     research_direction = "LONG" if research_score >= 0.15 else ("SHORT" if research_score <= -0.15 else "NEUTRAL")
     xgb_signed = ((xgb_confidence / 100.0) * (1 if xgb_signal == "LONG" else -1)) if xgb_signal != "NEUTRAL" else 0.0
 
-    # ----- Combined decision engine -----
-    agreement_votes = [d for d in (xgb_signal, research_direction, micro_direction) if d != "NEUTRAL"]
+    # ----- Independent trend confirmation for direction quality -----
+    ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = df["Close"].ewm(span=21, adjust=False).mean().iloc[-1]
+    momentum5 = float(df["Close"].iloc[-1] / (df["Close"].iloc[-6] + 1e-8) - 1.0) if len(df) >= 6 else 0.0
+    trend_score = float(np.clip(((ema9 - ema21) / (close_p + 1e-8)) * 250.0 + np.sign(momentum5) * min(abs(momentum5) * 1000.0, 0.5), -1.0, 1.0))
+    trend_direction = "LONG" if trend_score >= 0.10 else ("SHORT" if trend_score <= -0.10 else "NEUTRAL")
+
+    # ----- Conservative combined decision engine -----
+    # XGB must have meaningful confidence and must not directly conflict with
+    # both research and microstructure. Trend is an additional quality gate.
+    agreement_votes = [d for d in (xgb_signal, research_direction, micro_direction, trend_direction) if d != "NEUTRAL"]
     long_votes = agreement_votes.count("LONG")
     short_votes = agreement_votes.count("SHORT")
 
-    combined_score = float(np.clip(0.50 * xgb_signed + 0.30 * research_score + 0.20 * micro_score, -1.0, 1.0))
-    if long_votes >= 2 and combined_score >= 0.15 and xgb_confidence >= 55:
+    combined_score = float(np.clip(
+        0.45 * xgb_signed + 0.25 * research_score + 0.20 * micro_score + 0.10 * trend_score,
+        -1.0, 1.0
+    ))
+
+    xgb_conf_ok = xgb_confidence >= 60.0
+    long_confirmed = (xgb_signal == "LONG" and research_direction == "LONG" and
+                      micro_direction == "LONG" and trend_direction != "SHORT")
+    short_confirmed = (xgb_signal == "SHORT" and research_direction == "SHORT" and
+                       micro_direction == "SHORT" and trend_direction != "LONG")
+
+    if long_confirmed and xgb_conf_ok and combined_score >= 0.18:
         direction = "LONG"
-    elif short_votes >= 2 and combined_score <= -0.15 and xgb_confidence >= 55:
+    elif short_confirmed and xgb_conf_ok and combined_score <= -0.18:
         direction = "SHORT"
     else:
-        direction = "NEUTRAL"
+        # Fallback: allow 3-of-4 agreement only when the XGB direction is
+        # included and trend is not actively against the trade.
+        if xgb_signal == "LONG" and xgb_confidence >= 65 and long_votes >= 3 and trend_direction != "SHORT" and combined_score >= 0.18:
+            direction = "LONG"
+        elif xgb_signal == "SHORT" and xgb_confidence >= 65 and short_votes >= 3 and trend_direction != "LONG" and combined_score <= -0.18:
+            direction = "SHORT"
+        else:
+            direction = "NEUTRAL"
 
     confidence = int(np.clip(abs(combined_score) * 100.0, 0, 99))
 
@@ -543,6 +670,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
                 "exit_price": None,
                 "confidence": confidence,
                 "xgb_confidence": round(xgb_confidence, 2),
+                "xgb_features_json": json.dumps({k: float(xgb_features.iloc[0][k]) for k in XGB_FEATURES}),
                 "final_score": round(combined_score, 3),
                 "outcome": "PENDING",
                 "pnl_percent": 0.0,
@@ -573,7 +701,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     <div class="top-status-bar">
         🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
         TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
+        Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Trend: <b>{trend_direction}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
         ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
     </div>
     """, unsafe_allow_html=True)
@@ -598,7 +726,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">BASE Target</div><div class="metric-val-red">${base_level:,.2f}</div></div>', unsafe_allow_html=True)
     with col_m2:
         st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">1 : {actual_rr:.0f}</div><div style="font-size:10px;color:#8b949e;">Target: {rr_choice}</div></div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Signal Strength</div><div class="metric-val-green">HIGH</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Direction Quality</div><div class="metric-val-green">{confidence}%</div><div style="font-size:10px;color:#8b949e;">XGB + Research + OBI/OFI + Trend</div></div>', unsafe_allow_html=True)
     with col_m3:
         st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>', unsafe_allow_html=True)
@@ -748,6 +876,9 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
             st.session_state.trade_history_log = []
             if os.path.exists(CSV_FILE):
                 os.remove(CSV_FILE)
+            if os.path.exists(FEEDBACK_FILE):
+                os.remove(FEEDBACK_FILE)
+            st.session_state.xgb_last_retrain_count = 0
             st.rerun()
     else:
         st.info("No paper trade history recorded yet. Signals will automatically log when active.")
