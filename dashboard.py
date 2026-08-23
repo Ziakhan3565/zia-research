@@ -432,8 +432,12 @@ st.sidebar.markdown("### ⚡ Terminal Controls")
 selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
 selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1)
 forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
-rr_choice = st.sidebar.selectbox("Risk / Reward", ["1:2", "1:3"], index=0)
-rr_multiple = 2.0 if rr_choice == "1:2" else 3.0
+rr_choice = "TP1 1:2 | TP2 1:3"
+st.sidebar.markdown("**Risk / Reward Targets**")
+st.sidebar.info("TP1 = 1:2  •  TP2 = 1:3")
+rr_multiple = 2.0
+tp1_rr_multiple = 2.0
+tp2_rr_multiple = 3.0
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎛️ Paper Trading Mode")
@@ -643,24 +647,26 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
     else:
         signal_strength = "WAIT"
 
-    # ----- ATR based SL and selectable 1:2 / 1:3 target -----
+    # ----- ATR based SL with fixed targets: TP1 = 1:2, TP2 = 1:3 -----
     risk_distance = max(float(atr_val), close_p * 0.001)
     if direction == "LONG":
         sl_val = close_p - risk_distance
-        tp1_val = close_p + (risk_distance * rr_multiple)
-        tp2_val = close_p + (risk_distance * rr_multiple * 1.5)
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
     elif direction == "SHORT":
         sl_val = close_p + risk_distance
-        tp1_val = close_p - (risk_distance * rr_multiple)
-        tp2_val = close_p - (risk_distance * rr_multiple * 1.5)
+        tp1_val = close_p - (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p - (risk_distance * tp2_rr_multiple)
     else:
         sl_val = close_p - risk_distance
-        tp1_val = close_p + (risk_distance * rr_multiple)
-        tp2_val = close_p + (risk_distance * rr_multiple * 1.5)
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
 
     actual_risk = abs(close_p - sl_val)
-    actual_reward = abs(tp1_val - close_p)
-    actual_rr = actual_reward / actual_risk if actual_risk > 0 else 0.0
+    tp1_reward = abs(tp1_val - close_p)
+    tp2_reward = abs(tp2_val - close_p)
+    actual_rr = tp1_reward / actual_risk if actual_risk > 0 else 0.0
+    tp2_rr = tp2_reward / actual_risk if actual_risk > 0 else 0.0
     beam_level = tp2_val
     base_level = sl_val
 
@@ -685,7 +691,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
                 "stop_loss": round(sl_val, 2),
                 "tp1": round(tp1_val, 2),
                 "tp2": round(tp2_val, 2),
-                "rr_target": rr_choice,
+                "rr_target": "TP1 1:2 | TP2 1:3",
                 "exit_price": None,
                 "confidence": confidence,
                 "xgb_confidence": round(xgb_confidence, 2),
@@ -746,7 +752,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         st.markdown(f'<div class="metric-card"><div class="metric-label">BEAM Target</div><div class="metric-val-blue">${beam_level:,.2f}</div></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-card"><div class="metric-label">BASE Target</div><div class="metric-val-red">${base_level:,.2f}</div></div>', unsafe_allow_html=True)
     with col_m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">1 : {actual_rr:.0f}</div><div style="font-size:10px;color:#8b949e;">Target: {rr_choice}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">TP1 1 : 2 &nbsp;|&nbsp; TP2 1 : 3</div><div style="font-size:10px;color:#8b949e;">Fixed targets: 2R / 3R</div></div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-card"><div class="metric-label">Direction Quality</div><div class="metric-val-green">{confidence}%</div><div style="font-size:10px;color:#8b949e;">XGB + Research + OBI/OFI + Trend</div></div>', unsafe_allow_html=True)
     with col_m3:
         st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
@@ -902,7 +908,7 @@ if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
         default_values = {
             "timestamp": "", "symbol": "", "timeframe": "", "direction": "",
             "signal_strength": "", "entry_price": 0.0, "stop_loss": 0.0,
-            "tp1": 0.0, "tp2": 0.0, "rr_target": "1:2", "exit_price": 0.0,
+            "tp1": 0.0, "tp2": 0.0, "rr_target": "TP1 1:2 | TP2 1:3", "exit_price": 0.0,
             "pnl_percent": 0.0, "outcome": "PENDING", "confidence": 0.0,
             "xgb_confidence": 0.0, "exit_reason": ""
         }
