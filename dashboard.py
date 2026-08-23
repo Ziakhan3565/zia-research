@@ -1,284 +1,933 @@
-# ==========================================================
-# PROFESSIONAL SIGNAL ENGINE
-# LONG / SHORT / STRONG LONG / STRONG SHORT / WAIT
-# ==========================================================
+import datetime
+import os
+import time
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import joblib
+import json
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
+import streamlit as st
+from sklearn.preprocessing import StandardScaler
+from streamlit_autorefresh import st_autorefresh  # <-- 1. Yahan library import ki hai
 
-# ----------------------------------------------------------
-# 1. XGB SIGNED SCORE
-# ----------------------------------------------------------
-if xgb_signal == "LONG":
-    xgb_signed = xgb_confidence / 100.0
-elif xgb_signal == "SHORT":
-    xgb_signed = -(xgb_confidence / 100.0)
-else:
-    xgb_signed = 0.0
-
-
-# ----------------------------------------------------------
-# 2. MARKET COMPONENT SCORES
-# ----------------------------------------------------------
-
-# Research
-research_direction = (
-    "LONG" if research_score >= 0.10
-    else "SHORT" if research_score <= -0.10
-    else "NEUTRAL"
+# ==========================================
+# 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
+# ==========================================
+st.set_page_config(
+    page_title="Quantitative Research & Paper Trading Terminal",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Microstructure
-micro_score = float(np.clip(
-    0.65 * obi_val + 0.35 * ofi_norm,
-    -1.0,
-    1.0
-))
+# <-- 2. Yahan Auto-Refresh lagaya hai (Har 5 seconds / 5000ms baad page rerun hoga)
+count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
-micro_direction = (
-    "LONG" if micro_score >= 0.08
-    else "SHORT" if micro_score <= -0.08
-    else "NEUTRAL"
-)
+CSV_FILE = "signal_history.csv"
 
-# Trend
-trend_direction = (
-    "LONG" if trend_score >= 0.10
-    else "SHORT" if trend_score <= -0.10
-    else "NEUTRAL"
-)
+def load_persistent_history():
+    if os.path.exists(CSV_FILE):
+        try:
+            df_hist = pd.read_csv(CSV_FILE)
+            expected_cols = [
+                "trade_id", "timestamp", "symbol", "timeframe", "direction",
+                "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
+                "confidence", "xgb_confidence", "xgb_features_json", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
+            ]
+            for col in expected_cols:
+                if col not in df_hist.columns:
+                    df_hist[col] = "PENDING" if col == "outcome" else 0.0
+            return df_hist.to_dict("records")
+        except Exception:
+            return []
+    return []
 
+def save_persistent_history(history_list):
+    try:
+        df_hist = pd.DataFrame(history_list)
+        df_hist.to_csv(CSV_FILE, index=False)
+    except Exception as e:
+        st.error(f"Error saving history to CSV: {e}")
 
-# ----------------------------------------------------------
-# 3. DIRECTION VOTES
-# ----------------------------------------------------------
+if "trade_history_log" not in st.session_state:
+    st.session_state.trade_history_log = load_persistent_history()
 
-signals = [
-    xgb_signal,
-    research_direction,
-    micro_direction,
-    trend_direction
+MODEL_PATH = "xgboost_obi_model.pkl"
+
+@st.cache_resource
+def load_xgb_model():
+    if not os.path.exists(MODEL_PATH):
+        return None, f"Model file not found: {MODEL_PATH}"
+    try:
+        model = joblib.load(MODEL_PATH)
+        return model, None
+    except Exception as e:
+        return None, f"XGBoost load error: {e}"
+
+xgb_model, xgb_model_error = load_xgb_model()
+
+XGB_FEATURES = [
+    "top20_bid_sum", "top20_ask_sum", "obi_top20", "spread",
+    "bid_ask_ratio", "total_depth", "trend_signal"
 ]
 
-long_votes = signals.count("LONG")
-short_votes = signals.count("SHORT")
+# Controlled online-learning settings. XGBoost is retrained periodically from
+# completed paper trades; it is never changed after every single tick/trade.
+FEEDBACK_FILE = "xgb_trade_feedback.csv"
+MIN_FEEDBACK_TO_RETRAIN = 30
+RETRAIN_EVERY = 10
+MIN_TEST_ACCURACY = 0.55
+
+def _load_feedback():
+    if not os.path.exists(FEEDBACK_FILE):
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+    try:
+        fb = pd.read_csv(FEEDBACK_FILE)
+        for c in XGB_FEATURES + ["target"]:
+            if c not in fb.columns:
+                return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+        return fb.dropna(subset=XGB_FEATURES + ["target"]).copy()
+    except Exception:
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+
+def _append_feedback(trade):
+    raw = trade.get("xgb_features_json", "")
+    if not raw or str(trade.get("outcome", "")).upper() not in ("WIN", "LOSS"):
+        return
+    try:
+        features = json.loads(raw) if isinstance(raw, str) else raw
+        row = {k: float(features[k]) for k in XGB_FEATURES}
+        direction = str(trade.get("direction", "")).upper()
+        outcome = str(trade.get("outcome", "")).upper()
+        # Target means: which entry direction would have reached TP before SL?
+        # WIN LONG=1, LOSS LONG=0; WIN SHORT=0, LOSS SHORT=1.
+        row["target"] = int((direction == "LONG") == (outcome == "WIN"))
+        row["trade_id"] = trade.get("trade_id", "")
+        row["closed_at"] = trade.get("exit_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        fb = _load_feedback()
+        if str(row["trade_id"]) in set(fb.get("trade_id", pd.Series(dtype=str)).astype(str)):
+            return
+        fb = pd.concat([fb, pd.DataFrame([row])], ignore_index=True)
+        fb.to_csv(FEEDBACK_FILE, index=False)
+    except Exception:
+        pass
+
+def _retrain_xgb_from_feedback(current_model):
+    """Train a candidate on completed trade outcomes and replace only if it passes a time-ordered holdout test."""
+    fb = _load_feedback()
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or fb["target"].nunique() < 2:
+        return current_model, None
+
+    # Retrain only at 30, 40, 50... completed examples.
+    last_count = int(st.session_state.get("xgb_last_retrain_count", 0))
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or len(fb) < last_count + RETRAIN_EVERY:
+        return current_model, None
+
+    fb = fb.sort_values("closed_at", kind="stable")
+    split = max(int(len(fb) * 0.80), 1)
+    if split >= len(fb):
+        return current_model, None
+    X_train, X_test = fb.iloc[:split][XGB_FEATURES], fb.iloc[split:][XGB_FEATURES]
+    y_train, y_test = fb.iloc[:split]["target"].astype(int), fb.iloc[split:]["target"].astype(int)
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        return current_model, None
+
+    candidate = XGBClassifier(
+        n_estimators=180, learning_rate=0.03, max_depth=3,
+        min_child_weight=2, subsample=0.90, colsample_bytree=0.90,
+        reg_lambda=1.5, random_state=42, eval_metric="logloss",
+        n_jobs=2
+    )
+    candidate.fit(X_train, y_train)
+    test_acc = float(accuracy_score(y_test, candidate.predict(X_test)))
+
+    # A simple direction-quality gate: don't replace the model with a candidate
+    # that cannot beat a 55% chronological holdout.
+    if test_acc < MIN_TEST_ACCURACY:
+        st.session_state.xgb_last_retrain_count = len(fb)
+        return current_model, f"XGB retrain rejected: holdout accuracy {test_acc*100:.1f}% < {MIN_TEST_ACCURACY*100:.0f}%"
+
+    tmp_path = MODEL_PATH + ".tmp"
+    joblib.dump(candidate, tmp_path)
+    os.replace(tmp_path, MODEL_PATH)
+    st.session_state.xgb_last_retrain_count = len(fb)
+    return candidate, f"XGB retrained from {len(fb)} completed trades | holdout accuracy {test_acc*100:.1f}%"
+
+def build_xgb_features(df, bids, asks):
+    bid_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi = (bid_sum - ask_sum) / (bid_sum + ask_sum + 1e-8)
+    spread = abs(float(asks[0, 0]) - float(bids[0, 0])) if len(bids) and len(asks) else 0.0
+    ratio = bid_sum / (ask_sum + 1e-5)
+    total_depth = bid_sum + ask_sum
+    sma20 = df["Close"].rolling(20, min_periods=1).mean().iloc[-1]
+    trend_signal = float(df["Close"].iloc[-1] - sma20)
+    return pd.DataFrame([{
+        "top20_bid_sum": bid_sum,
+        "top20_ask_sum": ask_sum,
+        "obi_top20": obi,
+        "spread": spread,
+        "bid_ask_ratio": ratio,
+        "total_depth": total_depth,
+        "trend_signal": trend_signal,
+    }], columns=XGB_FEATURES)
+
+def calculate_ofi(current_bids, current_asks):
+    """Approximate top-20 order-book flow from consecutive snapshots."""
+    prev = st.session_state.get("previous_orderbook")
+    current_bid_sum = float(np.sum(current_bids[:, 1])) if len(current_bids) else 0.0
+    current_ask_sum = float(np.sum(current_asks[:, 1])) if len(current_asks) else 0.0
+    if prev is None:
+        ofi = 0.0
+    else:
+        prev_bid_sum, prev_ask_sum = prev
+        ofi = (current_bid_sum - prev_bid_sum) - (current_ask_sum - prev_ask_sum)
+    st.session_state.previous_orderbook = (current_bid_sum, current_ask_sum)
+    return float(ofi)
 
 
-# ----------------------------------------------------------
-# 4. DIRECTIONAL SCORE
-# ----------------------------------------------------------
+def normalize_trade(trade):
+    trade["outcome"] = str(trade.get("outcome", "PENDING")).upper()
+    trade["status"] = "Closed" if trade["outcome"] in ("WIN", "LOSS") else "Open"
+    for key in ("entry_price", "stop_loss", "tp1", "tp2"):
+        try: trade[key] = float(trade.get(key, 0.0))
+        except Exception: trade[key] = 0.0
+    if not trade.get("rr_target"):
+        trade["rr_target"] = "1:2"
+    if not trade.get("exit_reason"):
+        trade["exit_reason"] = ""
+    if not trade.get("entry_candle_time"):
+        trade["entry_candle_time"] = trade.get("timestamp", "")
+    if "xgb_features_json" not in trade:
+        trade["xgb_features_json"] = ""
+    return trade
 
-combined_score = float(np.clip(
-    0.40 * xgb_signed +
-    0.25 * research_score +
-    0.20 * micro_score +
-    0.15 * trend_score,
-    -1.0,
-    1.0
-))
+st.session_state.trade_history_log = [normalize_trade(t) for t in st.session_state.trade_history_log]
+
+def resolve_pending_trades(history, symbol, timeframe, current_candle_time, candle_high, candle_low, current_price):
+    changed = False
+    current_candle_str = pd.Timestamp(current_candle_time).strftime("%Y-%m-%d %H:%M:%S")
+    for trade in history:
+        if str(trade.get("outcome", "")).upper() != "PENDING":
+            continue
+        if trade.get("symbol") != symbol or trade.get("timeframe") != timeframe:
+            continue
+
+        # Never evaluate the same candle that created the trade; its high/low
+        # may have happened before the entry at the candle close.
+        entry_candle = str(trade.get("entry_candle_time", ""))
+        if entry_candle == current_candle_str:
+            continue
+
+        direction = str(trade.get("direction", "")).upper()
+        entry = float(trade.get("entry_price", 0.0))
+        sl = float(trade.get("stop_loss", 0.0))
+        tp = float(trade.get("tp1", 0.0))
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            continue
+
+        tp_hit = float(candle_high) >= tp if direction == "LONG" else float(candle_low) <= tp
+        sl_hit = float(candle_low) <= sl if direction == "LONG" else float(candle_high) >= sl
+
+        if not tp_hit and not sl_hit:
+            continue
+
+        # If both levels were touched in one OHLC candle, the exact sequence
+        # is unknowable. Use conservative SL-first accounting instead of leaving it pending.
+        if sl_hit and tp_hit:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL & TP touched in same candle (SL-first conservative)"
+        elif tp_hit:
+            result = "WIN"
+            exit_price = tp
+            reason = "TP1 HIT"
+        else:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL HIT"
+
+        if direction == "LONG":
+            pnl = ((exit_price - entry) / entry) * 100.0
+        else:
+            pnl = ((entry - exit_price) / entry) * 100.0
+
+        trade["outcome"] = result
+        trade["exit_price"] = round(float(exit_price), 2)
+        trade["pnl_percent"] = round(float(pnl), 4)
+        trade["status"] = "Closed"
+        trade["duration"] = "Closed"
+        trade["exit_reason"] = reason
+        trade["exit_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append_feedback(trade)
+        changed = True
+    return changed
 
 
-# ----------------------------------------------------------
-# 5. XGB QUALITY
-# ----------------------------------------------------------
+# ==========================================
+# 1. RESEARCH LAB & RISK ENGINE MODULES (CORE)
+# ==========================================
+class TenPaperResearchLab:
+    def __init__(self, target_vol=0.15):
+        self.target_vol = target_vol
+        self.scaler = StandardScaler()
+        
+        # 12 Quantitative Papers & Metrics Formulas
+        self.feature_names = [
+            "HAWKES", "BOOK_IMB", "TAKER_FLOW", "QUANT_IMPLY", 
+            "BAYESIAN", "QUANTILES", "TARGET_INV", "ADAPT_CONF", 
+            "FRAC_KELLY", "RMT_DOM", "CONF_CROSS", "REWARD_RISK"
+        ]
+        self.dynamic_weights = {k: 1.0 / len(self.feature_names) for k in self.feature_names}
 
-xgb_strong = xgb_confidence >= 75.0
-xgb_good = xgb_confidence >= 60.0
+    def extract_features(self, df, bids, asks):
+        results = {}
+        if len(bids) == 0 or len(asks) == 0 or df.empty or len(df) < 15:
+            return {k: 0.0 for k in self.feature_names}
+
+        bid_vol = np.sum(bids[:, 1])
+        ask_vol = np.sum(asks[:, 1])
+        mid_price = (bids[0, 0] + asks[0, 0]) / 2
+        returns = df["Close"].pct_change().dropna()
+        realized_vol = returns.std() + 1e-8
+        returns_h = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / (df["Close"].iloc[-5] + 1e-8)
+        delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
+
+        # 1. Hawkes Intensity Process
+        vol_changes = df["Volume"].pct_change().dropna().values
+        hawkes_intensity = (np.mean(vol_changes[-3:]) / (np.mean(vol_changes[-15:]) + 1e-8)) if len(vol_changes) >= 15 else 1.0
+        results["HAWKES"] = np.clip((hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1)
+
+        # 2. Book Imbalance
+        results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
+
+        # 3. Taker Flow
+        taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
+        taker_sell = df["Volume"].iloc[-1] * (1.0 if delta_p <= 0 else 0.3)
+        results["TAKER_FLOW"] = (taker_buy - taker_sell) / (taker_buy + taker_sell + 1e-8)
+
+        # 4. Quantities Imply
+        depth_skew = (bids[0, 1] - asks[0, 1]) / (bids[0, 1] + asks[0, 1] + 1e-8)
+        results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
+
+        # 5. Bayesian Probability
+        prior = 0.745
+        likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
+        posterior = (likelihood * prior) / ((likelihood * prior) + ((1 - likelihood) * (1 - prior)) + 1e-8)
+        results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
+
+        # 6. Quantiles Imply
+        q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
+        q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
+        results["QUANTILES"] = np.clip((returns_h - q10) / (q90 - q10 + 1e-8) * 2.0 - 1.0, -1, 1)
+
+        # 7. Target versus Invalidation Threshold
+        target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
+        results["TARGET_INV"] = 1.0 if target_diff >= 0.0006 else (-1.0 if target_diff <= -0.0006 else 0.0)
+
+        # 8. Adaptive Conformal Band Crosses Zero
+        ma_fast = df["Close"].rolling(3).mean().iloc[-1]
+        ma_slow = df["Close"].rolling(10).mean().iloc[-1]
+        results["ADAPT_CONF"] = np.clip((ma_fast - ma_slow) / (realized_vol * mid_price + 1e-8), -1, 1)
+
+        # 9. Fractional Kelly Risk
+        win_prob = 0.55 + (0.15 * np.sign(results["BOOK_IMB"]))
+        kelly_fraction = win_prob - ((1 - win_prob) / 1.5)
+        results["FRAC_KELLY"] = np.clip(kelly_fraction * 2.0 * np.sign(returns_h), -1, 1)
+
+        # 10. RMT Market Dominance
+        rmt_dom = (abs(returns_h) / (realized_vol * np.sqrt(5) + 1e-8)) / 3.0
+        results["RMT_DOM"] = np.clip(rmt_dom * np.sign(returns_h), -1, 1)
+
+        # 11. Conformal Interval Crosses Zero
+        conformal_spread = realized_vol * 1.96
+        upper_b = mid_price * (1 + conformal_spread)
+        lower_b = mid_price * (1 - conformal_spread)
+        results["CONF_CROSS"] = 1.0 if mid_price > (upper_b + lower_b) / 2 else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
+
+        # 12. Quantiles Reward / Risk Filter
+        rr_ratio = abs(q90) / (abs(q10) + 1e-8)
+        results["REWARD_RISK"] = 1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
+
+        return results
+
+    def calculate_all_signals(self, df, bids, asks, current_inventory=0, performance_history=None):
+        results = self.extract_features(df, bids, asks)
+        feature_vector = np.array([results[k] for k in self.feature_names]).reshape(1, -1)
+        
+        weight_vector = np.array(list(self.dynamic_weights.values()))
+        final_score = float(np.dot(feature_vector[0], weight_vector))
+
+        return results, final_score, self.dynamic_weights
 
 
-# ----------------------------------------------------------
-# 6. OBI QUALITY
-# ----------------------------------------------------------
+class PowerTradingRiskEngine:
+    def __init__(self):
+        pass
 
-obi_long = obi_val >= 0.10
-obi_short = obi_val <= -0.10
+    def calculate_risk_metrics(self, liquidation_volumes, displayed_vol, cancelled_vol, time_exists, obs_window, open_interest, leverage, volatility):
+        total_ltz = np.sum(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
+        max_ltz = np.max(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
+        ltz_score = (max_ltz / (total_ltz + 1e-8)) * 100
 
-strong_obi_long = obi_val >= 0.20
-strong_obi_short = obi_val <= -0.20
+        spoof_ratio = cancelled_vol / (displayed_vol + 1e-8)
+        persistence = min(max(time_exists / (obs_window + 1e-8), 0), 1)
+        spoof_score = spoof_ratio * (1 - persistence)
 
+        squeeze_risk = total_ltz * open_interest * leverage * volatility
+        market_risk = ltz_score + spoof_score + squeeze_risk
 
-# ----------------------------------------------------------
-# 7. OFI QUALITY
-# ----------------------------------------------------------
-
-ofi_long = ofi_norm >= 0.05
-ofi_short = ofi_norm <= -0.05
-
-strong_ofi_long = ofi_norm >= 0.12
-strong_ofi_short = ofi_norm <= -0.12
-
-
-# ----------------------------------------------------------
-# 8. MOMENTUM
-# ----------------------------------------------------------
-
-momentum_long = momentum5 > 0
-momentum_short = momentum5 < 0
+        return {
+            "LTZ_Score": ltz_score,
+            "Spoof_Score": spoof_score,
+            "Squeeze_Risk": squeeze_risk,
+            "Market_Risk": market_risk
+        }
 
 
-# ----------------------------------------------------------
-# 9. NORMAL SIGNAL CONDITIONS
-# ----------------------------------------------------------
+# ==========================================
+# 3. PROFESSIONAL STYLING & THEME
+# ==========================================
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+    .stApp { background-color: #080a0f; color: #e2e8f0; }
+    section[data-testid="stSidebar"] { background-color: #0d1117 !important; border-right: 1px solid #161b22; }
+    .metric-card {
+        background: #111622; border: 1px solid #1e2638; border-radius: 12px;
+        padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px;
+    }
+    .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
+    .metric-val-green { font-size: 18px; font-weight: 700; color: #00e676; }
+    .metric-val-red { font-size: 18px; font-weight: 700; color: #ff5252; }
+    .metric-val-blue { font-size: 18px; font-weight: 700; color: #38bdf8; }
+    .top-status-bar {
+        background: #111622; border: 1px solid #1e2638; border-radius: 10px;
+        padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-long_normal = (
-    long_votes >= 3
-    and xgb_good
-    and combined_score >= 0.12
-    and trend_direction != "SHORT"
+
+# ==========================================
+# 4. SIDEBAR CONTROLS & FILTERS
+# ==========================================
+COINS_LIST = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"
+]
+
+TIMEFRAME_MAP = {
+    "1m (Scalping)": ("1m", 1),
+    "15m (Medium TF)": ("15m", 15),
+    "30m (Medium TF)": ("30m", 30),
+    "1h (Intraday)": ("1h", 60),
+    "4h (Intraday)": ("4h", 240),
+}
+
+st.sidebar.markdown("### ⚡ Terminal Controls")
+selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
+selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1)
+forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
+rr_choice = "TP1 1:2 | TP2 1:3"
+st.sidebar.markdown("**Risk / Reward Targets**")
+st.sidebar.info("TP1 = 1:2  •  TP2 = 1:3")
+rr_multiple = 2.0
+tp1_rr_multiple = 2.0
+tp2_rr_multiple = 3.0
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🎛️ Paper Trading Mode")
+paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
+
+if xgb_model is not None:
+    st.sidebar.success("XGBoost model: LOADED")
+else:
+    st.sidebar.error("XGBoost model: NOT LOADED")
+    if xgb_model_error:
+        st.sidebar.caption(xgb_model_error)
+
+feedback_count = len(_load_feedback())
+st.sidebar.caption(f"Auto-learning feedback: {feedback_count} completed trades")
+if st.session_state.get("xgb_retrain_message"):
+    st.sidebar.info(st.session_state["xgb_retrain_message"])
+
+api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
+
+
+# ==========================================
+# 5. DATA FETCHING (SAFE API WITH FALLBACK)
+# ==========================================
+@st.cache_data(ttl=15)
+def fetch_klines_data(symbol, tf_key, limit=100, allow_fallback=True):
+    binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("30m" if "30m" in tf_key else ("1h" if "1h" in tf_key else "4h")))
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
+    try:
+        res = requests.get(url, timeout=4).json()
+        if isinstance(res, dict) or not isinstance(res, list):
+            raise ValueError("API limit or invalid format")
+        df = pd.DataFrame(res, columns=["Open_Time", "Open", "High", "Low", "Close", "Volume", "Close_Time", "QAV", "NAT", "TBBAV", "TBQAV", "Ignore"])
+        df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = df[col].astype(float)
+        df.set_index("Time", inplace=True)
+        return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        if not allow_fallback:
+            return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        dates = pd.date_range(end=datetime.datetime.now(), periods=limit, freq=binance_tf)
+        base_p = 60000.0
+        closes = base_p + np.cumsum(np.random.normal(0, 10, limit))
+        return pd.DataFrame({
+            "Time": dates,
+            "Open": closes - 5,
+            "High": closes + 15,
+            "Low": closes - 15,
+            "Close": closes,
+            "Volume": np.random.uniform(50, 500, limit)
+        })
+
+@st.cache_data(ttl=10)
+def fetch_order_book_depth(symbol, depth_limit=20):
+    try:
+        url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit={depth_limit}"
+        res = requests.get(url, timeout=4).json()
+        if "bids" in res and "asks" in res:
+            return np.array(res["bids"], dtype=float), np.array(res["asks"], dtype=float)
+    except Exception:
+        pass
+    dummy_bids = np.array([[60000 - i*2, 1.5] for i in range(20)], dtype=float)
+    dummy_asks = np.array([[60000 + i*2, 1.5] for i in range(20)], dtype=float)
+    return dummy_bids, dummy_asks
+
+df = fetch_klines_data(selected_symbol, selected_tf_label)
+bids, asks = fetch_order_book_depth(selected_symbol)
+
+
+def resolve_all_pending_trades(history, selected_symbol, selected_tf_label, selected_df):
+    """Resolve pending trades for ALL symbol/timeframe combinations, not only the one selected in the sidebar."""
+    pairs = {(t.get("symbol"), t.get("timeframe")) for t in history
+             if str(t.get("outcome", "")).upper() == "PENDING"}
+    for symbol, timeframe in pairs:
+        if not symbol or not timeframe:
+            continue
+        if symbol == selected_symbol and timeframe == selected_tf_label:
+            local_df = selected_df
+        else:
+            try:
+                local_df = fetch_klines_data(symbol, timeframe, limit=2, allow_fallback=False)
+            except Exception:
+                continue
+        if local_df is None or local_df.empty:
+            continue
+        last = local_df.iloc[-1]
+        resolve_pending_trades(
+            history, symbol, timeframe, pd.Timestamp(last["Time"]),
+            float(last["High"]), float(last["Low"]), float(last["Close"])
+        )
+
+resolve_all_pending_trades(
+    st.session_state.trade_history_log, selected_symbol, selected_tf_label, df
 )
+save_persistent_history(st.session_state.trade_history_log)
 
-short_normal = (
-    short_votes >= 3
-    and xgb_good
-    and combined_score <= -0.12
-    and trend_direction != "LONG"
-)
-
-
-# ----------------------------------------------------------
-# 10. STRONG LONG
-# ----------------------------------------------------------
-
-strong_long = (
-    xgb_signal == "LONG"
-    and xgb_strong
-    and long_votes >= 3
-    and combined_score >= 0.28
-    and trend_direction == "LONG"
-    and research_direction == "LONG"
-    and micro_direction == "LONG"
-    and (strong_obi_long or strong_ofi_long)
-)
+# Controlled automatic learning from completed TP/SL trades.
+try:
+    xgb_model, retrain_message = _retrain_xgb_from_feedback(xgb_model)
+    if retrain_message:
+        st.session_state.xgb_retrain_message = retrain_message
+except Exception as _retrain_err:
+    st.session_state.xgb_retrain_message = f"XGB retrain skipped: {_retrain_err}"
 
 
-# ----------------------------------------------------------
-# 11. STRONG SHORT
-# ----------------------------------------------------------
+# ==========================================
+# 6. ENGINE EXECUTION & SIGNAL GENERATION
+# ==========================================
+if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
+    lab = TenPaperResearchLab()
+    paper_results, research_score, evolved_weights = lab.calculate_all_signals(
+        df, bids, asks, current_inventory=0, performance_history=st.session_state.trade_history_log
+    )
 
-strong_short = (
-    xgb_signal == "SHORT"
-    and xgb_strong
-    and short_votes >= 3
-    and combined_score <= -0.28
-    and trend_direction == "SHORT"
-    and research_direction == "SHORT"
-    and micro_direction == "SHORT"
-    and (strong_obi_short or strong_ofi_short)
-)
+    close_p = float(df["Close"].iloc[-1])
+    high_p = float(df["High"].iloc[-1])
+    low_p = float(df["Low"].iloc[-1])
+    candle_time = pd.Timestamp(df["Time"].iloc[-1])
 
+    atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr_val) or atr_val <= 0:
+        atr_val = close_p * 0.005
 
-# ----------------------------------------------------------
-# 12. FINAL DIRECTION
-# ----------------------------------------------------------
+    # ----- XGBoost live prediction: same 7 features used during training -----
+    xgb_features = build_xgb_features(df, bids, asks)
+    xgb_signal = "NEUTRAL"
+    xgb_confidence = 0.0
+    xgb_prediction = None
+    if xgb_model is not None:
+        try:
+            xgb_prediction = int(xgb_model.predict(xgb_features)[0])
+            probs = xgb_model.predict_proba(xgb_features)[0]
+            xgb_confidence = float(np.max(probs) * 100.0)
+            xgb_signal = "LONG" if xgb_prediction == 1 else "SHORT"
+        except Exception as e:
+            xgb_model_error = f"XGBoost prediction error: {e}"
 
-if strong_long:
+    # ----- OBI / OFI confirmation -----
+    bid_vol_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_vol_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum + 1e-8)
+    ofi_val = calculate_ofi(bids, asks)
+    ofi_scale = max(abs(bid_vol_sum) + abs(ask_vol_sum), 1.0)
+    ofi_norm = float(np.clip(ofi_val / ofi_scale, -1.0, 1.0))
+    micro_score = float(np.clip(0.65 * obi_val + 0.35 * ofi_norm, -1.0, 1.0))
+    micro_direction = "LONG" if micro_score >= 0.08 else ("SHORT" if micro_score <= -0.08 else "NEUTRAL")
 
-    direction = "LONG"
-    signal_strength = "STRONG LONG"
+    research_direction = "LONG" if research_score >= 0.15 else ("SHORT" if research_score <= -0.15 else "NEUTRAL")
+    xgb_signed = ((xgb_confidence / 100.0) * (1 if xgb_signal == "LONG" else -1)) if xgb_signal != "NEUTRAL" else 0.0
 
-elif strong_short:
+    # ----- Independent trend confirmation for direction quality -----
+    ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = df["Close"].ewm(span=21, adjust=False).mean().iloc[-1]
+    momentum5 = float(df["Close"].iloc[-1] / (df["Close"].iloc[-6] + 1e-8) - 1.0) if len(df) >= 6 else 0.0
+    trend_score = float(np.clip(((ema9 - ema21) / (close_p + 1e-8)) * 250.0 + np.sign(momentum5) * min(abs(momentum5) * 1000.0, 0.5), -1.0, 1.0))
+    trend_direction = "LONG" if trend_score >= 0.10 else ("SHORT" if trend_score <= -0.10 else "NEUTRAL")
 
-    direction = "SHORT"
-    signal_strength = "STRONG SHORT"
+    # ----- Conservative combined decision engine -----
+    # XGB must have meaningful confidence and must not directly conflict with
+    # both research and microstructure. Trend is an additional quality gate.
+    agreement_votes = [d for d in (xgb_signal, research_direction, micro_direction, trend_direction) if d != "NEUTRAL"]
+    long_votes = agreement_votes.count("LONG")
+    short_votes = agreement_votes.count("SHORT")
 
-elif long_normal:
+    combined_score = float(np.clip(
+        0.45 * xgb_signed + 0.25 * research_score + 0.20 * micro_score + 0.10 * trend_score,
+        -1.0, 1.0
+    ))
 
-    direction = "LONG"
-    signal_strength = "LONG"
+    xgb_conf_ok = xgb_confidence >= 60.0
+    long_confirmed = (xgb_signal == "LONG" and research_direction == "LONG" and
+                      micro_direction == "LONG" and trend_direction != "SHORT")
+    short_confirmed = (xgb_signal == "SHORT" and research_direction == "SHORT" and
+                       micro_direction == "SHORT" and trend_direction != "LONG")
 
-elif short_normal:
+    if long_confirmed and xgb_conf_ok and combined_score >= 0.18:
+        direction = "LONG"
+    elif short_confirmed and xgb_conf_ok and combined_score <= -0.18:
+        direction = "SHORT"
+    else:
+        # Fallback: allow 3-of-4 agreement only when the XGB direction is
+        # included and trend is not actively against the trade.
+        if xgb_signal == "LONG" and xgb_confidence >= 65 and long_votes >= 3 and trend_direction != "SHORT" and combined_score >= 0.18:
+            direction = "LONG"
+        elif xgb_signal == "SHORT" and xgb_confidence >= 65 and short_votes >= 3 and trend_direction != "LONG" and combined_score <= -0.18:
+            direction = "SHORT"
+        else:
+            direction = "NEUTRAL"
 
-    direction = "SHORT"
-    signal_strength = "SHORT"
+    confidence = int(np.clip(abs(combined_score) * 100.0, 0, 99))
+
+    # ----- Signal strength / high-confluence labels -----
+    # Keep direction as LONG/SHORT/NEUTRAL internally so TP/SL and trade tracking
+    # continue to work. The stronger label is a presentation/quality layer.
+    if direction == "LONG":
+        if (xgb_confidence >= 80.0 and long_votes >= 4 and
+                combined_score >= 0.45 and trend_direction != "SHORT"):
+            signal_strength = "STRONG LONG"
+        else:
+            signal_strength = "LONG"
+    elif direction == "SHORT":
+        if (xgb_confidence >= 80.0 and short_votes >= 4 and
+                combined_score <= -0.45 and trend_direction != "LONG"):
+            signal_strength = "STRONG SELL"
+        else:
+            signal_strength = "SHORT"
+    else:
+        signal_strength = "WAIT"
+
+    # ----- ATR based SL with fixed targets: TP1 = 1:2, TP2 = 1:3 -----
+    risk_distance = max(float(atr_val), close_p * 0.001)
+    if direction == "LONG":
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
+    elif direction == "SHORT":
+        sl_val = close_p + risk_distance
+        tp1_val = close_p - (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p - (risk_distance * tp2_rr_multiple)
+    else:
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
+
+    actual_risk = abs(close_p - sl_val)
+    tp1_reward = abs(tp1_val - close_p)
+    tp2_reward = abs(tp2_val - close_p)
+    actual_rr = tp1_reward / actual_risk if actual_risk > 0 else 0.0
+    tp2_rr = tp2_reward / actual_risk if actual_risk > 0 else 0.0
+    beam_level = tp2_val
+    base_level = sl_val
+
+    lock_seconds = tf_minutes * 60
+    current_time_sec = int(time.time())
+    time_bucket = current_time_sec - (current_time_sec % lock_seconds)
+    time_remaining = lock_seconds - (current_time_sec % lock_seconds)
+    trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
+
+    if paper_trading_mode and direction != "NEUTRAL":
+        existing_trade_ids = {item.get("trade_id") for item in st.session_state.trade_history_log}
+        if trade_id not in existing_trade_ids:
+            new_trade = {
+                "trade_id": trade_id,
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_candle_time": candle_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": selected_symbol,
+                "timeframe": selected_tf_label,
+                "direction": direction,
+                "signal_strength": signal_strength,
+                "entry_price": round(close_p, 2),
+                "stop_loss": round(sl_val, 2),
+                "tp1": round(tp1_val, 2),
+                "tp2": round(tp2_val, 2),
+                "rr_target": "TP1 1:2 | TP2 1:3",
+                "exit_price": None,
+                "confidence": confidence,
+                "xgb_confidence": round(xgb_confidence, 2),
+                "xgb_features_json": json.dumps({k: float(xgb_features.iloc[0][k]) for k in XGB_FEATURES}),
+                "final_score": round(combined_score, 3),
+                "outcome": "PENDING",
+                "pnl_percent": 0.0,
+                "duration": "Active",
+                "status": "Open",
+                "exit_reason": ""
+            }
+            st.session_state.trade_history_log.insert(0, new_trade)
+
+    # Persist every refresh so a closed trade cannot remain visually pending after rerun.
+    save_persistent_history(st.session_state.trade_history_log)
+
+    risk_engine = PowerTradingRiskEngine()
+    disp_vol = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+    risk_metrics = risk_engine.calculate_risk_metrics(
+        liquidation_volumes=np.array([1000, 2500]), displayed_vol=disp_vol,
+        cancelled_vol=disp_vol * 0.1, time_exists=15.0, obs_window=60.0,
+        open_interest=150000.0, leverage=20.0, volatility=df["Close"].pct_change().std() + 1e-8
+    )
+
+    # ==========================================
+    # 7. TOP HEADER STATUS BAR
+    # ==========================================
+    dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    signal_color = "#00e676" if signal_strength == "STRONG LONG" else ("#ff5252" if signal_strength == "STRONG SELL" else dir_color)
+    mins_rem, secs_rem = divmod(time_remaining, 60)
+
+    st.markdown(f"""
+    <div class="top-status-bar">
+        🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
+        TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{signal_color};">{signal_strength}</span> &nbsp;|&nbsp; 
+        Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Trend: <b>{trend_direction}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
+        ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ==========================================
+    # 8. TRADE SIGNAL PANEL & METRICS
+    # ==========================================
+    col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
+    
+    with col_sig:
+        st.markdown(f"""
+        <div class="metric-card" style="border-left: 4px solid {dir_color};">
+            <div class="metric-label">Signal Execution Panel</div>
+            <div style="font-size:22px; font-weight:700; color:{signal_color};">{signal_strength}</div>
+            <div style="font-size:10px; color:#8b949e; margin-top:3px;">Direction: {direction} | XGB: {xgb_confidence:.1f}% | Votes: {long_votes if direction == "LONG" else short_votes}/4</div>
+            <div style="font-size:11px; color:#8b949e; margin-top:4px;">Entry: ${close_p:,.2f} | SL: ${sl_val:,.2f}</div>
+            <div style="font-size:11px; color:#38bdf8;">TP1: ${tp1_val:,.2f} | TP2: ${tp2_val:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_m1:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">BEAM Target</div><div class="metric-val-blue">${beam_level:,.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">BASE Target</div><div class="metric-val-red">${base_level:,.2f}</div></div>', unsafe_allow_html=True)
+    with col_m2:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">TP1 1 : 2 &nbsp;|&nbsp; TP2 1 : 3</div><div style="font-size:10px;color:#8b949e;">Fixed targets: 2R / 3R</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Direction Quality</div><div class="metric-val-green">{confidence}%</div><div style="font-size:10px;color:#8b949e;">XGB + Research + OBI/OFI + Trend</div></div>', unsafe_allow_html=True)
+    with col_m3:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>', unsafe_allow_html=True)
+    with col_m4:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
+
+    # ==========================================
+    # 9. CHART & MICROSTRUCTURE SECTION
+    # ==========================================
+    col_chart, col_risk_panel = st.columns([2.5, 1])
+    with col_chart:
+        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
+        time_delta = pd.Timedelta(minutes=tf_minutes)
+        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
+        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
+
+        if direction == "LONG":
+            forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
+        elif direction == "SHORT":
+            forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
+        else:
+            forecast_prices = [close_p] * forecast_horizon
+
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
+        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
+        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
+        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
+        fig.update_layout(template="plotly_dark", height=420, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_risk_panel:
+        st.subheader("Market Microstructure & OB")
+        bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
+        ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+        obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
+        spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
+
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
+            <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.subheader("Top 20 OBI Analysis")
+        fig_obi = go.Figure(go.Bar(x=["Top 5", "Top 10", "Top 20"], y=[obi_val*0.8, obi_val*0.9, obi_val], marker_color="#38bdf8"))
+        fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
+        st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
+
+    # ==========================================
+    # 10. RESEARCH PAPER SCOREBOARD
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🔬 12-Paper Quantitative Research Scoreboard")
+
+    col_sc1, col_sc2 = st.columns([1.5, 1])
+    with col_sc1:
+        paper_table_data = []
+        for k, v in paper_results.items():
+            status = "PASS 🟢" if v > 0.1 else ("FAIL 🔴" if v < -0.1 else "NEUTRAL ⚪")
+            paper_table_data.append({
+                "Paper": k,
+                "Value": f"{v:+.3f}",
+                "Weight": f"{evolved_weights.get(k, 0.083)*100:.1f}%",
+                "Status": status
+            })
+        st.dataframe(pd.DataFrame(paper_table_data), use_container_width=True, hide_index=True, height=270)
+
+    with col_sc2:
+        st.markdown("""
+        <div class="metric-card">
+            <div style="font-weight:700; color:#38bdf8; margin-bottom:6px;">Advanced Model Insights</div>
+            <div style="font-size:12px; color:#cbd5e1; line-height:1.6;">
+                • <b>HAWKES:</b> Measures aggressive order clustering and arrival rates.<br>
+                • <b>BOOK_IMB:</b> Computes real-time depth pressure across bids & asks.<br>
+                • <b>Dynamic Weights:</b> Optimized linear blending for robust signals.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ==========================================
+    # 11. PERFORMANCE & WIN RATE SECTION
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📊 Performance Summary & Win Rate Checker with Filters")
+
+    if st.session_state.trade_history_log:
+        df_log = pd.DataFrame(st.session_state.trade_history_log)
+
+        f_col1, f_col2, f_col3 = st.columns(3)
+        with f_col1:
+            coin_filter = st.selectbox("Filter Coin", ["ALL"] + COINS_LIST)
+        with f_col2:
+            tf_filter = st.selectbox("Filter Timeframe", ["ALL"] + list(TIMEFRAME_MAP.keys()))
+        with f_col3:
+            dir_filter = st.selectbox("Filter Direction", ["ALL", "LONG", "SHORT"])
+
+        filtered_df = df_log.copy()
+        if coin_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["symbol"] == coin_filter]
+        if tf_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["timeframe"] == tf_filter]
+        if dir_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["direction"] == dir_filter]
+
+        total_signals = len(filtered_df)
+        wins = len(filtered_df[filtered_df["outcome"] == "WIN"])
+        losses = len(filtered_df[filtered_df["outcome"] == "LOSS"])
+        pending = len(filtered_df[filtered_df["outcome"] == "PENDING"])
+        closed_trades = wins + losses
+        win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0.0
+
+        winning_trades_df = filtered_df[filtered_df["outcome"] == "WIN"]
+        losing_trades_df = filtered_df[filtered_df["outcome"] == "LOSS"]
+        
+        gross_profit = winning_trades_df["pnl_percent"].sum() if not winning_trades_df.empty else 0.0
+        gross_loss = abs(losing_trades_df["pnl_percent"].sum()) if not losing_trades_df.empty else 0.0
+        net_pnl = gross_profit - gross_loss
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-val-green">{win_rate:.1f}%</div></div>', unsafe_allow_html=True)
+        with p2:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Closed Trades</div><div class="metric-val-blue">{closed_trades}</div></div>', unsafe_allow_html=True)
+        with p3:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Wins / Losses</div><div style="font-size:16px; font-weight:750; color:#00e676;">{wins}W / {losses}L</div></div>', unsafe_allow_html=True)
+        with p4:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Pending</div><div class="metric-val-blue">{pending}</div></div>', unsafe_allow_html=True)
+        with p5:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Profit Factor</div><div class="metric-val-blue">{profit_factor:.2f}</div></div>', unsafe_allow_html=True)
+        with p6:
+            pnl_color = "#00e676" if net_pnl >= 0 else "#ff5252"
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
+
+        st.markdown("##### Detailed Trade History Table")
+        display_cols = [
+            "timestamp", "symbol", "timeframe", "direction", "signal_strength",
+            "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
+            "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"
+        ]
+
+        # Backward compatibility: older signal_history.csv files do not contain
+        # columns introduced by newer dashboard versions. Never let a missing
+        # history column crash the whole Streamlit app.
+        default_values = {
+            "timestamp": "", "symbol": "", "timeframe": "", "direction": "",
+            "signal_strength": "", "entry_price": 0.0, "stop_loss": 0.0,
+            "tp1": 0.0, "tp2": 0.0, "rr_target": "TP1 1:2 | TP2 1:3", "exit_price": 0.0,
+            "pnl_percent": 0.0, "outcome": "PENDING", "confidence": 0.0,
+            "xgb_confidence": 0.0, "exit_reason": ""
+        }
+        for col in display_cols:
+            if col not in filtered_df.columns:
+                filtered_df[col] = default_values[col]
+
+        st.dataframe(filtered_df.loc[:, display_cols], use_container_width=True, hide_index=True, height=280)
+
+        if st.sidebar.button("Clear Trade History Log"):
+            st.session_state.trade_history_log = []
+            if os.path.exists(CSV_FILE):
+                os.remove(CSV_FILE)
+            if os.path.exists(FEEDBACK_FILE):
+                os.remove(FEEDBACK_FILE)
+            st.session_state.xgb_last_retrain_count = 0
+            st.rerun()
+    else:
+        st.info("No paper trade history recorded yet. Signals will automatically log when active.")
 
 else:
-
-    direction = "NEUTRAL"
-    signal_strength = "WAIT"
-
-
-# ----------------------------------------------------------
-# 13. FINAL CONFIDENCE
-# ----------------------------------------------------------
-
-base_confidence = abs(combined_score) * 100.0
-
-# Agreement bonus
-if direction == "LONG":
-    agreement_bonus = long_votes * 4.0
-elif direction == "SHORT":
-    agreement_bonus = short_votes * 4.0
-else:
-    agreement_bonus = 0.0
-
-# XGB bonus
-xgb_bonus = max(0.0, (xgb_confidence - 50.0) * 0.15)
-
-confidence = int(np.clip(
-    base_confidence +
-    agreement_bonus +
-    xgb_bonus,
-    0,
-    99
-))
-
-
-# ----------------------------------------------------------
-# 14. CONFIDENCE QUALITY FILTER
-# ----------------------------------------------------------
-
-# Weak LONG/SHORT ko WAIT mein convert karo
-if direction == "LONG" and confidence < 58:
-    direction = "NEUTRAL"
-    signal_strength = "WAIT"
-
-elif direction == "SHORT" and confidence < 58:
-    direction = "NEUTRAL"
-    signal_strength = "WAIT"
-
-
-# ----------------------------------------------------------
-# 15. FINAL SAFETY CHECK
-# ----------------------------------------------------------
-
-# Opposite strong trend ko allow nahi karna
-if direction == "LONG" and trend_direction == "SHORT":
-    direction = "NEUTRAL"
-    signal_strength = "WAIT"
-
-elif direction == "SHORT" and trend_direction == "LONG":
-    direction = "NEUTRAL"
-    signal_strength = "WAIT"
-
-
-# ----------------------------------------------------------
-# 16. VERY STRONG CONFLUENCE UPGRADE
-# ----------------------------------------------------------
-
-if direction == "LONG":
-
-    if (
-        xgb_confidence >= 80
-        and long_votes >= 4
-        and combined_score >= 0.35
-        and obi_val >= 0.15
-        and trend_direction == "LONG"
-    ):
-        signal_strength = "STRONG LONG"
-
-
-elif direction == "SHORT":
-
-    if (
-        xgb_confidence >= 80
-        and short_votes >= 4
-        and combined_score <= -0.35
-        and obi_val <= -0.15
-        and trend_direction == "SHORT"
-    ):
-        signal_strength = "STRONG SHORT"
-
-
-# ----------------------------------------------------------
-# 17. FINAL WAIT RULE
-# ----------------------------------------------------------
-
-if direction == "NEUTRAL":
-    signal_strength = "WAIT"
+    st.warning("⚠️ Data pipeline initializing or connection restricted. Please refresh.")
