@@ -1,89 +1,424 @@
 import datetime
-import json
 import os
 import time
-
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-import streamlit as st
-
-from sklearn.metrics import accuracy_score
+import joblib
+import json
 from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
+import streamlit as st
+from sklearn.preprocessing import StandardScaler
+from streamlit_autorefresh import st_autorefresh  # <-- 1. Yahan library import ki hai
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    st_autorefresh = None
-
-
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
-
+# ==========================================
+# 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
+# ==========================================
 st.set_page_config(
-    page_title="Quant Research Terminal",
-    page_icon="⚡",
+    page_title="Quantitative Research & Paper Trading Terminal",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ============================================================
-# AUTO REFRESH
-# ============================================================
-
-if st_autorefresh is not None:
-    st_autorefresh(
-        interval=5000,
-        limit=None,
-        key="quant_terminal_refresh",
-    )
-
-
-# ============================================================
-# FILES
-# ============================================================
+# <-- 2. Yahan Auto-Refresh lagaya hai (Har 5 seconds / 5000ms baad page rerun hoga)
+count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
 CSV_FILE = "signal_history.csv"
-FEEDBACK_FILE = "xgb_trade_feedback.csv"
+
+def load_persistent_history():
+    if os.path.exists(CSV_FILE):
+        try:
+            df_hist = pd.read_csv(CSV_FILE)
+            expected_cols = [
+                "trade_id", "timestamp", "symbol", "timeframe", "direction",
+                "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
+                "confidence", "xgb_confidence", "xgb_features_json", "final_score", "outcome", "pnl_percent", "duration", "status", "exit_reason", "entry_candle_time", "exit_time"
+            ]
+            for col in expected_cols:
+                if col not in df_hist.columns:
+                    df_hist[col] = "PENDING" if col == "outcome" else 0.0
+            return df_hist.to_dict("records")
+        except Exception:
+            return []
+    return []
+
+def save_persistent_history(history_list):
+    try:
+        df_hist = pd.DataFrame(history_list)
+        df_hist.to_csv(CSV_FILE, index=False)
+    except Exception as e:
+        st.error(f"Error saving history to CSV: {e}")
+
+if "trade_history_log" not in st.session_state:
+    st.session_state.trade_history_log = load_persistent_history()
+
 MODEL_PATH = "xgboost_obi_model.pkl"
 
+@st.cache_resource
+def load_xgb_model():
+    if not os.path.exists(MODEL_PATH):
+        return None, f"Model file not found: {MODEL_PATH}"
+    try:
+        model = joblib.load(MODEL_PATH)
+        return model, None
+    except Exception as e:
+        return None, f"XGBoost load error: {e}"
 
-# ============================================================
-# CONSTANTS
-# ============================================================
+xgb_model, xgb_model_error = load_xgb_model()
 
 XGB_FEATURES = [
-    "top20_bid_sum",
-    "top20_ask_sum",
-    "obi_top20",
-    "spread",
-    "bid_ask_ratio",
-    "total_depth",
-    "trend_signal",
+    "top20_bid_sum", "top20_ask_sum", "obi_top20", "spread",
+    "bid_ask_ratio", "total_depth", "trend_signal"
 ]
 
+# Controlled online-learning settings. XGBoost is retrained periodically from
+# completed paper trades; it is never changed after every single tick/trade.
+FEEDBACK_FILE = "xgb_trade_feedback.csv"
 MIN_FEEDBACK_TO_RETRAIN = 30
 RETRAIN_EVERY = 10
 MIN_TEST_ACCURACY = 0.55
 
+def _load_feedback():
+    if not os.path.exists(FEEDBACK_FILE):
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+    try:
+        fb = pd.read_csv(FEEDBACK_FILE)
+        for c in XGB_FEATURES + ["target"]:
+            if c not in fb.columns:
+                return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
+        return fb.dropna(subset=XGB_FEATURES + ["target"]).copy()
+    except Exception:
+        return pd.DataFrame(columns=XGB_FEATURES + ["target", "trade_id", "closed_at"])
 
+def _append_feedback(trade):
+    raw = trade.get("xgb_features_json", "")
+    if not raw or str(trade.get("outcome", "")).upper() not in ("WIN", "LOSS"):
+        return
+    try:
+        features = json.loads(raw) if isinstance(raw, str) else raw
+        row = {k: float(features[k]) for k in XGB_FEATURES}
+        direction = str(trade.get("direction", "")).upper()
+        outcome = str(trade.get("outcome", "")).upper()
+        # Target means: which entry direction would have reached TP before SL?
+        # WIN LONG=1, LOSS LONG=0; WIN SHORT=0, LOSS SHORT=1.
+        row["target"] = int((direction == "LONG") == (outcome == "WIN"))
+        row["trade_id"] = trade.get("trade_id", "")
+        row["closed_at"] = trade.get("exit_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        fb = _load_feedback()
+        if str(row["trade_id"]) in set(fb.get("trade_id", pd.Series(dtype=str)).astype(str)):
+            return
+        fb = pd.concat([fb, pd.DataFrame([row])], ignore_index=True)
+        fb.to_csv(FEEDBACK_FILE, index=False)
+    except Exception:
+        pass
+
+def _retrain_xgb_from_feedback(current_model):
+    """Train a candidate on completed trade outcomes and replace only if it passes a time-ordered holdout test."""
+    fb = _load_feedback()
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or fb["target"].nunique() < 2:
+        return current_model, None
+
+    # Retrain only at 30, 40, 50... completed examples.
+    last_count = int(st.session_state.get("xgb_last_retrain_count", 0))
+    if len(fb) < MIN_FEEDBACK_TO_RETRAIN or len(fb) < last_count + RETRAIN_EVERY:
+        return current_model, None
+
+    fb = fb.sort_values("closed_at", kind="stable")
+    split = max(int(len(fb) * 0.80), 1)
+    if split >= len(fb):
+        return current_model, None
+    X_train, X_test = fb.iloc[:split][XGB_FEATURES], fb.iloc[split:][XGB_FEATURES]
+    y_train, y_test = fb.iloc[:split]["target"].astype(int), fb.iloc[split:]["target"].astype(int)
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        return current_model, None
+
+    candidate = XGBClassifier(
+        n_estimators=180, learning_rate=0.03, max_depth=3,
+        min_child_weight=2, subsample=0.90, colsample_bytree=0.90,
+        reg_lambda=1.5, random_state=42, eval_metric="logloss",
+        n_jobs=2
+    )
+    candidate.fit(X_train, y_train)
+    test_acc = float(accuracy_score(y_test, candidate.predict(X_test)))
+
+    # A simple direction-quality gate: don't replace the model with a candidate
+    # that cannot beat a 55% chronological holdout.
+    if test_acc < MIN_TEST_ACCURACY:
+        st.session_state.xgb_last_retrain_count = len(fb)
+        return current_model, f"XGB retrain rejected: holdout accuracy {test_acc*100:.1f}% < {MIN_TEST_ACCURACY*100:.0f}%"
+
+    tmp_path = MODEL_PATH + ".tmp"
+    joblib.dump(candidate, tmp_path)
+    os.replace(tmp_path, MODEL_PATH)
+    st.session_state.xgb_last_retrain_count = len(fb)
+    return candidate, f"XGB retrained from {len(fb)} completed trades | holdout accuracy {test_acc*100:.1f}%"
+
+def build_xgb_features(df, bids, asks):
+    bid_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi = (bid_sum - ask_sum) / (bid_sum + ask_sum + 1e-8)
+    spread = abs(float(asks[0, 0]) - float(bids[0, 0])) if len(bids) and len(asks) else 0.0
+    ratio = bid_sum / (ask_sum + 1e-5)
+    total_depth = bid_sum + ask_sum
+    sma20 = df["Close"].rolling(20, min_periods=1).mean().iloc[-1]
+    trend_signal = float(df["Close"].iloc[-1] - sma20)
+    return pd.DataFrame([{
+        "top20_bid_sum": bid_sum,
+        "top20_ask_sum": ask_sum,
+        "obi_top20": obi,
+        "spread": spread,
+        "bid_ask_ratio": ratio,
+        "total_depth": total_depth,
+        "trend_signal": trend_signal,
+    }], columns=XGB_FEATURES)
+
+def calculate_ofi(current_bids, current_asks):
+    """Approximate top-20 order-book flow from consecutive snapshots."""
+    prev = st.session_state.get("previous_orderbook")
+    current_bid_sum = float(np.sum(current_bids[:, 1])) if len(current_bids) else 0.0
+    current_ask_sum = float(np.sum(current_asks[:, 1])) if len(current_asks) else 0.0
+    if prev is None:
+        ofi = 0.0
+    else:
+        prev_bid_sum, prev_ask_sum = prev
+        ofi = (current_bid_sum - prev_bid_sum) - (current_ask_sum - prev_ask_sum)
+    st.session_state.previous_orderbook = (current_bid_sum, current_ask_sum)
+    return float(ofi)
+
+
+def normalize_trade(trade):
+    trade["outcome"] = str(trade.get("outcome", "PENDING")).upper()
+    trade["status"] = "Closed" if trade["outcome"] in ("WIN", "LOSS") else "Open"
+    for key in ("entry_price", "stop_loss", "tp1", "tp2"):
+        try: trade[key] = float(trade.get(key, 0.0))
+        except Exception: trade[key] = 0.0
+    if not trade.get("rr_target"):
+        trade["rr_target"] = "1:2"
+    if not trade.get("exit_reason"):
+        trade["exit_reason"] = ""
+    if not trade.get("entry_candle_time"):
+        trade["entry_candle_time"] = trade.get("timestamp", "")
+    if "xgb_features_json" not in trade:
+        trade["xgb_features_json"] = ""
+    return trade
+
+st.session_state.trade_history_log = [normalize_trade(t) for t in st.session_state.trade_history_log]
+
+def resolve_pending_trades(history, symbol, timeframe, current_candle_time, candle_high, candle_low, current_price):
+    changed = False
+    current_candle_str = pd.Timestamp(current_candle_time).strftime("%Y-%m-%d %H:%M:%S")
+    for trade in history:
+        if str(trade.get("outcome", "")).upper() != "PENDING":
+            continue
+        if trade.get("symbol") != symbol or trade.get("timeframe") != timeframe:
+            continue
+
+        # Never evaluate the same candle that created the trade; its high/low
+        # may have happened before the entry at the candle close.
+        entry_candle = str(trade.get("entry_candle_time", ""))
+        if entry_candle == current_candle_str:
+            continue
+
+        direction = str(trade.get("direction", "")).upper()
+        entry = float(trade.get("entry_price", 0.0))
+        sl = float(trade.get("stop_loss", 0.0))
+        tp = float(trade.get("tp1", 0.0))
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            continue
+
+        tp_hit = float(candle_high) >= tp if direction == "LONG" else float(candle_low) <= tp
+        sl_hit = float(candle_low) <= sl if direction == "LONG" else float(candle_high) >= sl
+
+        if not tp_hit and not sl_hit:
+            continue
+
+        # If both levels were touched in one OHLC candle, the exact sequence
+        # is unknowable. Use conservative SL-first accounting instead of leaving it pending.
+        if sl_hit and tp_hit:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL & TP touched in same candle (SL-first conservative)"
+        elif tp_hit:
+            result = "WIN"
+            exit_price = tp
+            reason = "TP1 HIT"
+        else:
+            result = "LOSS"
+            exit_price = sl
+            reason = "SL HIT"
+
+        if direction == "LONG":
+            pnl = ((exit_price - entry) / entry) * 100.0
+        else:
+            pnl = ((entry - exit_price) / entry) * 100.0
+
+        trade["outcome"] = result
+        trade["exit_price"] = round(float(exit_price), 2)
+        trade["pnl_percent"] = round(float(pnl), 4)
+        trade["status"] = "Closed"
+        trade["duration"] = "Closed"
+        trade["exit_reason"] = reason
+        trade["exit_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append_feedback(trade)
+        changed = True
+    return changed
+
+
+# ==========================================
+# 1. RESEARCH LAB & RISK ENGINE MODULES (CORE)
+# ==========================================
+class TenPaperResearchLab:
+    def __init__(self, target_vol=0.15):
+        self.target_vol = target_vol
+        self.scaler = StandardScaler()
+        
+        # 12 Quantitative Papers & Metrics Formulas
+        self.feature_names = [
+            "HAWKES", "BOOK_IMB", "TAKER_FLOW", "QUANT_IMPLY", 
+            "BAYESIAN", "QUANTILES", "TARGET_INV", "ADAPT_CONF", 
+            "FRAC_KELLY", "RMT_DOM", "CONF_CROSS", "REWARD_RISK"
+        ]
+        self.dynamic_weights = {k: 1.0 / len(self.feature_names) for k in self.feature_names}
+
+    def extract_features(self, df, bids, asks):
+        results = {}
+        if len(bids) == 0 or len(asks) == 0 or df.empty or len(df) < 15:
+            return {k: 0.0 for k in self.feature_names}
+
+        bid_vol = np.sum(bids[:, 1])
+        ask_vol = np.sum(asks[:, 1])
+        mid_price = (bids[0, 0] + asks[0, 0]) / 2
+        returns = df["Close"].pct_change().dropna()
+        realized_vol = returns.std() + 1e-8
+        returns_h = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / (df["Close"].iloc[-5] + 1e-8)
+        delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
+
+        # 1. Hawkes Intensity Process
+        vol_changes = df["Volume"].pct_change().dropna().values
+        hawkes_intensity = (np.mean(vol_changes[-3:]) / (np.mean(vol_changes[-15:]) + 1e-8)) if len(vol_changes) >= 15 else 1.0
+        results["HAWKES"] = np.clip((hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1)
+
+        # 2. Book Imbalance
+        results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
+
+        # 3. Taker Flow
+        taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
+        taker_sell = df["Volume"].iloc[-1] * (1.0 if delta_p <= 0 else 0.3)
+        results["TAKER_FLOW"] = (taker_buy - taker_sell) / (taker_buy + taker_sell + 1e-8)
+
+        # 4. Quantities Imply
+        depth_skew = (bids[0, 1] - asks[0, 1]) / (bids[0, 1] + asks[0, 1] + 1e-8)
+        results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
+
+        # 5. Bayesian Probability
+        prior = 0.745
+        likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
+        posterior = (likelihood * prior) / ((likelihood * prior) + ((1 - likelihood) * (1 - prior)) + 1e-8)
+        results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
+
+        # 6. Quantiles Imply
+        q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
+        q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
+        results["QUANTILES"] = np.clip((returns_h - q10) / (q90 - q10 + 1e-8) * 2.0 - 1.0, -1, 1)
+
+        # 7. Target versus Invalidation Threshold
+        target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
+        results["TARGET_INV"] = 1.0 if target_diff >= 0.0006 else (-1.0 if target_diff <= -0.0006 else 0.0)
+
+        # 8. Adaptive Conformal Band Crosses Zero
+        ma_fast = df["Close"].rolling(3).mean().iloc[-1]
+        ma_slow = df["Close"].rolling(10).mean().iloc[-1]
+        results["ADAPT_CONF"] = np.clip((ma_fast - ma_slow) / (realized_vol * mid_price + 1e-8), -1, 1)
+
+        # 9. Fractional Kelly Risk
+        win_prob = 0.55 + (0.15 * np.sign(results["BOOK_IMB"]))
+        kelly_fraction = win_prob - ((1 - win_prob) / 1.5)
+        results["FRAC_KELLY"] = np.clip(kelly_fraction * 2.0 * np.sign(returns_h), -1, 1)
+
+        # 10. RMT Market Dominance
+        rmt_dom = (abs(returns_h) / (realized_vol * np.sqrt(5) + 1e-8)) / 3.0
+        results["RMT_DOM"] = np.clip(rmt_dom * np.sign(returns_h), -1, 1)
+
+        # 11. Conformal Interval Crosses Zero
+        conformal_spread = realized_vol * 1.96
+        upper_b = mid_price * (1 + conformal_spread)
+        lower_b = mid_price * (1 - conformal_spread)
+        results["CONF_CROSS"] = 1.0 if mid_price > (upper_b + lower_b) / 2 else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
+
+        # 12. Quantiles Reward / Risk Filter
+        rr_ratio = abs(q90) / (abs(q10) + 1e-8)
+        results["REWARD_RISK"] = 1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
+
+        return results
+
+    def calculate_all_signals(self, df, bids, asks, current_inventory=0, performance_history=None):
+        results = self.extract_features(df, bids, asks)
+        feature_vector = np.array([results[k] for k in self.feature_names]).reshape(1, -1)
+        
+        weight_vector = np.array(list(self.dynamic_weights.values()))
+        final_score = float(np.dot(feature_vector[0], weight_vector))
+
+        return results, final_score, self.dynamic_weights
+
+
+class PowerTradingRiskEngine:
+    def __init__(self):
+        pass
+
+    def calculate_risk_metrics(self, liquidation_volumes, displayed_vol, cancelled_vol, time_exists, obs_window, open_interest, leverage, volatility):
+        total_ltz = np.sum(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
+        max_ltz = np.max(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
+        ltz_score = (max_ltz / (total_ltz + 1e-8)) * 100
+
+        spoof_ratio = cancelled_vol / (displayed_vol + 1e-8)
+        persistence = min(max(time_exists / (obs_window + 1e-8), 0), 1)
+        spoof_score = spoof_ratio * (1 - persistence)
+
+        squeeze_risk = total_ltz * open_interest * leverage * volatility
+        market_risk = ltz_score + spoof_score + squeeze_risk
+
+        return {
+            "LTZ_Score": ltz_score,
+            "Spoof_Score": spoof_score,
+            "Squeeze_Risk": squeeze_risk,
+            "Market_Risk": market_risk
+        }
+
+
+# ==========================================
+# 3. PROFESSIONAL STYLING & THEME
+# ==========================================
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+    .stApp { background-color: #080a0f; color: #e2e8f0; }
+    section[data-testid="stSidebar"] { background-color: #0d1117 !important; border-right: 1px solid #161b22; }
+    .metric-card {
+        background: #111622; border: 1px solid #1e2638; border-radius: 12px;
+        padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px;
+    }
+    .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
+    .metric-val-green { font-size: 18px; font-weight: 700; color: #00e676; }
+    .metric-val-red { font-size: 18px; font-weight: 700; color: #ff5252; }
+    .metric-val-blue { font-size: 18px; font-weight: 700; color: #38bdf8; }
+    .top-status-bar {
+        background: #111622; border: 1px solid #1e2638; border-radius: 10px;
+        padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ==========================================
+# 4. SIDEBAR CONTROLS & FILTERS
+# ==========================================
 COINS_LIST = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "ADAUSDT",
-    "AVAXUSDT",
-    "DOTUSDT",
-    "LINKUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"
 ]
-
 
 TIMEFRAME_MAP = {
     "1m (Scalping)": ("1m", 1),
@@ -93,3811 +428,506 @@ TIMEFRAME_MAP = {
     "4h (Intraday)": ("4h", 240),
 }
 
+st.sidebar.markdown("### ⚡ Terminal Controls")
+selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
+selected_tf_label = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1)
+forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
+rr_choice = "TP1 1:2 | TP2 1:3"
+st.sidebar.markdown("**Risk / Reward Targets**")
+st.sidebar.info("TP1 = 1:2  •  TP2 = 1:3")
+rr_multiple = 2.0
+tp1_rr_multiple = 2.0
+tp2_rr_multiple = 3.0
 
-# ============================================================
-# CSS
-# ============================================================
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🎛️ Paper Trading Mode")
+paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
 
-st.markdown(
-    """
-<style>
+if xgb_model is not None:
+    st.sidebar.success("XGBoost model: LOADED")
+else:
+    st.sidebar.error("XGBoost model: NOT LOADED")
+    if xgb_model_error:
+        st.sidebar.caption(xgb_model_error)
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+feedback_count = len(_load_feedback())
+st.sidebar.caption(f"Auto-learning feedback: {feedback_count} completed trades")
+if st.session_state.get("xgb_retrain_message"):
+    st.sidebar.info(st.session_state["xgb_retrain_message"])
 
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif !important;
-}
-
-.stApp {
-    background:
-        radial-gradient(circle at top right, rgba(0, 180, 255, 0.07), transparent 28%),
-        radial-gradient(circle at bottom left, rgba(0, 255, 150, 0.04), transparent 25%),
-        #070a0f;
-    color: #e6edf3;
-}
-
-section[data-testid="stSidebar"] {
-    background: #0b0f15 !important;
-    border-right: 1px solid #1d2633;
-}
-
-.block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 2rem;
-}
-
-h1, h2, h3, h4 {
-    letter-spacing: -0.02em;
-}
-
-.terminal-header {
-    background: linear-gradient(
-        135deg,
-        #101722,
-        #0d131c
-    );
-    border: 1px solid #202b3a;
-    border-radius: 14px;
-    padding: 16px 20px;
-    margin-bottom: 14px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.25);
-}
-
-.terminal-title {
-    font-size: 24px;
-    font-weight: 800;
-    color: #f1f5f9;
-}
-
-.terminal-subtitle {
-    color: #7f8ea3;
-    font-size: 12px;
-    margin-top: 3px;
-}
-
-.status-bar {
-    background: #0e141d;
-    border: 1px solid #202b3a;
-    border-radius: 10px;
-    padding: 10px 14px;
-    margin: 10px 0 16px 0;
-    font-size: 12px;
-}
-
-.card {
-    background: linear-gradient(145deg, #111823, #0e141d);
-    border: 1px solid #202b3a;
-    border-radius: 12px;
-    padding: 15px;
-    margin-bottom: 10px;
-    box-shadow: 0 5px 18px rgba(0,0,0,.20);
-}
-
-.card-title {
-    color: #8492a6;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: .08em;
-    margin-bottom: 7px;
-}
-
-.card-value {
-    font-size: 21px;
-    font-weight: 800;
-}
-
-.card-small {
-    font-size: 11px;
-    color: #7f8ea3;
-    margin-top: 5px;
-}
-
-.signal-card {
-    background: linear-gradient(145deg, #121a25, #0c1219);
-    border: 1px solid #273448;
-    border-radius: 14px;
-    padding: 20px;
-    min-height: 190px;
-}
-
-.signal-label {
-    color: #8190a5;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: .08em;
-}
-
-.signal-value {
-    font-size: 32px;
-    font-weight: 900;
-    margin-top: 8px;
-}
-
-.green {
-    color: #00e676;
-}
-
-.red {
-    color: #ff5252;
-}
-
-.blue {
-    color: #38bdf8;
-}
-
-.yellow {
-    color: #fbbf24;
-}
-
-.muted {
-    color: #7f8ea3;
-}
-
-.section-title {
-    font-size: 17px;
-    font-weight: 800;
-    margin-top: 12px;
-    margin-bottom: 10px;
-}
-
-.badge {
-    display: inline-block;
-    padding: 4px 9px;
-    border-radius: 999px;
-    font-size: 10px;
-    font-weight: 800;
-    border: 1px solid #263446;
-    background: #111a25;
-}
-
-hr {
-    border-color: #1c2734 !important;
-}
-
-div[data-testid="stMetric"] {
-    background: #101721;
-    border: 1px solid #202b3a;
-    padding: 12px;
-    border-radius: 10px;
-}
-
-</style>
-""",
-    unsafe_allow_html=True,
-)
+api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
-# ============================================================
-# HISTORY
-# ============================================================
-
-EXPECTED_HISTORY_COLUMNS = [
-    "trade_id",
-    "timestamp",
-    "symbol",
-    "timeframe",
-    "direction",
-    "signal_strength",
-    "entry_price",
-    "stop_loss",
-    "tp1",
-    "tp2",
-    "rr_target",
-    "exit_price",
-    "confidence",
-    "xgb_confidence",
-    "xgb_features_json",
-    "final_score",
-    "outcome",
-    "pnl_percent",
-    "duration",
-    "status",
-    "exit_reason",
-    "entry_candle_time",
-    "exit_time",
-]
-
-
-def load_persistent_history():
-
-    if not os.path.exists(CSV_FILE):
-        return []
-
+# ==========================================
+# 5. DATA FETCHING (SAFE API WITH FALLBACK)
+# ==========================================
+@st.cache_data(ttl=15)
+def fetch_klines_data(symbol, tf_key, limit=100, allow_fallback=True):
+    binance_tf = "1m" if "1m" in tf_key else ("15m" if "15m" in tf_key else ("30m" if "30m" in tf_key else ("1h" if "1h" in tf_key else "4h")))
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
     try:
-
-        df = pd.read_csv(CSV_FILE)
-
-        for col in EXPECTED_HISTORY_COLUMNS:
-
-            if col not in df.columns:
-
-                if col == "outcome":
-                    df[col] = "PENDING"
-
-                elif col in ["signal_strength", "rr_target", "exit_reason"]:
-                    df[col] = ""
-
-                else:
-                    df[col] = 0.0
-
-        return df.to_dict("records")
-
+        res = requests.get(url, timeout=4).json()
+        if isinstance(res, dict) or not isinstance(res, list):
+            raise ValueError("API limit or invalid format")
+        df = pd.DataFrame(res, columns=["Open_Time", "Open", "High", "Low", "Close", "Volume", "Close_Time", "QAV", "NAT", "TBBAV", "TBQAV", "Ignore"])
+        df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = df[col].astype(float)
+        df.set_index("Time", inplace=True)
+        return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
     except Exception:
-        return []
-
-
-def save_persistent_history(history):
-
-    try:
-
-        pd.DataFrame(history).to_csv(
-            CSV_FILE,
-            index=False,
-        )
-
-    except Exception as e:
-
-        st.warning(
-            f"Could not save trade history: {e}"
-        )
-
-
-if "trade_history_log" not in st.session_state:
-
-    st.session_state.trade_history_log = (
-        load_persistent_history()
-    )
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-@st.cache_resource
-def load_xgb_model():
-
-    if not os.path.exists(MODEL_PATH):
-
-        return None, (
-            f"{MODEL_PATH} not found."
-        )
-
-    try:
-
-        model = joblib.load(MODEL_PATH)
-
-        if not hasattr(model, "predict"):
-
-            return None, (
-                "Model loaded but does not have predict()."
-            )
-
-        return model, None
-
-    except Exception as e:
-
-        return None, (
-            f"XGBoost loading error: {e}"
-        )
-
-
-xgb_model, xgb_model_error = load_xgb_model()
-
-
-# ============================================================
-# FEEDBACK
-# ============================================================
-
-def empty_feedback():
-
-    return pd.DataFrame(
-        columns=XGB_FEATURES + [
-            "target",
-            "trade_id",
-            "closed_at",
-        ]
-    )
-
-
-def load_feedback():
-
-    if not os.path.exists(FEEDBACK_FILE):
-        return empty_feedback()
-
-    try:
-
-        fb = pd.read_csv(FEEDBACK_FILE)
-
-        required = XGB_FEATURES + [
-            "target",
-            "trade_id",
-            "closed_at",
-        ]
-
-        for col in required:
-
-            if col not in fb.columns:
-                return empty_feedback()
-
-        fb = fb.dropna(
-            subset=XGB_FEATURES + ["target"]
-        )
-
-        return fb
-
-    except Exception:
-        return empty_feedback()
-
-
-def append_feedback(trade):
-
-    outcome = str(
-        trade.get("outcome", "")
-    ).upper()
-
-    if outcome not in ["WIN", "LOSS"]:
-        return
-
-    raw = trade.get(
-        "xgb_features_json",
-        "",
-    )
-
-    if not raw:
-        return
-
-    try:
-
-        features = (
-            json.loads(raw)
-            if isinstance(raw, str)
-            else raw
-        )
-
-        row = {}
-
-        for feature in XGB_FEATURES:
-
-            row[feature] = float(
-                features[feature]
-            )
-
-        direction = str(
-            trade.get("direction", "")
-        ).upper()
-
-        row["target"] = int(
-            (direction == "LONG")
-            == (outcome == "WIN")
-        )
-
-        row["trade_id"] = str(
-            trade.get("trade_id", "")
-        )
-
-        row["closed_at"] = trade.get(
-            "exit_time",
-            datetime.datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        )
-
-        fb = load_feedback()
-
-        if (
-            "trade_id" in fb.columns
-            and str(row["trade_id"])
-            in set(
-                fb["trade_id"]
-                .astype(str)
-            )
-        ):
-            return
-
-        fb = pd.concat(
-            [
-                fb,
-                pd.DataFrame([row]),
-            ],
-            ignore_index=True,
-        )
-
-        fb.to_csv(
-            FEEDBACK_FILE,
-            index=False,
-        )
-
-    except Exception:
-        pass
-
-
-def retrain_xgb_from_feedback(
-    current_model,
-):
-
-    fb = load_feedback()
-
-    if len(fb) < MIN_FEEDBACK_TO_RETRAIN:
-        return current_model, None
-
-    if fb["target"].nunique() < 2:
-        return current_model, None
-
-    last_count = int(
-        st.session_state.get(
-            "xgb_last_retrain_count",
-            0,
-        )
-    )
-
-    if len(fb) < (
-        last_count + RETRAIN_EVERY
-    ):
-        return current_model, None
-
-    fb = fb.sort_values(
-        "closed_at",
-        kind="stable",
-    )
-
-    split = max(
-        int(len(fb) * 0.80),
-        1,
-    )
-
-    if split >= len(fb):
-        return current_model, None
-
-    train = fb.iloc[:split]
-    test = fb.iloc[split:]
-
-    if train["target"].nunique() < 2:
-        return current_model, None
-
-    if test["target"].nunique() < 2:
-        return current_model, None
-
-    candidate = XGBClassifier(
-        n_estimators=180,
-        learning_rate=0.03,
-        max_depth=3,
-        min_child_weight=2,
-        subsample=0.90,
-        colsample_bytree=0.90,
-        reg_lambda=1.5,
-        random_state=42,
-        eval_metric="logloss",
-        n_jobs=2,
-    )
-
-    candidate.fit(
-        train[XGB_FEATURES],
-        train["target"].astype(int),
-    )
-
-    predictions = candidate.predict(
-        test[XGB_FEATURES]
-    )
-
-    accuracy = float(
-        accuracy_score(
-            test["target"].astype(int),
-            predictions,
-        )
-    )
-
-    st.session_state.xgb_last_retrain_count = len(fb)
-
-    if accuracy < MIN_TEST_ACCURACY:
-
-        return current_model, (
-            f"Retrain rejected | "
-            f"holdout accuracy "
-            f"{accuracy * 100:.1f}%"
-        )
-
-    temp_path = MODEL_PATH + ".tmp"
-
-    joblib.dump(
-        candidate,
-        temp_path,
-    )
-
-    os.replace(
-        temp_path,
-        MODEL_PATH,
-    )
-
-    return candidate, (
-        f"XGB retrained | "
-        f"{len(fb)} trades | "
-        f"holdout "
-        f"{accuracy * 100:.1f}%"
-    )
-
-
-# ============================================================
-# NORMALIZE TRADE
-# ============================================================
-
-def normalize_trade(trade):
-
-    trade["outcome"] = str(
-        trade.get(
-            "outcome",
-            "PENDING",
-        )
-    ).upper()
-
-    trade["status"] = (
-        "Closed"
-        if trade["outcome"]
-        in ["WIN", "LOSS"]
-        else "Open"
-    )
-
-    numeric_fields = [
-        "entry_price",
-        "stop_loss",
-        "tp1",
-        "tp2",
-        "exit_price",
-        "confidence",
-        "xgb_confidence",
-        "final_score",
-        "pnl_percent",
-    ]
-
-    for key in numeric_fields:
-
-        try:
-
-            trade[key] = float(
-                trade.get(key, 0)
-            )
-
-        except Exception:
-
-            trade[key] = 0.0
-
-    if not trade.get("rr_target"):
-        trade["rr_target"] = (
-            "TP1 1:2 | TP2 1:3"
-        )
-
-    if not trade.get("entry_candle_time"):
-
-        trade["entry_candle_time"] = (
-            trade.get(
-                "timestamp",
-                "",
-            )
-        )
-
-    if "xgb_features_json" not in trade:
-        trade["xgb_features_json"] = ""
-
-    if "signal_strength" not in trade:
-        trade["signal_strength"] = ""
-
-    return trade
-
-
-st.session_state.trade_history_log = [
-    normalize_trade(t)
-    for t in st.session_state.trade_history_log
-]
-
-
-# ============================================================
-# DATA FETCH
-# ============================================================
+        if not allow_fallback:
+            return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        dates = pd.date_range(end=datetime.datetime.now(), periods=limit, freq=binance_tf)
+        base_p = 60000.0
+        closes = base_p + np.cumsum(np.random.normal(0, 10, limit))
+        return pd.DataFrame({
+            "Time": dates,
+            "Open": closes - 5,
+            "High": closes + 15,
+            "Low": closes - 15,
+            "Close": closes,
+            "Volume": np.random.uniform(50, 500, limit)
+        })
 
 @st.cache_data(ttl=10)
-def fetch_klines_data(
-    symbol,
-    timeframe,
-    limit=150,
-):
-
-    interval = timeframe
-
-    url = (
-        "https://data-api.binance.vision"
-        "/api/v3/klines"
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
-
+def fetch_order_book_depth(symbol, depth_limit=20):
     try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=5,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not isinstance(data, list):
-            raise ValueError(
-                "Invalid Binance response"
-            )
-
-        df = pd.DataFrame(
-            data,
-            columns=[
-                "Open_Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "Close_Time",
-                "QAV",
-                "Trades",
-                "TBBAV",
-                "TBQAV",
-                "Ignore",
-            ],
-        )
-
-        df["Time"] = pd.to_datetime(
-            df["Open_Time"],
-            unit="ms",
-        )
-
-        for col in [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce",
-            )
-
-        return df[
-            [
-                "Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-            ]
-        ].dropna()
-
+        url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit={depth_limit}"
+        res = requests.get(url, timeout=4).json()
+        if "bids" in res and "asks" in res:
+            return np.array(res["bids"], dtype=float), np.array(res["asks"], dtype=float)
     except Exception:
-
-        return pd.DataFrame(
-            columns=[
-                "Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-            ]
-        )
-
-
-@st.cache_data(ttl=5)
-def fetch_order_book_depth(
-    symbol,
-    depth_limit=50,
-):
-
-    url = (
-        "https://data-api.binance.vision"
-        "/api/v3/depth"
-    )
-
-    params = {
-        "symbol": symbol,
-        "limit": depth_limit,
-    }
-
-    try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=5,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        bids = np.array(
-            data["bids"],
-            dtype=float,
-        )
-
-        asks = np.array(
-            data["asks"],
-            dtype=float,
-        )
-
-        return bids, asks
-
-    except Exception:
-
-        return (
-            np.empty((0, 2)),
-            np.empty((0, 2)),
-        )
-
-
-# ============================================================
-# ORDER BOOK FUNCTIONS
-# ============================================================
-
-def calculate_obi(
-    bids,
-    asks,
-    levels=20,
-):
-
-    if len(bids) == 0 or len(asks) == 0:
-        return 0.0
-
-    bid = float(
-        np.sum(
-            bids[:levels, 1]
-        )
-    )
-
-    ask = float(
-        np.sum(
-            asks[:levels, 1]
-        )
-    )
-
-    return (
-        (bid - ask)
-        / (bid + ask + 1e-12)
-    )
-
-
-def calculate_ofi(
-    bids,
-    asks,
-):
-
-    current_bid = (
-        float(np.sum(bids[:, 1]))
-        if len(bids)
-        else 0.0
-    )
-
-    current_ask = (
-        float(np.sum(asks[:, 1]))
-        if len(asks)
-        else 0.0
-    )
-
-    previous = st.session_state.get(
-        "previous_orderbook",
-        None,
-    )
-
-    if previous is None:
-
-        ofi = 0.0
-
-    else:
-
-        previous_bid, previous_ask = (
-            previous
-        )
-
-        ofi = (
-            current_bid
-            - previous_bid
-            - (
-                current_ask
-                - previous_ask
-            )
-        )
-
-    st.session_state.previous_orderbook = (
-        current_bid,
-        current_ask,
-    )
-
-    return float(ofi)
-
-
-def orderbook_stats(
-    bids,
-    asks,
-):
-
-    result = {}
-
-    for level in [
-        5,
-        10,
-        20,
-        50,
-    ]:
-
-        result[
-            f"obi_{level}"
-        ] = calculate_obi(
-            bids,
-            asks,
-            level,
-        )
-
-    result["bid20"] = (
-        float(
-            np.sum(
-                bids[:20, 1]
-            )
-        )
-        if len(bids)
-        else 0
-    )
-
-    result["ask20"] = (
-        float(
-            np.sum(
-                asks[:20, 1]
-            )
-        )
-        if len(asks)
-        else 0
-    )
-
-    result["bid50"] = (
-        float(
-            np.sum(
-                bids[:50, 1]
-            )
-        )
-        if len(bids)
-        else 0
-    )
-
-    result["ask50"] = (
-        float(
-            np.sum(
-                asks[:50, 1]
-            )
-        )
-        if len(asks)
-        else 0
-    )
-
-    result["spread"] = (
-        abs(
-            asks[0, 0]
-            - bids[0, 0]
-        )
-        if len(bids)
-        and len(asks)
-        else 0
-    )
-
-    return result
-
-
-# ============================================================
-# XGB FEATURES
-# ============================================================
-
-def build_xgb_features(
-    df,
-    bids,
-    asks,
-):
-
-    bid20 = (
-        float(
-            np.sum(
-                bids[:20, 1]
-            )
-        )
-        if len(bids)
-        else 0
-    )
-
-    ask20 = (
-        float(
-            np.sum(
-                asks[:20, 1]
-            )
-        )
-        if len(asks)
-        else 0
-    )
-
-    obi = (
-        (bid20 - ask20)
-        / (bid20 + ask20 + 1e-12)
-    )
-
-    spread = (
-        abs(
-            asks[0, 0]
-            - bids[0, 0]
-        )
-        if len(bids)
-        and len(asks)
-        else 0
-    )
-
-    ratio = (
-        bid20
-        / (ask20 + 1e-8)
-    )
-
-    total_depth = (
-        bid20 + ask20
-    )
-
-    if len(df) >= 20:
-
-        sma20 = (
-            df["Close"]
-            .rolling(20)
-            .mean()
-            .iloc[-1]
-        )
-
-    else:
-
-        sma20 = df["Close"].mean()
-
-    trend_signal = float(
-        df["Close"].iloc[-1]
-        - sma20
-    )
-
-    return pd.DataFrame(
-        [
-            {
-                "top20_bid_sum": bid20,
-                "top20_ask_sum": ask20,
-                "obi_top20": obi,
-                "spread": spread,
-                "bid_ask_ratio": ratio,
-                "total_depth": total_depth,
-                "trend_signal": trend_signal,
-            }
-        ],
-        columns=XGB_FEATURES,
-    )
-
-
-# ============================================================
-# RESEARCH ENGINE
-# ============================================================
-
-class TenPaperResearchLab:
-
-    def __init__(self):
-
-        self.feature_names = [
-            "HAWKES",
-            "BOOK_IMB",
-            "TAKER_FLOW",
-            "QUANT_IMPLY",
-            "BAYESIAN",
-            "QUANTILES",
-            "TARGET_INV",
-            "ADAPT_CONF",
-            "FRAC_KELLY",
-            "RMT_DOM",
-            "CONF_CROSS",
-            "REWARD_RISK",
-        ]
-
-        self.dynamic_weights = {
-            name: 1.0 / len(
-                self.feature_names
-            )
-            for name
-            in self.feature_names
-        }
-
-    def extract_features(
-        self,
-        df,
-        bids,
-        asks,
-    ):
-
-        result = {
-            name: 0.0
-            for name
-            in self.feature_names
-        }
-
-        if (
-            df.empty
-            or len(df) < 15
-            or len(bids) == 0
-            or len(asks) == 0
-        ):
-            return result
-
-        bid_volume = float(
-            np.sum(
-                bids[:20, 1]
-            )
-        )
-
-        ask_volume = float(
-            np.sum(
-                asks[:20, 1]
-            )
-        )
-
-        mid_price = (
-            bids[0, 0]
-            + asks[0, 0]
-        ) / 2
-
-        returns = (
-            df["Close"]
-            .pct_change()
-            .dropna()
-        )
-
-        volatility = (
-            float(returns.std())
-            + 1e-8
-        )
-
-        returns_h = (
-            df["Close"].iloc[-1]
-            - df["Close"].iloc[-5]
-        ) / (
-            df["Close"].iloc[-5]
-            + 1e-8
-        )
-
-        delta_price = (
-            df["Close"].iloc[-1]
-            - df["Close"].iloc[-2]
-        )
-
-        # Hawkes-style activity
-        volume_changes = (
-            df["Volume"]
-            .pct_change()
-            .replace(
-                [np.inf, -np.inf],
-                np.nan,
-            )
-            .dropna()
-            .values
-        )
-
-        if len(volume_changes) >= 15:
-
-            recent = np.mean(
-                volume_changes[-3:]
-            )
-
-            baseline = np.mean(
-                volume_changes[-15:]
-            )
-
-            hawkes = (
-                recent
-                / (abs(baseline) + 1e-8)
-            )
-
-            result["HAWKES"] = np.clip(
-                (
-                    hawkes - 1
-                )
-                * np.sign(
-                    returns_h
-                ),
-                -1,
-                1,
-            )
-
-        # Book imbalance
-        result["BOOK_IMB"] = (
-            (
-                bid_volume
-                - ask_volume
-            )
-            / (
-                bid_volume
-                + ask_volume
-                + 1e-8
-            )
-        )
-
-        # Taker flow approximation
-        volume_now = float(
-            df["Volume"].iloc[-1]
-        )
-
-        if delta_price > 0:
-
-            buy = volume_now
-            sell = volume_now * 0.3
-
-        else:
-
-            buy = volume_now * 0.3
-            sell = volume_now
-
-        result["TAKER_FLOW"] = (
-            buy - sell
-        ) / (
-            buy + sell + 1e-8
-        )
-
-        # Best level pressure
-        best_bid = float(
-            bids[0, 1]
-        )
-
-        best_ask = float(
-            asks[0, 1]
-        )
-
-        result["QUANT_IMPLY"] = np.clip(
-            (
-                best_bid
-                - best_ask
-            )
-            / (
-                best_bid
-                + best_ask
-                + 1e-8
-            )
-            * 1.5,
-            -1,
-            1,
-        )
-
-        # Bayesian
-        prior = 0.55
-
-        likelihood = (
-            0.70
-            if result["BOOK_IMB"] > 0
-            else 0.30
-        )
-
-        posterior = (
-            likelihood * prior
-        ) / (
-            likelihood * prior
-            + (
-                1 - likelihood
-            ) * (
-                1 - prior
-            )
-            + 1e-8
-        )
-
-        result["BAYESIAN"] = np.clip(
-            (
-                posterior - 0.5
-            ) * 2,
-            -1,
-            1,
-        )
-
-        # Quantiles
-        q90 = (
-            returns.quantile(0.90)
-            if len(returns) > 5
-            else 0.01
-        )
-
-        q10 = (
-            returns.quantile(0.10)
-            if len(returns) > 5
-            else -0.01
-        )
-
-        result["QUANTILES"] = np.clip(
-            (
-                (
-                    returns_h
-                    - q10
-                )
-                / (
-                    q90
-                    - q10
-                    + 1e-8
-                )
-                * 2
-                - 1
-            ),
-            -1,
-            1,
-        )
-
-        # Target/invalidation
-        move_pct = (
-            delta_price
-            / (
-                df["Close"].iloc[-1]
-                + 1e-8
-            )
-        )
-
-        if move_pct >= 0.0006:
-
-            result["TARGET_INV"] = 1.0
-
-        elif move_pct <= -0.0006:
-
-            result["TARGET_INV"] = -1.0
-
-        else:
-
-            result["TARGET_INV"] = 0.0
-
-        # Adaptive confirmation
-        fast = (
-            df["Close"]
-            .rolling(3)
-            .mean()
-            .iloc[-1]
-        )
-
-        slow = (
-            df["Close"]
-            .rolling(10)
-            .mean()
-            .iloc[-1]
-        )
-
-        result["ADAPT_CONF"] = np.clip(
-            (
-                fast - slow
-            )
-            / (
-                volatility
-                * mid_price
-                + 1e-8
-            ),
-            -1,
-            1,
-        )
-
-        # Fractional Kelly
-        win_probability = (
-            0.55
-            + 0.10
-            * np.sign(
-                result["BOOK_IMB"]
-            )
-        )
-
-        kelly = (
-            win_probability
-            - (
-                (
-                    1
-                    - win_probability
-                )
-                / 1.5
-            )
-        )
-
-        result["FRAC_KELLY"] = np.clip(
-            kelly
-            * 2
-            * np.sign(
-                returns_h
-            ),
-            -1,
-            1,
-        )
-
-        # RMT dominance
-        dominance = (
-            abs(returns_h)
-            / (
-                volatility
-                * np.sqrt(5)
-                + 1e-8
-            )
-        ) / 3
-
-        result["RMT_DOM"] = np.clip(
-            dominance
-            * np.sign(
-                returns_h
-            ),
-            -1,
-            1,
-        )
-
-        # Conformal center
-        result["CONF_CROSS"] = np.clip(
-            returns_h
-            / (
-                volatility
-                * 2
-                + 1e-8
-            ),
-            -1,
-            1,
-        )
-
-        # Reward/risk
-        rr = (
-            abs(q90)
-            / (
-                abs(q10)
-                + 1e-8
-            )
-        )
-
-        if rr >= 1.2:
-
-            result["REWARD_RISK"] = 1.0
-
-        elif rr < 0.8:
-
-            result["REWARD_RISK"] = -1.0
-
-        else:
-
-            result["REWARD_RISK"] = 0.0
-
-        return result
-
-    def calculate_all_signals(
-        self,
-        df,
-        bids,
-        asks,
-    ):
-
-        features = self.extract_features(
-            df,
-            bids,
-            asks,
-        )
-
-        vector = np.array(
-            [
-                features[k]
-                for k
-                in self.feature_names
-            ]
-        )
-
-        weights = np.array(
-            [
-                self.dynamic_weights[k]
-                for k
-                in self.feature_names
-            ]
-        )
-
-        score = float(
-            np.dot(
-                vector,
-                weights,
-            )
-        )
-
-        return (
-            features,
-            score,
-            self.dynamic_weights,
-        )
-
-
-# ============================================================
-# RISK ENGINE
-# ============================================================
-
-class PowerTradingRiskEngine:
-
-    def calculate_risk_metrics(
-        self,
-        bids,
-        asks,
-        volatility,
-    ):
-
-        bid_depth = (
-            np.sum(bids[:, 1])
-            if len(bids)
-            else 0
-        )
-
-        ask_depth = (
-            np.sum(asks[:, 1])
-            if len(asks)
-            else 0
-        )
-
-        total_depth = (
-            bid_depth
-            + ask_depth
-        )
-
-        imbalance = (
-            abs(
-                bid_depth
-                - ask_depth
-            )
-            / (
-                total_depth
-                + 1e-8
-            )
-        )
-
-        spread = (
-            abs(
-                asks[0, 0]
-                - bids[0, 0]
-            )
-            if len(bids)
-            and len(asks)
-            else 0
-        )
-
-        ltz_score = float(
-            min(
-                imbalance * 100,
-                100,
-            )
-        )
-
-        spoof_score = float(
-            min(
-                spread
-                / (
-                    (
-                        bids[0, 0]
-                        + asks[0, 0]
-                    )
-                    / 2
-                    + 1e-8
-                )
-                * 100000,
-                100,
-            )
-        )
-
-        squeeze = float(
-            min(
-                volatility * 1000,
-                100,
-            )
-        )
-
-        market_risk = float(
-            min(
-                0.45 * ltz_score
-                + 0.20 * spoof_score
-                + 0.35 * squeeze,
-                100,
-            )
-        )
-
-        if market_risk >= 75:
-
-            risk_status = "EXTREME"
-
-        elif market_risk >= 50:
-
-            risk_status = "HIGH"
-
-        elif market_risk >= 25:
-
-            risk_status = "MEDIUM"
-
-        else:
-
-            risk_status = "LOW"
-
-        return {
-            "LTZ_Score": ltz_score,
-            "Spoof_Score": spoof_score,
-            "Squeeze_Risk": squeeze,
-            "Market_Risk": market_risk,
-            "Risk_Status": risk_status,
-        }
-
-
-# ============================================================
-# PENDING TRADE RESOLUTION
-# ============================================================
-
-def resolve_pending_trades(
-    history,
-    symbol,
-    timeframe,
-    candle_time,
-    candle_high,
-    candle_low,
-):
-
-    changed = False
-
-    candle_string = (
-        pd.Timestamp(
-            candle_time
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    )
-
-    for trade in history:
-
-        if str(
-            trade.get(
-                "outcome",
-                "",
-            )
-        ).upper() != "PENDING":
-
+        pass
+    dummy_bids = np.array([[60000 - i*2, 1.5] for i in range(20)], dtype=float)
+    dummy_asks = np.array([[60000 + i*2, 1.5] for i in range(20)], dtype=float)
+    return dummy_bids, dummy_asks
+
+df = fetch_klines_data(selected_symbol, selected_tf_label)
+bids, asks = fetch_order_book_depth(selected_symbol)
+
+
+def resolve_all_pending_trades(history, selected_symbol, selected_tf_label, selected_df):
+    """Resolve pending trades for ALL symbol/timeframe combinations, not only the one selected in the sidebar."""
+    pairs = {(t.get("symbol"), t.get("timeframe")) for t in history
+             if str(t.get("outcome", "")).upper() == "PENDING"}
+    for symbol, timeframe in pairs:
+        if not symbol or not timeframe:
             continue
-
-        if trade.get("symbol") != symbol:
-            continue
-
-        if trade.get("timeframe") != timeframe:
-            continue
-
-        entry_candle = str(
-            trade.get(
-                "entry_candle_time",
-                "",
-            )
-        )
-
-        if (
-            entry_candle
-            == candle_string
-        ):
-            continue
-
-        direction = str(
-            trade.get(
-                "direction",
-                "",
-            )
-        ).upper()
-
-        entry = float(
-            trade.get(
-                "entry_price",
-                0,
-            )
-        )
-
-        sl = float(
-            trade.get(
-                "stop_loss",
-                0,
-            )
-        )
-
-        tp = float(
-            trade.get(
-                "tp1",
-                0,
-            )
-        )
-
-        if (
-            entry <= 0
-            or sl <= 0
-            or tp <= 0
-        ):
-            continue
-
-        if direction == "LONG":
-
-            tp_hit = (
-                candle_high >= tp
-            )
-
-            sl_hit = (
-                candle_low <= sl
-            )
-
+        if symbol == selected_symbol and timeframe == selected_tf_label:
+            local_df = selected_df
         else:
-
-            tp_hit = (
-                candle_low <= tp
-            )
-
-            sl_hit = (
-                candle_high >= sl
-            )
-
-        if not tp_hit and not sl_hit:
+            try:
+                local_df = fetch_klines_data(symbol, timeframe, limit=2, allow_fallback=False)
+            except Exception:
+                continue
+        if local_df is None or local_df.empty:
             continue
-
-        if tp_hit and sl_hit:
-
-            outcome = "LOSS"
-            exit_price = sl
-            reason = (
-                "SL & TP same candle "
-                "(SL-first)"
-            )
-
-        elif tp_hit:
-
-            outcome = "WIN"
-            exit_price = tp
-            reason = "TP1 HIT"
-
-        else:
-
-            outcome = "LOSS"
-            exit_price = sl
-            reason = "SL HIT"
-
-        if direction == "LONG":
-
-            pnl = (
-                (
-                    exit_price
-                    - entry
-                )
-                / entry
-            ) * 100
-
-        else:
-
-            pnl = (
-                (
-                    entry
-                    - exit_price
-                )
-                / entry
-            ) * 100
-
-        trade["outcome"] = outcome
-        trade["exit_price"] = round(
-            exit_price,
-            2,
-        )
-        trade["pnl_percent"] = round(
-            pnl,
-            4,
-        )
-        trade["status"] = "Closed"
-        trade["duration"] = "Closed"
-        trade["exit_reason"] = reason
-        trade["exit_time"] = (
-            datetime.datetime.now()
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        last = local_df.iloc[-1]
+        resolve_pending_trades(
+            history, symbol, timeframe, pd.Timestamp(last["Time"]),
+            float(last["High"]), float(last["Low"]), float(last["Close"])
         )
 
-        append_feedback(trade)
-
-        changed = True
-
-    return changed
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.markdown(
-    "## ⚡ Quant Terminal"
+resolve_all_pending_trades(
+    st.session_state.trade_history_log, selected_symbol, selected_tf_label, df
 )
+save_persistent_history(st.session_state.trade_history_log)
 
-st.sidebar.caption(
-    "Research • Microstructure • XGBoost • Paper Trading"
-)
-
-selected_symbol = st.sidebar.selectbox(
-    "Cryptocurrency",
-    COINS_LIST,
-)
-
-selected_tf_label = st.sidebar.selectbox(
-    "Timeframe",
-    list(TIMEFRAME_MAP.keys()),
-    index=1,
-)
-
-api_interval, tf_minutes = TIMEFRAME_MAP[
-    selected_tf_label
-]
-
-forecast_horizon = st.sidebar.slider(
-    "Forecast Horizon",
-    5,
-    30,
-    15,
-)
-
-st.sidebar.markdown("---")
-
-paper_trading_mode = st.sidebar.toggle(
-    "Enable Paper Trading",
-    value=True,
-)
-
-show_debug = st.sidebar.toggle(
-    "Show Engine Debug",
-    value=False,
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.markdown(
-    "### 🤖 XGBoost"
-)
-
-if xgb_model is not None:
-
-    st.sidebar.success(
-        "MODEL LOADED"
-    )
-
-else:
-
-    st.sidebar.error(
-        "MODEL NOT LOADED"
-    )
-
-    if xgb_model_error:
-
-        st.sidebar.caption(
-            xgb_model_error
-        )
-
-feedback_count = len(
-    load_feedback()
-)
-
-st.sidebar.caption(
-    f"Completed feedback: {feedback_count}"
-)
-
-if st.session_state.get(
-    "xgb_retrain_message"
-):
-
-    st.sidebar.info(
-        st.session_state[
-            "xgb_retrain_message"
-        ]
-    )
-
-
-# ============================================================
-# FETCH CURRENT DATA
-# ============================================================
-
-df = fetch_klines_data(
-    selected_symbol,
-    api_interval,
-    150,
-)
-
-bids, asks = fetch_order_book_depth(
-    selected_symbol,
-    50,
-)
-
-
-# ============================================================
-# HANDLE EMPTY DATA
-# ============================================================
-
-if (
-    df.empty
-    or len(df) < 20
-    or len(bids) == 0
-    or len(asks) == 0
-):
-
-    st.markdown(
-        """
-<div class="terminal-header">
-    <div class="terminal-title">
-        ⚡ Quantitative Research Terminal
-    </div>
-    <div class="terminal-subtitle">
-        Waiting for market data...
-    </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.warning(
-        "Market data is temporarily unavailable. "
-        "The dashboard will retry automatically."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# RESOLVE EXISTING PENDING TRADES
-# ============================================================
-
-pending_pairs = {
-    (
-        t.get("symbol"),
-        t.get("timeframe"),
-    )
-    for t
-    in st.session_state.trade_history_log
-    if str(
-        t.get("outcome", "")
-    ).upper() == "PENDING"
-}
-
-for symbol, timeframe in pending_pairs:
-
-    if not symbol or not timeframe:
-        continue
-
-    if (
-        symbol == selected_symbol
-        and timeframe == selected_tf_label
-    ):
-
-        local_df = df
-
-    else:
-
-        local_df = fetch_klines_data(
-            symbol,
-            timeframe.split(" ")[0],
-            3,
-        )
-
-    if local_df.empty:
-        continue
-
-    last = local_df.iloc[-1]
-
-    resolve_pending_trades(
-        st.session_state.trade_history_log,
-        symbol,
-        timeframe,
-        last["Time"],
-        float(last["High"]),
-        float(last["Low"]),
-    )
-
-save_persistent_history(
-    st.session_state.trade_history_log
-)
-
-
-# ============================================================
-# RETRAIN XGB
-# ============================================================
-
+# Controlled automatic learning from completed TP/SL trades.
 try:
-
-    (
-        xgb_model,
-        retrain_message,
-    ) = retrain_xgb_from_feedback(
-        xgb_model
-    )
-
+    xgb_model, retrain_message = _retrain_xgb_from_feedback(xgb_model)
     if retrain_message:
-
-        st.session_state[
-            "xgb_retrain_message"
-        ] = retrain_message
-
-except Exception as e:
-
-    st.session_state[
-        "xgb_retrain_message"
-    ] = f"Retrain skipped: {e}"
-
-
-# ============================================================
-# RESEARCH
-# ============================================================
-
-lab = TenPaperResearchLab()
-
-(
-    paper_results,
-    research_score,
-    research_weights,
-) = lab.calculate_all_signals(
-    df,
-    bids,
-    asks,
-)
-
-
-# ============================================================
-# PRICE
-# ============================================================
-
-close_price = float(
-    df["Close"].iloc[-1]
-)
-
-last_high = float(
-    df["High"].iloc[-1]
-)
-
-last_low = float(
-    df["Low"].iloc[-1]
-)
-
-last_candle_time = pd.Timestamp(
-    df["Time"].iloc[-1]
-)
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-tr = pd.concat(
-    [
-        df["High"] - df["Low"],
-        (
-            df["High"]
-            - df["Close"].shift()
-        ).abs(),
-        (
-            df["Low"]
-            - df["Close"].shift()
-        ).abs(),
-    ],
-    axis=1,
-).max(axis=1)
-
-atr = float(
-    tr.rolling(14)
-    .mean()
-    .iloc[-1]
-)
-
-if not np.isfinite(atr) or atr <= 0:
-
-    atr = close_price * 0.005
-
-
-# ============================================================
-# XGB PREDICTION
-# ============================================================
-
-xgb_features = build_xgb_features(
-    df,
-    bids,
-    asks,
-)
-
-xgb_signal = "NEUTRAL"
-xgb_confidence = 0.0
-xgb_prediction = None
-
-if xgb_model is not None:
-
-    try:
-
-        xgb_prediction = int(
-            xgb_model.predict(
-                xgb_features
-            )[0]
-        )
-
-        probabilities = (
-            xgb_model.predict_proba(
-                xgb_features
-            )[0]
-        )
-
-        xgb_confidence = float(
-            np.max(
-                probabilities
-            )
-            * 100
-        )
-
-        xgb_signal = (
-            "LONG"
-            if xgb_prediction == 1
-            else "SHORT"
-        )
-
-    except Exception as e:
-
-        xgb_model_error = (
-            f"Prediction error: {e}"
-        )
-
-
-# ============================================================
-# OBI / OFI
-# ============================================================
-
-stats = orderbook_stats(
-    bids,
-    asks,
-)
-
-obi5 = stats["obi_5"]
-obi10 = stats["obi_10"]
-obi20 = stats["obi_20"]
-obi50 = stats["obi_50"]
-
-ofi = calculate_ofi(
-    bids[:20],
-    asks[:20],
-)
-
-depth20 = (
-    stats["bid20"]
-    + stats["ask20"]
-)
-
-ofi_normalized = float(
-    np.clip(
-        ofi
-        / (
-            depth20
-            + 1e-8
-        ),
-        -1,
-        1,
-    )
-)
-
-micro_score = float(
-    np.clip(
-        0.65 * obi20
-        + 0.35 * ofi_normalized,
-        -1,
-        1,
-    )
-)
-
-if micro_score >= 0.08:
-
-    micro_direction = "LONG"
-
-elif micro_score <= -0.08:
-
-    micro_direction = "SHORT"
-
-else:
-
-    micro_direction = "NEUTRAL"
-
-
-# ============================================================
-# TREND
-# ============================================================
-
-ema9 = float(
-    df["Close"]
-    .ewm(
-        span=9,
-        adjust=False,
-    )
-    .mean()
-    .iloc[-1]
-)
-
-ema21 = float(
-    df["Close"]
-    .ewm(
-        span=21,
-        adjust=False,
-    )
-    .mean()
-    .iloc[-1]
-)
-
-momentum = float(
-    df["Close"].iloc[-1]
-    / (
-        df["Close"].iloc[-6]
-        + 1e-8
-    )
-    - 1
-)
-
-trend_score = float(
-    np.clip(
-        (
-            (
-                ema9
-                - ema21
-            )
-            / (
-                close_price
-                + 1e-8
-            )
-        )
-        * 250
-        + np.sign(momentum)
-        * min(
-            abs(momentum)
-            * 1000,
-            0.5,
-        ),
-        -1,
-        1,
-    )
-)
-
-if trend_score >= 0.10:
-
-    trend_direction = "LONG"
-
-elif trend_score <= -0.10:
-
-    trend_direction = "SHORT"
-
-else:
-
-    trend_direction = "NEUTRAL"
-
-
-# ============================================================
-# RESEARCH DIRECTION
-# ============================================================
-
-if research_score >= 0.15:
-
-    research_direction = "LONG"
-
-elif research_score <= -0.15:
-
-    research_direction = "SHORT"
-
-else:
-
-    research_direction = "NEUTRAL"
-
-
-# ============================================================
-# COMBINED ENGINE
-# ============================================================
-
-if xgb_signal == "LONG":
-
-    xgb_signed = (
-        xgb_confidence / 100
+        st.session_state.xgb_retrain_message = retrain_message
+except Exception as _retrain_err:
+    st.session_state.xgb_retrain_message = f"XGB retrain skipped: {_retrain_err}"
+
+
+# ==========================================
+# 6. ENGINE EXECUTION & SIGNAL GENERATION
+# ==========================================
+if not df.empty and len(df) >= 20 and len(bids) > 0 and len(asks) > 0:
+    lab = TenPaperResearchLab()
+    paper_results, research_score, evolved_weights = lab.calculate_all_signals(
+        df, bids, asks, current_inventory=0, performance_history=st.session_state.trade_history_log
     )
 
-elif xgb_signal == "SHORT":
+    close_p = float(df["Close"].iloc[-1])
+    high_p = float(df["High"].iloc[-1])
+    low_p = float(df["Low"].iloc[-1])
+    candle_time = pd.Timestamp(df["Time"].iloc[-1])
 
-    xgb_signed = -(
-        xgb_confidence / 100
-    )
+    atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr_val) or atr_val <= 0:
+        atr_val = close_p * 0.005
 
-else:
+    # ----- XGBoost live prediction: same 7 features used during training -----
+    xgb_features = build_xgb_features(df, bids, asks)
+    xgb_signal = "NEUTRAL"
+    xgb_confidence = 0.0
+    xgb_prediction = None
+    if xgb_model is not None:
+        try:
+            xgb_prediction = int(xgb_model.predict(xgb_features)[0])
+            probs = xgb_model.predict_proba(xgb_features)[0]
+            xgb_confidence = float(np.max(probs) * 100.0)
+            xgb_signal = "LONG" if xgb_prediction == 1 else "SHORT"
+        except Exception as e:
+            xgb_model_error = f"XGBoost prediction error: {e}"
 
-    xgb_signed = 0.0
+    # ----- OBI / OFI confirmation -----
+    bid_vol_sum = float(np.sum(bids[:, 1])) if len(bids) else 0.0
+    ask_vol_sum = float(np.sum(asks[:, 1])) if len(asks) else 0.0
+    obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum + 1e-8)
+    ofi_val = calculate_ofi(bids, asks)
+    ofi_scale = max(abs(bid_vol_sum) + abs(ask_vol_sum), 1.0)
+    ofi_norm = float(np.clip(ofi_val / ofi_scale, -1.0, 1.0))
+    micro_score = float(np.clip(0.65 * obi_val + 0.35 * ofi_norm, -1.0, 1.0))
+    micro_direction = "LONG" if micro_score >= 0.08 else ("SHORT" if micro_score <= -0.08 else "NEUTRAL")
 
+    research_direction = "LONG" if research_score >= 0.15 else ("SHORT" if research_score <= -0.15 else "NEUTRAL")
+    xgb_signed = ((xgb_confidence / 100.0) * (1 if xgb_signal == "LONG" else -1)) if xgb_signal != "NEUTRAL" else 0.0
 
-combined_score = float(
-    np.clip(
-        0.45 * xgb_signed
-        + 0.25 * research_score
-        + 0.20 * micro_score
-        + 0.10 * trend_score,
-        -1,
-        1,
-    )
-)
+    # ----- Independent trend confirmation for direction quality -----
+    ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = df["Close"].ewm(span=21, adjust=False).mean().iloc[-1]
+    momentum5 = float(df["Close"].iloc[-1] / (df["Close"].iloc[-6] + 1e-8) - 1.0) if len(df) >= 6 else 0.0
+    trend_score = float(np.clip(((ema9 - ema21) / (close_p + 1e-8)) * 250.0 + np.sign(momentum5) * min(abs(momentum5) * 1000.0, 0.5), -1.0, 1.0))
+    trend_direction = "LONG" if trend_score >= 0.10 else ("SHORT" if trend_score <= -0.10 else "NEUTRAL")
 
+    # ----- Conservative combined decision engine -----
+    # XGB must have meaningful confidence and must not directly conflict with
+    # both research and microstructure. Trend is an additional quality gate.
+    agreement_votes = [d for d in (xgb_signal, research_direction, micro_direction, trend_direction) if d != "NEUTRAL"]
+    long_votes = agreement_votes.count("LONG")
+    short_votes = agreement_votes.count("SHORT")
 
-votes = [
-    xgb_signal,
-    research_direction,
-    micro_direction,
-    trend_direction,
-]
+    combined_score = float(np.clip(
+        0.45 * xgb_signed + 0.25 * research_score + 0.20 * micro_score + 0.10 * trend_score,
+        -1.0, 1.0
+    ))
 
-long_votes = votes.count("LONG")
-short_votes = votes.count("SHORT")
+    xgb_conf_ok = xgb_confidence >= 60.0
+    long_confirmed = (xgb_signal == "LONG" and research_direction == "LONG" and
+                      micro_direction == "LONG" and trend_direction != "SHORT")
+    short_confirmed = (xgb_signal == "SHORT" and research_direction == "SHORT" and
+                       micro_direction == "SHORT" and trend_direction != "LONG")
 
-
-xgb_ok = (
-    xgb_confidence >= 60
-)
-
-
-long_confirmed = (
-    xgb_signal == "LONG"
-    and research_direction == "LONG"
-    and micro_direction == "LONG"
-    and trend_direction != "SHORT"
-)
-
-short_confirmed = (
-    xgb_signal == "SHORT"
-    and research_direction == "SHORT"
-    and micro_direction == "SHORT"
-    and trend_direction != "LONG"
-)
-
-
-if (
-    long_confirmed
-    and xgb_ok
-    and combined_score >= 0.18
-):
-
-    direction = "LONG"
-
-elif (
-    short_confirmed
-    and xgb_ok
-    and combined_score <= -0.18
-):
-
-    direction = "SHORT"
-
-elif (
-    xgb_signal == "LONG"
-    and xgb_confidence >= 65
-    and long_votes >= 3
-    and trend_direction != "SHORT"
-    and combined_score >= 0.18
-):
-
-    direction = "LONG"
-
-elif (
-    xgb_signal == "SHORT"
-    and xgb_confidence >= 65
-    and short_votes >= 3
-    and trend_direction != "LONG"
-    and combined_score <= -0.18
-):
-
-    direction = "SHORT"
-
-else:
-
-    direction = "NEUTRAL"
-
-
-confidence = int(
-    np.clip(
-        abs(combined_score)
-        * 100,
-        0,
-        99,
-    )
-)
-
-
-# ============================================================
-# SIGNAL STRENGTH
-# ============================================================
-
-if direction == "LONG":
-
-    if (
-        xgb_confidence >= 80
-        and long_votes >= 4
-        and combined_score >= 0.45
-    ):
-
-        signal_strength = "STRONG LONG"
-
+    if long_confirmed and xgb_conf_ok and combined_score >= 0.18:
+        direction = "LONG"
+    elif short_confirmed and xgb_conf_ok and combined_score <= -0.18:
+        direction = "SHORT"
     else:
-
-        signal_strength = "LONG"
-
-elif direction == "SHORT":
-
-    if (
-        xgb_confidence >= 80
-        and short_votes >= 4
-        and combined_score <= -0.45
-    ):
-
-        signal_strength = "STRONG SHORT"
-
-    else:
-
-        signal_strength = "SHORT"
-
-else:
-
-    signal_strength = "WAIT"
-
-
-# ============================================================
-# TARGETS
-# ============================================================
-
-risk_distance = max(
-    atr,
-    close_price * 0.001,
-)
-
-TP1_R = 2.0
-TP2_R = 3.0
-
-
-if direction == "LONG":
-
-    sl_price = (
-        close_price
-        - risk_distance
-    )
-
-    tp1_price = (
-        close_price
-        + risk_distance * TP1_R
-    )
-
-    tp2_price = (
-        close_price
-        + risk_distance * TP2_R
-    )
-
-elif direction == "SHORT":
-
-    sl_price = (
-        close_price
-        + risk_distance
-    )
-
-    tp1_price = (
-        close_price
-        - risk_distance * TP1_R
-    )
-
-    tp2_price = (
-        close_price
-        - risk_distance * TP2_R
-    )
-
-else:
-
-    sl_price = (
-        close_price
-        - risk_distance
-    )
-
-    tp1_price = (
-        close_price
-        + risk_distance * TP1_R
-    )
-
-    tp2_price = (
-        close_price
-        + risk_distance * TP2_R
-    )
-
-
-# ============================================================
-# RISK
-# ============================================================
-
-risk_engine = PowerTradingRiskEngine()
-
-volatility = float(
-    df["Close"]
-    .pct_change()
-    .std()
-)
-
-risk_metrics = (
-    risk_engine.calculate_risk_metrics(
-        bids,
-        asks,
-        volatility,
-    )
-)
-
-
-# ============================================================
-# PAPER TRADE
-# ============================================================
-
-lock_seconds = (
-    tf_minutes * 60
-)
-
-now_seconds = int(
-    time.time()
-)
-
-bucket = (
-    now_seconds
-    - (
-        now_seconds
-        % lock_seconds
-    )
-)
-
-time_remaining = (
-    lock_seconds
-    - (
-        now_seconds
-        % lock_seconds
-    )
-)
-
-trade_id = (
-    f"{selected_symbol}_"
-    f"{api_interval}_"
-    f"{bucket}_"
-    f"{direction}"
-)
-
-
-if (
-    paper_trading_mode
-    and direction != "NEUTRAL"
-):
-
-    existing_ids = {
-        str(
-            t.get(
-                "trade_id",
-                "",
-            )
-        )
-        for t
-        in st.session_state.trade_history_log
-    }
-
-    if trade_id not in existing_ids:
-
-        new_trade = {
-
-            "trade_id": trade_id,
-
-            "timestamp":
-                datetime.datetime.now()
-                .strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-
-            "entry_candle_time":
-                last_candle_time.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-
-            "symbol":
-                selected_symbol,
-
-            "timeframe":
-                selected_tf_label,
-
-            "direction":
-                direction,
-
-            "signal_strength":
-                signal_strength,
-
-            "entry_price":
-                round(
-                    close_price,
-                    2,
-                ),
-
-            "stop_loss":
-                round(
-                    sl_price,
-                    2,
-                ),
-
-            "tp1":
-                round(
-                    tp1_price,
-                    2,
-                ),
-
-            "tp2":
-                round(
-                    tp2_price,
-                    2,
-                ),
-
-            "rr_target":
-                "TP1 1:2 | TP2 1:3",
-
-            "exit_price":
-                0.0,
-
-            "confidence":
-                confidence,
-
-            "xgb_confidence":
-                round(
-                    xgb_confidence,
-                    2,
-                ),
-
-            "xgb_features_json":
-                json.dumps(
-                    {
-                        k: float(
-                            xgb_features.iloc[
-                                0
-                            ][k]
-                        )
-                        for k
-                        in XGB_FEATURES
-                    }
-                ),
-
-            "final_score":
-                round(
-                    combined_score,
-                    4,
-                ),
-
-            "outcome":
-                "PENDING",
-
-            "pnl_percent":
-                0.0,
-
-            "duration":
-                "Active",
-
-            "status":
-                "Open",
-
-            "exit_reason":
-                "",
-
-        }
-
-        st.session_state.trade_history_log.insert(
-            0,
-            new_trade,
-        )
-
-        save_persistent_history(
-            st.session_state.trade_history_log
-        )
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-if direction == "LONG":
-
-    signal_color = "#00e676"
-
-elif direction == "SHORT":
-
-    signal_color = "#ff5252"
-
-else:
-
-    signal_color = "#38bdf8"
-
-
-mins, secs = divmod(
-    time_remaining,
-    60,
-)
-
-
-st.markdown(
-    f"""
-<div class="terminal-header">
-
-    <div class="terminal-title">
-        ⚡ Quantitative Research & Paper Trading Terminal
-    </div>
-
-    <div class="terminal-subtitle">
-        Multi-factor market research engine
-        • Order Book Microstructure
-        • XGBoost Direction Model
-        • 12 Quantitative Research Factors
-    </div>
-
-</div>
-
-<div class="status-bar">
-
-    <b>{selected_symbol}</b>
-    &nbsp; | &nbsp;
-
-    Price:
-    <b>${close_price:,.2f}</b>
-
-    &nbsp; | &nbsp;
-
-    TF:
-    <b>{selected_tf_label}</b>
-
-    &nbsp; | &nbsp;
-
-    SIGNAL:
-    <span style="color:{signal_color};font-weight:900;">
-        {signal_strength}
-    </span>
-
-    &nbsp; | &nbsp;
-
-    SCORE:
-    <b>{combined_score:+.3f}</b>
-
-    &nbsp; | &nbsp;
-
-    XGB:
-    <b>{xgb_signal}</b>
-    ({xgb_confidence:.1f}%)
-
-    &nbsp; | &nbsp;
-
-    OBI:
-    <b>{obi20:+.3f}</b>
-
-    &nbsp; | &nbsp;
-
-    OFI:
-    <b>{ofi:+.2f}</b>
-
-    &nbsp; | &nbsp;
-
-    CONF:
-    <b>{confidence}%</b>
-
-    &nbsp; | &nbsp;
-
-    RESET:
-    <b>{mins}m {secs}s</b>
-
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# MAIN SIGNAL CARDS
-# ============================================================
-
-c1, c2, c3, c4, c5 = st.columns(
-    [1.35, 1, 1, 1, 1]
-)
-
-
-with c1:
-
-    st.markdown(
-        f"""
-<div class="signal-card"
-     style="border-left:4px solid {signal_color};">
-
-    <div class="signal-label">
-        Signal Execution
-    </div>
-
-    <div class="signal-value"
-         style="color:{signal_color};">
-        {signal_strength}
-    </div>
-
-    <div class="card-small">
-        Direction: <b>{direction}</b>
-    </div>
-
-    <div class="card-small">
-        XGB: <b>{xgb_confidence:.1f}%</b>
-        &nbsp; • &nbsp;
-        Votes:
-        <b>{max(long_votes, short_votes)}/4</b>
-    </div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with c2:
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Entry
-</div>
-
-<div class="card-value blue">
-${close_price:,.2f}
-</div>
-
-<div class="card-small">
-Current market price
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with c3:
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Stop Loss
-</div>
-
-<div class="card-value red">
-${sl_price:,.2f}
-</div>
-
-<div class="card-small">
-Risk distance: ${risk_distance:,.2f}
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with c4:
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-TP1 • 2R
-</div>
-
-<div class="card-value green">
-${tp1_price:,.2f}
-</div>
-
-<div class="card-small">
-Risk / Reward: 1 : 2
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with c5:
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-TP2 • 3R
-</div>
-
-<div class="card-value green">
-${tp2_price:,.2f}
-</div>
-
-<div class="card-small">
-Risk / Reward: 1 : 3
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-# ============================================================
-# SECOND METRIC ROW
-# ============================================================
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-
-
-with m1:
-
-    st.metric(
-        "OBI Top 5",
-        f"{obi5:+.3f}",
-    )
-
-
-with m2:
-
-    st.metric(
-        "OBI Top 10",
-        f"{obi10:+.3f}",
-    )
-
-
-with m3:
-
-    st.metric(
-        "OBI Top 20",
-        f"{obi20:+.3f}",
-    )
-
-
-with m4:
-
-    st.metric(
-        "OBI Top 50",
-        f"{obi50:+.3f}",
-    )
-
-
-with m5:
-
-    st.metric(
-        "Research Score",
-        f"{research_score:+.3f}",
-    )
-
-
-with m6:
-
-    st.metric(
-        "Market Risk",
-        f"{risk_metrics['Market_Risk']:.1f}",
-        risk_metrics["Risk_Status"],
-    )
-
-
-# ============================================================
-# PRICE CHART + MICROSTRUCTURE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📈 Price Structure & Forecast</div>',
-    unsafe_allow_html=True,
-)
-
-chart_col, micro_col = st.columns(
-    [2.5, 1]
-)
-
-
-with chart_col:
-
-    future_delta = pd.Timedelta(
-        minutes=tf_minutes
-    )
-
-    future_times = [
-        last_candle_time
-        + future_delta * i
-        for i
-        in range(
-            1,
-            forecast_horizon + 1,
-        )
-    ]
-
-    steps = np.linspace(
-        0,
-        np.pi / 2,
-        forecast_horizon,
-    )
-
-    if direction == "LONG":
-
-        forecast = (
-            close_price
-            + (
-                tp2_price
-                - close_price
-            )
-            * np.sin(steps)
-        )
-
-    elif direction == "SHORT":
-
-        forecast = (
-            close_price
-            - (
-                close_price
-                - tp2_price
-            )
-            * np.sin(steps)
-        )
-
-    else:
-
-        forecast = np.full(
-            forecast_horizon,
-            close_price,
-        )
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df["Time"],
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=[
-                last_candle_time
-            ] + future_times,
-            y=[
-                close_price
-            ] + list(forecast),
-            mode="lines+markers",
-            name="Model Trajectory",
-            line=dict(
-                color=signal_color,
-                width=2,
-                dash="dot",
-            ),
-        )
-    )
-
-    fig.add_hline(
-        y=sl_price,
-        line_dash="dot",
-        annotation_text="SL",
-    )
-
-    fig.add_hline(
-        y=tp1_price,
-        line_dash="dash",
-        annotation_text="TP1",
-    )
-
-    fig.add_hline(
-        y=tp2_price,
-        line_dash="dash",
-        annotation_text="TP2",
-    )
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=470,
-        xaxis_rangeslider_visible=False,
-        paper_bgcolor="#0e141d",
-        plot_bgcolor="#0e141d",
-        margin=dict(
-            l=10,
-            r=10,
-            t=10,
-            b=10,
-        ),
-        legend=dict(
-            orientation="h",
-        ),
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-    )
-
-
-with micro_col:
-
-    st.markdown(
-        """
-<div class="section-title">
-    🧠 Market Microstructure
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    bid20 = stats["bid20"]
-    ask20 = stats["ask20"]
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Top 20 Order Book
-</div>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Bid Volume</span>
-<b class="green">
-{bid20:,.3f}
-</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Ask Volume</span>
-<b class="red">
-{ask20:,.3f}
-</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>OBI</span>
-<b class="blue">
-{obi20:+.4f}
-</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>OFI</span>
-<b class="yellow">
-{ofi:+.2f}
-</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Spread</span>
-<b>
-${stats["spread"]:.4f}
-</b>
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Directional Components
-</div>
-
-<div style="display:flex;justify-content:space-between;">
-<span>XGBoost</span>
-<b>{xgb_signal}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Research</span>
-<b>{research_direction}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Microstructure</span>
-<b>{micro_direction}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Trend</span>
-<b>{trend_direction}</b>
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-# ============================================================
-# OBI PROFILE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📊 Order Book Imbalance Profile</div>',
-    unsafe_allow_html=True,
-)
-
-obi_fig = go.Figure()
-
-obi_fig.add_trace(
-    go.Bar(
-        x=[
-            "Top 5",
-            "Top 10",
-            "Top 20",
-            "Top 50",
-        ],
-        y=[
-            obi5,
-            obi10,
-            obi20,
-            obi50,
-        ],
-        text=[
-            f"{obi5:+.3f}",
-            f"{obi10:+.3f}",
-            f"{obi20:+.3f}",
-            f"{obi50:+.3f}",
-        ],
-        textposition="auto",
-    )
-)
-
-obi_fig.add_hline(
-    y=0,
-    line_dash="dot",
-)
-
-obi_fig.update_layout(
-    template="plotly_dark",
-    height=260,
-    paper_bgcolor="#0e141d",
-    plot_bgcolor="#0e141d",
-    margin=dict(
-        l=10,
-        r=10,
-        t=10,
-        b=10,
-    ),
-)
-
-st.plotly_chart(
-    obi_fig,
-    use_container_width=True,
-    config={
-        "displayModeBar": False
-    },
-)
-
-
-# ============================================================
-# RISK + RESEARCH
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🛡️ Risk Engine & Research Engine</div>',
-    unsafe_allow_html=True,
-)
-
-risk_col, research_col = st.columns(
-    [1, 2]
-)
-
-
-with risk_col:
-
-    risk_status = (
-        risk_metrics[
-            "Risk_Status"
-        ]
-    )
-
-    risk_color = (
-        "#00e676"
-        if risk_status == "LOW"
-        else (
-            "#fbbf24"
-            if risk_status == "MEDIUM"
-            else "#ff5252"
-        )
-    )
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Market Risk Status
-</div>
-
-<div style="
-font-size:28px;
-font-weight:900;
-color:{risk_color};
-">
-{risk_status}
-</div>
-
-<hr>
-
-<div style="display:flex;justify-content:space-between;">
-<span>LTZ Score</span>
-<b>{risk_metrics["LTZ_Score"]:.2f}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Spoof Score</span>
-<b>{risk_metrics["Spoof_Score"]:.2f}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Squeeze Risk</span>
-<b>{risk_metrics["Squeeze_Risk"]:.2f}</b>
-</div>
-
-<br>
-
-<div style="display:flex;justify-content:space-between;">
-<span>Total Risk</span>
-<b>{risk_metrics["Market_Risk"]:.2f}</b>
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with research_col:
-
-    paper_rows = []
-
-    for name, value in paper_results.items():
-
-        if value > 0.10:
-
-            status = "PASS 🟢"
-
-        elif value < -0.10:
-
-            status = "FAIL 🔴"
-
+        # Fallback: allow 3-of-4 agreement only when the XGB direction is
+        # included and trend is not actively against the trade.
+        if xgb_signal == "LONG" and xgb_confidence >= 65 and long_votes >= 3 and trend_direction != "SHORT" and combined_score >= 0.18:
+            direction = "LONG"
+        elif xgb_signal == "SHORT" and xgb_confidence >= 65 and short_votes >= 3 and trend_direction != "LONG" and combined_score <= -0.18:
+            direction = "SHORT"
         else:
+            direction = "NEUTRAL"
 
-            status = "NEUTRAL ⚪"
+    confidence = int(np.clip(abs(combined_score) * 100.0, 0, 99))
 
-        paper_rows.append(
-            {
-                "Research Factor": name,
-                "Value": round(
-                    value,
-                    4,
-                ),
-                "Weight": f"{research_weights[name] * 100:.1f}%",
-                "Status": status,
+    # ----- Signal strength / high-confluence labels -----
+    # Keep direction as LONG/SHORT/NEUTRAL internally so TP/SL and trade tracking
+    # continue to work. The stronger label is a presentation/quality layer.
+    if direction == "LONG":
+        if (xgb_confidence >= 80.0 and long_votes >= 4 and
+                combined_score >= 0.45 and trend_direction != "SHORT"):
+            signal_strength = "STRONG LONG"
+        else:
+            signal_strength = "LONG"
+    elif direction == "SHORT":
+        if (xgb_confidence >= 80.0 and short_votes >= 4 and
+                combined_score <= -0.45 and trend_direction != "LONG"):
+            signal_strength = "STRONG SELL"
+        else:
+            signal_strength = "SHORT"
+    else:
+        signal_strength = "WAIT"
+
+    # ----- ATR based SL with fixed targets: TP1 = 1:2, TP2 = 1:3 -----
+    risk_distance = max(float(atr_val), close_p * 0.001)
+    if direction == "LONG":
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
+    elif direction == "SHORT":
+        sl_val = close_p + risk_distance
+        tp1_val = close_p - (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p - (risk_distance * tp2_rr_multiple)
+    else:
+        sl_val = close_p - risk_distance
+        tp1_val = close_p + (risk_distance * tp1_rr_multiple)
+        tp2_val = close_p + (risk_distance * tp2_rr_multiple)
+
+    actual_risk = abs(close_p - sl_val)
+    tp1_reward = abs(tp1_val - close_p)
+    tp2_reward = abs(tp2_val - close_p)
+    actual_rr = tp1_reward / actual_risk if actual_risk > 0 else 0.0
+    tp2_rr = tp2_reward / actual_risk if actual_risk > 0 else 0.0
+    beam_level = tp2_val
+    base_level = sl_val
+
+    lock_seconds = tf_minutes * 60
+    current_time_sec = int(time.time())
+    time_bucket = current_time_sec - (current_time_sec % lock_seconds)
+    time_remaining = lock_seconds - (current_time_sec % lock_seconds)
+    trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}_{direction}"
+
+    if paper_trading_mode and direction != "NEUTRAL":
+        existing_trade_ids = {item.get("trade_id") for item in st.session_state.trade_history_log}
+        if trade_id not in existing_trade_ids:
+            new_trade = {
+                "trade_id": trade_id,
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_candle_time": candle_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": selected_symbol,
+                "timeframe": selected_tf_label,
+                "direction": direction,
+                "signal_strength": signal_strength,
+                "entry_price": round(close_p, 2),
+                "stop_loss": round(sl_val, 2),
+                "tp1": round(tp1_val, 2),
+                "tp2": round(tp2_val, 2),
+                "rr_target": "TP1 1:2 | TP2 1:3",
+                "exit_price": None,
+                "confidence": confidence,
+                "xgb_confidence": round(xgb_confidence, 2),
+                "xgb_features_json": json.dumps({k: float(xgb_features.iloc[0][k]) for k in XGB_FEATURES}),
+                "final_score": round(combined_score, 3),
+                "outcome": "PENDING",
+                "pnl_percent": 0.0,
+                "duration": "Active",
+                "status": "Open",
+                "exit_reason": ""
             }
-        )
+            st.session_state.trade_history_log.insert(0, new_trade)
 
-    st.dataframe(
-        pd.DataFrame(
-            paper_rows
-        ),
-        use_container_width=True,
-        hide_index=True,
-        height=330,
+    # Persist every refresh so a closed trade cannot remain visually pending after rerun.
+    save_persistent_history(st.session_state.trade_history_log)
+
+    risk_engine = PowerTradingRiskEngine()
+    disp_vol = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+    risk_metrics = risk_engine.calculate_risk_metrics(
+        liquidation_volumes=np.array([1000, 2500]), displayed_vol=disp_vol,
+        cancelled_vol=disp_vol * 0.1, time_exists=15.0, obs_window=60.0,
+        open_interest=150000.0, leverage=20.0, volatility=df["Close"].pct_change().std() + 1e-8
     )
 
+    # ==========================================
+    # 7. TOP HEADER STATUS BAR
+    # ==========================================
+    dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    signal_color = "#00e676" if signal_strength == "STRONG LONG" else ("#ff5252" if signal_strength == "STRONG SELL" else dir_color)
+    mins_rem, secs_rem = divmod(time_remaining, 60)
 
-# ============================================================
-# PERFORMANCE
-# ============================================================
+    st.markdown(f"""
+    <div class="top-status-bar">
+        🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.2f}</b> &nbsp;|&nbsp; 
+        TF: {selected_tf_label} &nbsp;|&nbsp; SIGNAL: <span style="color:{signal_color};">{signal_strength}</span> &nbsp;|&nbsp; 
+        Score: <b>{combined_score:+.3f}</b> &nbsp;|&nbsp; Research: <b>{research_score:+.3f}</b> &nbsp;|&nbsp; OBI: <b>{obi_val:+.3f}</b> &nbsp;|&nbsp; OFI: <b>{ofi_val:+.2f}</b> &nbsp;|&nbsp; XGB: <b>{xgb_signal}</b> ({xgb_confidence:.1f}%) &nbsp;|&nbsp; Trend: <b>{trend_direction}</b> &nbsp;|&nbsp; Confidence: <b>{confidence}%</b> &nbsp;|&nbsp; 
+        ⏳ Next Reset: <b>{mins_rem}m {secs_rem}s</b>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.markdown(
-    '<div class="section-title">📊 Paper Trading Performance</div>',
-    unsafe_allow_html=True,
-)
+    # ==========================================
+    # 8. TRADE SIGNAL PANEL & METRICS
+    # ==========================================
+    col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
+    
+    with col_sig:
+        st.markdown(f"""
+        <div class="metric-card" style="border-left: 4px solid {dir_color};">
+            <div class="metric-label">Signal Execution Panel</div>
+            <div style="font-size:22px; font-weight:700; color:{signal_color};">{signal_strength}</div>
+            <div style="font-size:10px; color:#8b949e; margin-top:3px;">Direction: {direction} | XGB: {xgb_confidence:.1f}% | Votes: {long_votes if direction == "LONG" else short_votes}/4</div>
+            <div style="font-size:11px; color:#8b949e; margin-top:4px;">Entry: ${close_p:,.2f} | SL: ${sl_val:,.2f}</div>
+            <div style="font-size:11px; color:#38bdf8;">TP1: ${tp1_val:,.2f} | TP2: ${tp2_val:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-history_df = pd.DataFrame(
-    st.session_state.trade_history_log
-)
+    with col_m1:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">BEAM Target</div><div class="metric-val-blue">${beam_level:,.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">BASE Target</div><div class="metric-val-red">${base_level:,.2f}</div></div>', unsafe_allow_html=True)
+    with col_m2:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Risk / Reward</div><div class="metric-val-blue">TP1 1 : 2 &nbsp;|&nbsp; TP2 1 : 3</div><div style="font-size:10px;color:#8b949e;">Fixed targets: 2R / 3R</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Direction Quality</div><div class="metric-val-green">{confidence}%</div><div style="font-size:10px;color:#8b949e;">XGB + Research + OBI/OFI + Trend</div></div>', unsafe_allow_html=True)
+    with col_m3:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>', unsafe_allow_html=True)
+    with col_m4:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
+    # ==========================================
+    # 9. CHART & MICROSTRUCTURE SECTION
+    # ==========================================
+    col_chart, col_risk_panel = st.columns([2.5, 1])
+    with col_chart:
+        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
+        time_delta = pd.Timedelta(minutes=tf_minutes)
+        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
+        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
 
-if not history_df.empty:
+        if direction == "LONG":
+            forecast_prices = close_p + (beam_level - close_p) * np.sin(t_steps)
+        elif direction == "SHORT":
+            forecast_prices = close_p - (close_p - base_level) * np.sin(t_steps)
+        else:
+            forecast_prices = [close_p] * forecast_horizon
 
-    if "outcome" not in history_df.columns:
-        history_df["outcome"] = "PENDING"
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
+        fig.add_hline(y=beam_level, line_dash="dash", line_color="#00e676", annotation_text=f"BEAM: ${beam_level:,.2f}")
+        fig.add_hline(y=base_level, line_dash="dash", line_color="#ff5252", annotation_text=f"BASE: ${base_level:,.2f}")
+        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.2f}")
+        fig.update_layout(template="plotly_dark", height=420, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
-    if "pnl_percent" not in history_df.columns:
-        history_df["pnl_percent"] = 0.0
+    with col_risk_panel:
+        st.subheader("Market Microstructure & OB")
+        bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
+        ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
+        obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
+        spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
 
-    if "direction" not in history_df.columns:
-        history_df["direction"] = ""
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Order Book Imbalance (OBI)</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.2f}</b></div>
+            <div style="display:flex; justify-content:space-between;"><span>Risk Status</span> <b style="color:#00e676;">LOW-MEDIUM</b></div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    history_df["outcome"] = (
-        history_df["outcome"]
-        .astype(str)
-        .str.upper()
-    )
+        st.subheader("Top 20 OBI Analysis")
+        fig_obi = go.Figure(go.Bar(x=["Top 5", "Top 10", "Top 20"], y=[obi_val*0.8, obi_val*0.9, obi_val], marker_color="#38bdf8"))
+        fig_obi.update_layout(height=160, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="#111622", plot_bgcolor="#111622")
+        st.plotly_chart(fig_obi, use_container_width=True, config={"displayModeBar": False})
 
-    filter1, filter2, filter3 = st.columns(
-        3
-    )
+    # ==========================================
+    # 10. RESEARCH PAPER SCOREBOARD
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🔬 12-Paper Quantitative Research Scoreboard")
 
-    with filter1:
+    col_sc1, col_sc2 = st.columns([1.5, 1])
+    with col_sc1:
+        paper_table_data = []
+        for k, v in paper_results.items():
+            status = "PASS 🟢" if v > 0.1 else ("FAIL 🔴" if v < -0.1 else "NEUTRAL ⚪")
+            paper_table_data.append({
+                "Paper": k,
+                "Value": f"{v:+.3f}",
+                "Weight": f"{evolved_weights.get(k, 0.083)*100:.1f}%",
+                "Status": status
+            })
+        st.dataframe(pd.DataFrame(paper_table_data), use_container_width=True, hide_index=True, height=270)
 
-        coin_filter = st.selectbox(
-            "Coin",
-            ["ALL"] + COINS_LIST,
-            key="history_coin",
-        )
+    with col_sc2:
+        st.markdown("""
+        <div class="metric-card">
+            <div style="font-weight:700; color:#38bdf8; margin-bottom:6px;">Advanced Model Insights</div>
+            <div style="font-size:12px; color:#cbd5e1; line-height:1.6;">
+                • <b>HAWKES:</b> Measures aggressive order clustering and arrival rates.<br>
+                • <b>BOOK_IMB:</b> Computes real-time depth pressure across bids & asks.<br>
+                • <b>Dynamic Weights:</b> Optimized linear blending for robust signals.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    with filter2:
+    # ==========================================
+    # 11. PERFORMANCE & WIN RATE SECTION
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📊 Performance Summary & Win Rate Checker with Filters")
 
-        tf_filter = st.selectbox(
-            "Timeframe",
-            ["ALL"]
-            + list(
-                TIMEFRAME_MAP.keys()
-            ),
-            key="history_tf",
-        )
+    if st.session_state.trade_history_log:
+        df_log = pd.DataFrame(st.session_state.trade_history_log)
 
-    with filter3:
+        f_col1, f_col2, f_col3 = st.columns(3)
+        with f_col1:
+            coin_filter = st.selectbox("Filter Coin", ["ALL"] + COINS_LIST)
+        with f_col2:
+            tf_filter = st.selectbox("Filter Timeframe", ["ALL"] + list(TIMEFRAME_MAP.keys()))
+        with f_col3:
+            dir_filter = st.selectbox("Filter Direction", ["ALL", "LONG", "SHORT"])
 
-        direction_filter = st.selectbox(
-            "Direction",
-            [
-                "ALL",
-                "LONG",
-                "SHORT",
-            ],
-            key="history_direction",
-        )
+        filtered_df = df_log.copy()
+        if coin_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["symbol"] == coin_filter]
+        if tf_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["timeframe"] == tf_filter]
+        if dir_filter != "ALL":
+            filtered_df = filtered_df[filtered_df["direction"] == dir_filter]
 
-    filtered = history_df.copy()
+        total_signals = len(filtered_df)
+        wins = len(filtered_df[filtered_df["outcome"] == "WIN"])
+        losses = len(filtered_df[filtered_df["outcome"] == "LOSS"])
+        pending = len(filtered_df[filtered_df["outcome"] == "PENDING"])
+        closed_trades = wins + losses
+        win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0.0
 
-    if coin_filter != "ALL":
+        winning_trades_df = filtered_df[filtered_df["outcome"] == "WIN"]
+        losing_trades_df = filtered_df[filtered_df["outcome"] == "LOSS"]
+        
+        gross_profit = winning_trades_df["pnl_percent"].sum() if not winning_trades_df.empty else 0.0
+        gross_loss = abs(losing_trades_df["pnl_percent"].sum()) if not losing_trades_df.empty else 0.0
+        net_pnl = gross_profit - gross_loss
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
 
-        filtered = filtered[
-            filtered["symbol"]
-            == coin_filter
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-val-green">{win_rate:.1f}%</div></div>', unsafe_allow_html=True)
+        with p2:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Closed Trades</div><div class="metric-val-blue">{closed_trades}</div></div>', unsafe_allow_html=True)
+        with p3:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Wins / Losses</div><div style="font-size:16px; font-weight:750; color:#00e676;">{wins}W / {losses}L</div></div>', unsafe_allow_html=True)
+        with p4:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Pending</div><div class="metric-val-blue">{pending}</div></div>', unsafe_allow_html=True)
+        with p5:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Profit Factor</div><div class="metric-val-blue">{profit_factor:.2f}</div></div>', unsafe_allow_html=True)
+        with p6:
+            pnl_color = "#00e676" if net_pnl >= 0 else "#ff5252"
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Net PnL %</div><div style="font-size:18px; font-weight:700; color:{pnl_color};">{net_pnl:+.2f}%</div></div>', unsafe_allow_html=True)
+
+        st.markdown("##### Detailed Trade History Table")
+        display_cols = [
+            "timestamp", "symbol", "timeframe", "direction", "signal_strength",
+            "entry_price", "stop_loss", "tp1", "tp2", "rr_target", "exit_price",
+            "pnl_percent", "outcome", "confidence", "xgb_confidence", "exit_reason"
         ]
 
-    if tf_filter != "ALL":
+        # Backward compatibility: older signal_history.csv files do not contain
+        # columns introduced by newer dashboard versions. Never let a missing
+        # history column crash the whole Streamlit app.
+        default_values = {
+            "timestamp": "", "symbol": "", "timeframe": "", "direction": "",
+            "signal_strength": "", "entry_price": 0.0, "stop_loss": 0.0,
+            "tp1": 0.0, "tp2": 0.0, "rr_target": "TP1 1:2 | TP2 1:3", "exit_price": 0.0,
+            "pnl_percent": 0.0, "outcome": "PENDING", "confidence": 0.0,
+            "xgb_confidence": 0.0, "exit_reason": ""
+        }
+        for col in display_cols:
+            if col not in filtered_df.columns:
+                filtered_df[col] = default_values[col]
 
-        filtered = filtered[
-            filtered["timeframe"]
-            == tf_filter
-        ]
+        st.dataframe(filtered_df.loc[:, display_cols], use_container_width=True, hide_index=True, height=280)
 
-    if direction_filter != "ALL":
-
-        filtered = filtered[
-            filtered["direction"]
-            == direction_filter
-        ]
-
-    wins = len(
-        filtered[
-            filtered["outcome"]
-            == "WIN"
-        ]
-    )
-
-    losses = len(
-        filtered[
-            filtered["outcome"]
-            == "LOSS"
-        ]
-    )
-
-    pending = len(
-        filtered[
-            filtered["outcome"]
-            == "PENDING"
-        ]
-    )
-
-    closed = wins + losses
-
-    win_rate = (
-        wins / closed * 100
-        if closed > 0
-        else 0
-    )
-
-    gross_profit = (
-        filtered.loc[
-            filtered["outcome"] == "WIN",
-            "pnl_percent",
-        ].sum()
-        if not filtered.empty
-        else 0
-    )
-
-    gross_loss = abs(
-        filtered.loc[
-            filtered["outcome"] == "LOSS",
-            "pnl_percent",
-        ].sum()
-        if not filtered.empty
-        else 0
-    )
-
-    net_pnl = (
-        gross_profit
-        - gross_loss
-    )
-
-    profit_factor = (
-        gross_profit
-        / gross_loss
-        if gross_loss > 0
-        else 0
-    )
-
-
-    p1, p2, p3, p4, p5, p6 = st.columns(
-        6
-    )
-
-    with p1:
-        st.metric(
-            "Win Rate",
-            f"{win_rate:.1f}%",
-        )
-
-    with p2:
-        st.metric(
-            "Closed",
-            closed,
-        )
-
-    with p3:
-        st.metric(
-            "Wins",
-            wins,
-        )
-
-    with p4:
-        st.metric(
-            "Losses",
-            losses,
-        )
-
-    with p5:
-        st.metric(
-            "Profit Factor",
-            f"{profit_factor:.2f}",
-        )
-
-    with p6:
-        st.metric(
-            "Net PnL",
-            f"{net_pnl:+.2f}%",
-        )
-
-
-    # ========================================================
-    # PERFORMANCE CHART
-    # ========================================================
-
-    chart_data = filtered.copy()
-
-    if not chart_data.empty:
-
-        chart_data["pnl"] = pd.to_numeric(
-            chart_data[
-                "pnl_percent"
-            ],
-            errors="coerce",
-        ).fillna(0)
-
-        chart_data["equity"] = (
-            chart_data["pnl"]
-            .cumsum()
-        )
-
-        perf_fig = go.Figure()
-
-        perf_fig.add_trace(
-            go.Scatter(
-                x=np.arange(
-                    len(chart_data)
-                ),
-                y=chart_data[
-                    "equity"
-                ],
-                mode="lines+markers",
-                name="Cumulative PnL",
-            )
-        )
-
-        perf_fig.update_layout(
-            template="plotly_dark",
-            height=280,
-            paper_bgcolor="#0e141d",
-            plot_bgcolor="#0e141d",
-            margin=dict(
-                l=10,
-                r=10,
-                t=10,
-                b=10,
-            ),
-        )
-
-        st.plotly_chart(
-            perf_fig,
-            use_container_width=True,
-        )
-
-
-    # ========================================================
-    # HISTORY TABLE
-    # ========================================================
-
-    st.markdown(
-        "##### Detailed Trade History"
-    )
-
-    display_columns = [
-        "timestamp",
-        "symbol",
-        "timeframe",
-        "direction",
-        "signal_strength",
-        "entry_price",
-        "stop_loss",
-        "tp1",
-        "tp2",
-        "exit_price",
-        "confidence",
-        "xgb_confidence",
-        "pnl_percent",
-        "outcome",
-        "exit_reason",
-    ]
-
-    defaults = {
-        "timestamp": "",
-        "symbol": "",
-        "timeframe": "",
-        "direction": "",
-        "signal_strength": "",
-        "entry_price": 0.0,
-        "stop_loss": 0.0,
-        "tp1": 0.0,
-        "tp2": 0.0,
-        "exit_price": 0.0,
-        "confidence": 0.0,
-        "xgb_confidence": 0.0,
-        "pnl_percent": 0.0,
-        "outcome": "PENDING",
-        "exit_reason": "",
-    }
-
-    for column in display_columns:
-
-        if column not in filtered.columns:
-
-            filtered[column] = defaults[
-                column
-            ]
-
-    st.dataframe(
-        filtered[
-            display_columns
-        ],
-        use_container_width=True,
-        hide_index=True,
-        height=350,
-    )
+        if st.sidebar.button("Clear Trade History Log"):
+            st.session_state.trade_history_log = []
+            if os.path.exists(CSV_FILE):
+                os.remove(CSV_FILE)
+            if os.path.exists(FEEDBACK_FILE):
+                os.remove(FEEDBACK_FILE)
+            st.session_state.xgb_last_retrain_count = 0
+            st.rerun()
+    else:
+        st.info("No paper trade history recorded yet. Signals will automatically log when active.")
 
 else:
-
-    st.info(
-        "No paper trades recorded yet."
-    )
-
-
-# ============================================================
-# MODEL INFORMATION
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🤖 XGBoost Model Status</div>',
-    unsafe_allow_html=True,
-)
-
-model_col1, model_col2 = st.columns(
-    2
-)
-
-
-with model_col1:
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-Model File
-</div>
-
-<div class="card-value blue">
-{MODEL_PATH}
-</div>
-
-<div class="card-small">
-Status:
-<b>
-{
-    "LOADED"
-    if xgb_model is not None
-    else "NOT LOADED"
-}
-</b>
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with model_col2:
-
-    st.markdown(
-        """
-<div class="card">
-
-<div class="card-title">
-Live XGB Features
-</div>
-
-<div style="
-font-size:11px;
-line-height:1.8;
-color:#aab6c5;
-">
-
-Top20 Bid Sum •
-Top20 Ask Sum •
-OBI Top20 •
-Spread •
-Bid/Ask Ratio •
-Total Depth •
-Trend Signal
-
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-# ============================================================
-# DEBUG
-# ============================================================
-
-if show_debug:
-
-    st.markdown(
-        '<div class="section-title">🔧 Engine Debug</div>',
-        unsafe_allow_html=True,
-    )
-
-    debug_data = {
-
-        "Symbol":
-            selected_symbol,
-
-        "Timeframe":
-            selected_tf_label,
-
-        "Price":
-            close_price,
-
-        "XGB Signal":
-            xgb_signal,
-
-        "XGB Confidence":
-            xgb_confidence,
-
-        "Research Score":
-            research_score,
-
-        "Micro Score":
-            micro_score,
-
-        "Trend Score":
-            trend_score,
-
-        "Combined Score":
-            combined_score,
-
-        "OBI 5":
-            obi5,
-
-        "OBI 10":
-            obi10,
-
-        "OBI 20":
-            obi20,
-
-        "OBI 50":
-            obi50,
-
-        "OFI":
-            ofi,
-
-        "Long Votes":
-            long_votes,
-
-        "Short Votes":
-            short_votes,
-
-        "Direction":
-            direction,
-
-        "Confidence":
-            confidence,
-
-        "Risk":
-            risk_metrics[
-                "Market_Risk"
-            ],
-
-    }
-
-    st.json(debug_data)
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown(
-    """
-<hr>
-
-<div style="
-text-align:center;
-color:#536174;
-font-size:10px;
-padding:10px;
-">
-
-QUANTITATIVE RESEARCH TERMINAL
-&nbsp; • &nbsp;
-PAPER TRADING ONLY
-&nbsp; • &nbsp;
-XGBoost + OBI + OFI + Research Engine
-
-</div>
-""",
-    unsafe_allow_html=True,
-)
+    st.warning("⚠️ Data pipeline initializing or connection restricted. Please refresh.")
