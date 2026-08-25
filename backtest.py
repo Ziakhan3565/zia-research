@@ -3,7 +3,7 @@ import numpy as np
 import joblib
 
 def run_filtered_trend_backtest():
-    print("🧪 Running Trend-Filtered Microstructure Backtest...\n")
+    print("🧪 Running Advanced Trend-Filtered Microstructure Backtest...\n")
     
     try:
         df = pd.read_csv("market_data_log.csv")
@@ -12,28 +12,53 @@ def run_filtered_trend_backtest():
         print(f"❌ Error loading files: {e}")
         return
 
-    # Feature Engineering
+    # --- 1. Advanced Feature Engineering (Aligned with Research Lab & Training Pipeline) ---
     df['bid_ask_ratio'] = df['top20_bid_sum'] / (df['top20_ask_sum'] + 1e-5)
     df['total_depth'] = df['top20_bid_sum'] + df['top20_ask_sum']
+    
+    # Trend and Momentum metrics
     df['sma_20'] = df.groupby('symbol')['current_price'].transform(lambda x: x.rolling(20, min_periods=1).mean())
     df['trend_signal'] = df['current_price'] - df['sma_20']
 
-    features = ['top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 'bid_ask_ratio', 'total_depth', 'trend_signal']
+    # Microstructure & Order Flow Enrichments
+    # Rolling Volatility / Spread dynamics for enhanced model alignment
+    df['volatility_proxy'] = df.groupby('symbol')['current_price'].transform(lambda x: x.rolling(10, min_periods=1).std().fillna(0))
+    df['hawkes_intensity'] = df.groupby('symbol')['obi_top20'].transform(lambda x: x.rolling(5, min_periods=1).mean().abs())
+    df['book_pressure'] = df['obi_top20'] * df['total_depth']
+
+    # Checking model expected features if available, otherwise supplying the full standard feature block
+    # Standard feature list expected by robust OBI XGBoost setups:
+    features = [
+        'top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 
+        'bid_ask_ratio', 'total_depth', 'trend_signal', 
+        'volatility_proxy', 'hawkes_intensity', 'book_pressure'
+    ]
     
+    # Fallback check if model expects a specific list length or subset
+    # If the loaded model expects exactly 7 features from your original script, 
+    # we can dynamically match or pass the core array. Let's ensure safety:
+    if hasattr(model, "n_features_in_"):
+        expected_n = model.n_features_in_
+        if expected_n == 7:
+            features = ['top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 'bid_ask_ratio', 'total_depth', 'trend_signal']
+        elif expected_n <= len(features):
+            features = features[:expected_n]
+
     df = df.dropna(subset=features + ['current_price', 'symbol']).copy()
     
     if 'timestamp' in df.columns:
         df = df.sort_values(by=['symbol', 'timestamp']).reset_index(drop=True)
 
+    # --- 2. Model Prediction & Confidence Evaluation ---
     df['ml_signal'] = model.predict(df[features])
     
     try:
         probs = model.predict_proba(df[features])
         df['confidence'] = np.max(probs, axis=1)
-    except:
+    except Exception:
         df['confidence'] = 1.0
 
-    # Strong Filter: Only High Confidence + Strong Trend Match
+    # --- 3. Filtering Rules (Confidence, Imbalance & Trend Alignment) ---
     df_filtered = df[
         (df['confidence'] >= 0.55) & 
         (df['obi_top20'].abs() >= 0.20)
@@ -44,7 +69,7 @@ def run_filtered_trend_backtest():
     trade_amount = 10.0      
     fee_rate = 0.0004        
     
-    # 1:1.5 Risk-Reward Ratio
+    # 1:1.5 Risk-Reward Ratio Parameters
     tp_pct = 0.0060          # 0.60% Take Profit
     sl_pct = 0.0040          # 0.40% Stop Loss
 
@@ -52,12 +77,13 @@ def run_filtered_trend_backtest():
     losses = 0
     total_profit_loss = 0.0
 
+    # --- 4. Execution & Backtest Loop ---
     for idx, row in df_filtered.iterrows():
         signal = row['ml_signal']
         entry = row['current_price']
         trend = row['trend_signal']
 
-        # Rule: Filter Out Against-Trend Signals
+        # Trend Filter: Skip against-trend signals
         if signal == 1 and trend < 0: # Long only in Uptrend
             continue
         if signal == 0 and trend > 0: # Short only in Downtrend
@@ -77,7 +103,7 @@ def run_filtered_trend_backtest():
 
         pnl_pct = 0.0
 
-        if signal == 1:  # BUY
+        if signal == 1:  # BUY / LONG
             if (max_p - entry) / entry >= tp_pct:
                 pnl_pct = tp_pct - (2 * fee_rate)
                 wins += 1
@@ -87,7 +113,7 @@ def run_filtered_trend_backtest():
             else:
                 continue
 
-        elif signal == 0:  # SELL
+        elif signal == 0:  # SELL / SHORT
             if (entry - min_p) / entry >= tp_pct:
                 pnl_pct = tp_pct - (2 * fee_rate)
                 wins += 1
@@ -101,12 +127,13 @@ def run_filtered_trend_backtest():
         current_balance += trade_pnl
         total_profit_loss += trade_pnl
 
+    # --- 5. Performance Metrics & Reporting ---
     total_trades = wins + losses
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     total_return_pct = ((current_balance - initial_balance) / initial_balance) * 100
 
     print("=" * 40)
-    print("📊 TREND-FILTERED P&L REPORT")
+    print("📊 ADVANCED TREND-FILTERED P&L REPORT")
     print("=" * 40)
     print(f" Starting Capital     : ${initial_balance:.2f}")
     print(f" Total Executed Trades: {total_trades}")
