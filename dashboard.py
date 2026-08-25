@@ -12,7 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
-# 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
+# STREAMLIT CONFIG & PERSISTENT CSV SETUP
 # ==========================================
 st.set_page_config(
     page_title="Quantitative Research & Paper Trading Terminal",
@@ -129,7 +129,7 @@ ml_model = load_xgboost_model()
 
 
 # ==========================================
-# 1. RESEARCH LAB & RISK ENGINE MODULES (CORE)
+# RESEARCH LAB & RISK ENGINE MODULES (CORE)
 # ==========================================
 class TenPaperResearchLab:
 
@@ -295,7 +295,7 @@ class PowerTradingRiskEngine:
 
 
 # ==========================================
-# 3. PROFESSIONAL STYLING & CSS
+# PROFESSIONAL STYLING & CSS
 # ==========================================
 st.markdown(
     """
@@ -323,7 +323,7 @@ st.markdown(
 )
 
 # ==========================================
-# 4. SIDEBAR CONTROLS
+# SIDEBAR CONTROLS
 # ==========================================
 COINS_LIST = [
     "BTCUSDT",
@@ -517,37 +517,23 @@ if submit_manual:
 
 
 # ==========================================
-# LOOP SCANNER WITH COOLDOWN (NO REPEATING TRADES)
+# LOOP SCANNER WITH FLEXIBLE THRESHOLD
 # ==========================================
 symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
 lab = TenPaperResearchLab()
 
-HOLDING_COOLDOWN_SECONDS = 600
+HOLDING_COOLDOWN_SECONDS = 120
 
 for sym in symbols_to_scan:
     recent_symbol_trade = False
     for existing_t in st.session_state.trade_history_log:
         if (
             existing_t.get("symbol") == sym
+            and existing_t.get("timeframe") == selected_tf_label
             and existing_t.get("status") == "Open"
         ):
             recent_symbol_trade = True
             break
-        if existing_t.get("symbol") == sym:
-            t_time_str = existing_t.get("timestamp")
-            if t_time_str:
-                try:
-                    t_dt = datetime.datetime.strptime(
-                        t_time_str, "%Y-%m-%d %H:%M:%S"
-                    )
-                    elapsed_sec = (
-                        datetime.datetime.now() - t_dt
-                    ).total_seconds()
-                    if elapsed_sec < HOLDING_COOLDOWN_SECONDS:
-                        recent_symbol_trade = True
-                        break
-                except Exception:
-                    pass
 
     if recent_symbol_trade:
         continue
@@ -573,8 +559,8 @@ for sym in symbols_to_scan:
 
         s_dir = (
             "LONG"
-            if s_final_score >= 0.12
-            else ("SHORT" if s_final_score <= -0.12 else "NEUTRAL")
+            if s_final_score >= 0.05
+            else ("SHORT" if s_final_score <= -0.05 else "NEUTRAL")
         )
         s_conf = int(min(max(abs(s_final_score) * 100, 20), 99))
         s_risk_dist = 1.5 * s_atr
@@ -618,7 +604,7 @@ save_persistent_history(st.session_state.trade_history_log)
 
 
 # ==========================================
-# 5. MAIN UI RENDERING
+# MAIN UI RENDERING
 # ==========================================
 df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
@@ -981,16 +967,13 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     )
 
     if st.session_state.trade_history_log:
-        # ROBUST FIXED FILTERING: Checks specifically for 15m/30m vs 1h/4h across the timeframe strings
         scalping_trades = []
         intraday_trades = []
-        
+
         for t in st.session_state.trade_history_log:
             tf_str = str(t.get("timeframe", ""))
-            # If timeframe string contains 15m or 30m
             if "15m" in tf_str or "30m" in tf_str:
                 scalping_trades.append(t)
-            # If timeframe string contains 1h or 4h (or if it doesn't match 15m/30m, categorize safely as intraday)
             elif "1h" in tf_str or "4h" in tf_str or ("15m" not in tf_str and "30m" not in tf_str):
                 intraday_trades.append(t)
 
