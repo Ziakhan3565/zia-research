@@ -657,7 +657,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     current_time_sec = int(time.time())
     time_remaining = lock_seconds - (current_time_sec % lock_seconds)
 
-    # Outcome & Time Duration Checker (Scalping = 30 mins, Intraday = 8 Hours)
+    # Outcome & Time Duration Checker
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING":
             t_time_str = trade.get("timestamp")
@@ -970,26 +970,27 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     st.markdown(
         """
     <div class="sticky-dashboard-header">
-        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard (Scalping: 30m | Intraday: 8h)</h3>
+        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard (Scalping: 15m/30m | Intraday: 1h/4h)</h3>
     </div>
     """,
         unsafe_allow_html=True,
     )
 
     tab_scalping, tab_intraday = st.tabs(
-        ["⚡ Scalping (15m / 30m - 30m Limit)", "📊 Intraday (1h / 4h - 8h Limit)"]
+        ["⚡ Scalping (15m / 30m)", "📊 Intraday (1h / 4h)"]
     )
 
     if st.session_state.trade_history_log:
+        # FIXED: Corrected filtering logic so 1h and 4h are properly captured in Intraday tab
         scalping_trades = [
             t
             for t in st.session_state.trade_history_log
-            if any(tf in t.get("timeframe", "") for tf in ["15m", "30m"])
+            if any(tf in str(t.get("timeframe", "")) for tf in ["15m", "30m"])
         ]
         intraday_trades = [
             t
             for t in st.session_state.trade_history_log
-            if any(tf in t.get("timeframe", "") for tf in ["1h", "4h"])
+            if any(tf in str(t.get("timeframe", "")) for tf in ["1h", "4h"])
         ]
 
         def get_coin_icon(symbol):
