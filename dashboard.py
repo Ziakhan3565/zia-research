@@ -21,6 +21,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Smooth background refresh (no jarring full-page blank flash)
 count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
 CSV_FILE = "signal_history.csv"
@@ -373,7 +374,7 @@ with st.sidebar.form("manual_trade_form"):
     submit_manual = st.form_submit_button("📥 Open Manual Trade")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 ML Model Controls")
+st.sidebar.markdown("### 🤖 ML Model & History Controls")
 if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
     success, msg = train_xgboost_model_automatically(
         st.session_state.trade_history_log, force=True
@@ -385,6 +386,18 @@ if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
         st.rerun()
     else:
         st.sidebar.error(f"Training failed: {msg}")
+
+# Clear Trade History Button
+if st.sidebar.button("🗑️ Clear Trade History", use_container_width=True):
+    st.session_state.trade_history_log = []
+    if os.path.exists(CSV_FILE):
+        try:
+            os.remove(CSV_FILE)
+        except Exception:
+            pass
+    st.sidebar.success("Trade history cleared successfully!")
+    time.sleep(0.5)
+    st.rerun()
 
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
@@ -529,7 +542,6 @@ lab = TenPaperResearchLab()
 HOLDING_COOLDOWN_SECONDS = 600  # 600 seconds minimum gap per coin trade
 
 for sym in symbols_to_scan:
-    # Check if a trade for this symbol was opened recently (< 600 seconds)
     recent_symbol_trade = False
     for existing_t in st.session_state.trade_history_log:
         if existing_t.get("symbol") == sym:
@@ -549,7 +561,7 @@ for sym in symbols_to_scan:
                     pass
 
     if recent_symbol_trade:
-        continue  # Skip scanning this symbol if 600s haven't passed yet
+        continue
 
     scan_df = fetch_klines_data(sym, selected_tf_label)
     scan_bids, scan_asks = fetch_order_book_depth(sym)
