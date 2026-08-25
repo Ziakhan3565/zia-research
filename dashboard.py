@@ -760,6 +760,22 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     save_persistent_history(st.session_state.trade_history_log)
 
+    # Total Winning & Losing Trades Calculation
+    total_wins = len(
+        [
+            t
+            for t in st.session_state.trade_history_log
+            if t.get("outcome") == "WIN"
+        ]
+    )
+    total_losses = len(
+        [
+            t
+            for t in st.session_state.trade_history_log
+            if t.get("outcome") == "LOSS"
+        ]
+    )
+
     closed_count = len([
         t
         for t in st.session_state.trade_history_log
@@ -794,11 +810,16 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     st.markdown(
         f"""
-    <div class="top-status-bar">
-        🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
-        ML: <b>{ml_status_text}</b> &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
-        ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b> &nbsp;|&nbsp; Loop Scan: <b>{"ON" if loop_all_coins else "OFF"}</b>
+    <div class="top-status-bar" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+        <div>
+            🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
+            ML: <b>{ml_status_text}</b> &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
+            Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
+            ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b> &nbsp;|&nbsp; Loop Scan: <b>{"ON" if loop_all_coins else "OFF"}</b>
+        </div>
+        <div>
+            🏆 Wins: <b style="color:#00e676;">{total_wins}</b> &nbsp;|&nbsp; ❌ Losses: <b style="color:#ff5252;">{total_losses}</b>
+        </div>
     </div>
     """,
         unsafe_allow_html=True,
