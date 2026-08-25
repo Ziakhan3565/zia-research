@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from streamlit_autorefresh import st_autorefresh
@@ -323,10 +324,6 @@ st.markdown(
         background: #111622; border: 1px solid #1e2638; border-radius: 10px;
         padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
     }
-    .trade-card {
-        background: #111622; border: 1px solid #1e2638; border-radius: 12px;
-        padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -390,6 +387,7 @@ if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
         st.sidebar.error(f"Training failed: {msg}")
 
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
+
 
 # ==========================================
 # DATA FETCHING FUNCTIONS
@@ -476,12 +474,28 @@ def fetch_order_book_depth(symbol, depth_limit=20):
 if submit_manual:
     temp_df_m = fetch_klines_data(m_coin, selected_tf_label, limit=5)
     current_m_price = temp_df_m["Close"].iloc[-1] if not temp_df_m.empty else 100.0
-    
+
     entry_p = m_entry if m_entry > 0 else current_m_price
     atr_approx = current_m_price * 0.005
-    sl_p = m_sl if m_sl > 0 else (entry_p - 1.5 * atr_approx if m_dir == "LONG" else entry_p + 1.5 * atr_approx)
-    tp_p = m_tp if m_tp > 0 else (entry_p + 3.0 * atr_approx if m_dir == "LONG" else entry_p - 3.0 * atr_approx)
-    
+    sl_p = (
+        m_sl
+        if m_sl > 0
+        else (
+            entry_p - 1.5 * atr_approx
+            if m_dir == "LONG"
+            else entry_p + 1.5 * atr_approx
+        )
+    )
+    tp_p = (
+        m_tp
+        if m_tp > 0
+        else (
+            entry_p + 3.0 * atr_approx
+            if m_dir == "LONG"
+            else entry_p - 3.0 * atr_approx
+        )
+    )
+
     manual_trade_id = f"MANUAL_{m_coin}_{int(time.time())}"
     manual_new_trade = {
         "trade_id": manual_trade_id,
@@ -492,7 +506,7 @@ if submit_manual:
         "entry_price": round(entry_p, 4),
         "stop_loss": round(sl_p, 4),
         "tp1": round(tp_p, 4),
-        "tp2": round(tp_p * 1.01 if m_dir=="LONG" else tp_p * 0.99, 4),
+        "tp2": round(tp_p * 1.01 if m_dir == "LONG" else tp_p * 0.99, 4),
         "exit_price": round(entry_p, 4),
         "confidence": 91,
         "final_score": 1.0 if m_dir == "LONG" else -1.0,
@@ -515,17 +529,30 @@ lab = TenPaperResearchLab()
 for sym in symbols_to_scan:
     scan_df = fetch_klines_data(sym, selected_tf_label)
     scan_bids, scan_asks = fetch_order_book_depth(sym)
-    
-    if not scan_df.empty and len(scan_df) >= 3 and len(scan_bids) > 0 and len(scan_asks) > 0:
-        _, s_final_score, _ = lab.calculate_all_signals(scan_df, scan_bids, scan_asks)
+
+    if (
+        not scan_df.empty
+        and len(scan_df) >= 3
+        and len(scan_bids) > 0
+        and len(scan_asks) > 0
+    ):
+        _, s_final_score, _ = lab.calculate_all_signals(
+            scan_df, scan_bids, scan_asks
+        )
         s_close_p = scan_df["Close"].iloc[-1]
-        s_atr = (scan_df["High"] - scan_df["Low"]).rolling(14).mean().iloc[-1]
+        s_atr = (
+            (scan_df["High"] - scan_df["Low"]).rolling(14).mean().iloc[-1]
+        )
         if np.isnan(s_atr):
             s_atr = s_close_p * 0.005
-            
-        s_dir = "LONG" if s_final_score >= 0.12 else ("SHORT" if s_final_score <= -0.12 else "NEUTRAL")
+
+        s_dir = (
+            "LONG"
+            if s_final_score >= 0.12
+            else ("SHORT" if s_final_score <= -0.12 else "NEUTRAL")
+        )
         s_conf = int(min(max(abs(s_final_score) * 100, 20), 99))
-        
+
         s_risk_dist = 1.5 * s_atr
         if s_dir == "LONG":
             s_sl = s_close_p - s_risk_dist
@@ -537,18 +564,23 @@ for sym in symbols_to_scan:
             s_tp2 = s_close_p - (3.0 * s_risk_dist)
         else:
             continue
-            
+
         if paper_trading_mode and s_dir != "NEUTRAL":
             lock_sec = tf_minutes * 60
             curr_sec = int(time.time())
             t_bucket = curr_sec - (curr_sec % lock_sec)
             loop_trade_id = f"{sym}_{selected_tf_label}_{t_bucket}"
-            
-            existing_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
+
+            existing_ids = [
+                item.get("trade_id")
+                for item in st.session_state.trade_history_log
+            ]
             if loop_trade_id not in existing_ids:
                 loop_trade = {
                     "trade_id": loop_trade_id,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": datetime.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
                     "symbol": sym,
                     "timeframe": selected_tf_label,
                     "direction": s_dir,
@@ -576,7 +608,9 @@ df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
 
 if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(df, bids, asks)
+    paper_results, final_score, evolved_weights = lab.calculate_all_signals(
+        df, bids, asks
+    )
 
     close_p = df["Close"].iloc[-1]
     atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
@@ -612,7 +646,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING":
             trade_symbol = trade["symbol"]
-            temp_df = fetch_klines_data(trade_symbol, trade["timeframe"], limit=15)
+            temp_df = fetch_klines_data(
+                trade_symbol, trade["timeframe"], limit=15
+            )
             if not temp_df.empty:
                 entry_time_str = trade.get("timestamp")
                 for idx, row in temp_df.iterrows():
@@ -628,33 +664,47 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                             if curr_high >= tp:
                                 trade["outcome"] = "WIN"
                                 trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(((tp - entry) / entry) * 100, 2)
+                                trade["pnl_percent"] = round(
+                                    ((tp - entry) / entry) * 100, 2
+                                )
                                 trade["status"] = "Closed"
                                 break
                             elif curr_low <= sl:
                                 trade["outcome"] = "LOSS"
                                 trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(((sl - entry) / entry) * 100, 2)
+                                trade["pnl_percent"] = round(
+                                    ((sl - entry) / entry) * 100, 2
+                                )
                                 trade["status"] = "Closed"
                                 break
                         elif trade["direction"] == "SHORT":
                             if curr_low <= tp:
                                 trade["outcome"] = "WIN"
                                 trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(((entry - tp) / entry) * 100, 2)
+                                trade["pnl_percent"] = round(
+                                    ((entry - tp) / entry) * 100, 2
+                                )
                                 trade["status"] = "Closed"
                                 break
                             elif curr_high >= sl:
                                 trade["outcome"] = "LOSS"
                                 trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(((entry - sl) / entry) * 100, 2)
+                                trade["pnl_percent"] = round(
+                                    ((entry - sl) / entry) * 100, 2
+                                )
                                 trade["status"] = "Closed"
                                 break
 
     save_persistent_history(st.session_state.trade_history_log)
 
-    closed_count = len([t for t in st.session_state.trade_history_log if t["outcome"] in ["WIN", "LOSS"]])
-    next_train_target = (closed_count // TRAIN_INTERVAL + 1) * TRAIN_INTERVAL
+    closed_count = len([
+        t
+        for t in st.session_state.trade_history_log
+        if t["outcome"] in ["WIN", "LOSS"]
+    ])
+    next_train_target = (
+        closed_count // TRAIN_INTERVAL + 1
+    ) * TRAIN_INTERVAL
 
     risk_engine = PowerTradingRiskEngine()
     disp_vol = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
@@ -669,9 +719,15 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         volatility=df["Close"].pct_change().std() + 1e-8,
     )
 
-    dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    dir_color = (
+        "#00e676"
+        if direction == "LONG"
+        else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    )
     mins_rem, secs_rem = divmod(time_remaining, 60)
-    ml_status_text = "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
+    ml_status_text = (
+        "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
+    )
 
     st.markdown(
         f"""
@@ -702,24 +758,51 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         )
 
     with col_m1:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>',
+            unsafe_allow_html=True,
+        )
     with col_m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>',
+            unsafe_allow_html=True,
+        )
     with col_m3:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>',
+            unsafe_allow_html=True,
+        )
     with col_m4:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>',
+            unsafe_allow_html=True,
+        )
 
     # Chart & Trade History display area
     col_chart, col_risk_panel = st.columns([2.5, 1])
     with col_chart:
         st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
         time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
+        future_times = [
+            df["Time"].iloc[-1] + (i * time_delta)
+            for i in range(1, forecast_horizon + 1)
+        ]
         t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
 
         if direction == "LONG":
@@ -730,20 +813,67 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             forecast_prices = [close_p] * forecast_horizon
 
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
-        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
-        fig.add_hline(y=tp2_val, line_dash="dash", line_color="#00e676", annotation_text=f"TP2: ${tp2_val:,.4f}")
-        fig.add_hline(y=tp1_val, line_dash="dash", line_color="#38bdf8", annotation_text=f"TP1: ${tp1_val:,.4f}")
-        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.4f}")
-        fig.update_layout(template="plotly_dark", height=420, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
+        fig.add_trace(
+            go.Candlestick(
+                x=df["Time"],
+                open=df["Open"],
+                high=df["High"],
+                low=df["Low"],
+                close=df["Close"],
+                name="Candles",
+                increasing_line_color="#00e676",
+                decreasing_line_color="#ff5252",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[df["Time"].iloc[-1]] + future_times,
+                y=[close_p] + list(forecast_prices),
+                mode="lines+markers",
+                name="Trajectory",
+                line=dict(color=dir_color, width=2, dash="dot"),
+            )
+        )
+        fig.add_hline(
+            y=tp2_val,
+            line_dash="dash",
+            line_color="#00e676",
+            annotation_text=f"TP2: ${tp2_val:,.4f}",
+        )
+        fig.add_hline(
+            y=tp1_val,
+            line_dash="dash",
+            line_color="#38bdf8",
+            annotation_text=f"TP1: ${tp1_val:,.4f}",
+        )
+        fig.add_hline(
+            y=sl_val,
+            line_dash="dot",
+            line_color="#ff5252",
+            annotation_text=f"SL: ${sl_val:,.4f}",
+        )
+        fig.update_layout(
+            template="plotly_dark",
+            height=420,
+            xaxis_rangeslider_visible=False,
+            paper_bgcolor="#111622",
+            plot_bgcolor="#111622",
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with col_risk_panel:
         st.subheader("Market Microstructure")
         bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
         ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-        obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
-        spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
+        obi_val = (bid_vol_sum - ask_vol_sum) / (
+            bid_vol_sum + ask_vol_sum + 1e-8
+        )
+        spread_val = (
+            abs(asks[0, 0] - bids[0, 0])
+            if len(bids) > 0 and len(asks) > 0
+            else 0.0
+        )
 
         st.markdown(
             f"""
@@ -772,17 +902,25 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             t_conf = t.get("confidence", 90)
             t_pnl = t.get("pnl_percent", 0.0)
             t_status = t.get("status", "Open")
-            
+
             c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
-            run_status_bg = "rgba(0, 230, 118, 0.1)" if t_status == "Open" else "rgba(139, 148, 158, 0.1)"
+            run_status_bg = (
+                "rgba(0, 230, 118, 0.1)"
+                if t_status == "Open"
+                else "rgba(139, 148, 158, 0.1)"
+            )
             run_status_fg = "#00e676" if t_status == "Open" else "#8b949e"
-            run_status_text = "🟢 RUNNING" if t_status == "Open" else f"🔴 {t.get('outcome','CLOSED')}"
-            
+            run_status_text = (
+                "🟢 RUNNING"
+                if t_status == "Open"
+                else f"🔴 {t.get('outcome','CLOSED')}"
+            )
+
             pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
             pnl_sign = "+" if t_pnl >= 0 else ""
 
             card_html = f"""
-            <div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
+            <div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); font-family: 'Inter', sans-serif;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="background: {c_color}; color: #080a0f; padding: 4px 12px; border-radius: 6px; font-weight: 700; font-size: 13px;">{t_dir}</span>
@@ -842,4 +980,4 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 </div>
             </div>
             """
-            st.markdown(card_html, unsafe_allow_html=True)
+            components.html(card_html, height=270, scrolling=False)
