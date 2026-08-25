@@ -13,27 +13,29 @@ class TenPaperResearchLab:
 
     # Online Machine Learning Classifier
     base_model = SGDClassifier(
-        loss='log_loss', penalty='l2', alpha=0.0001, max_iter=1000, random_state=42
+        loss="log_loss", penalty="l2", alpha=0.0001, max_iter=1000, random_state=42
     )
     self.ml_model = CalibratedClassifierCV(
-        estimator=base_model, method='sigmoid', cv='prefit'
+        estimator=base_model, method="sigmoid", cv="prefit"
     )
     self.is_model_trained = False
 
-    # Sirf Top 5 Behtareen Features/Formulas jo 85% Accuracy ke liye ahem hain
+    # Ab Yahan Fourier Trend Feature ko bhi shamil kar diya gaya hai (Total 6 Features)
     self.feature_names = [
         "BOOK_IMB",
         "TAKER_FLOW",
         "QUANT_IMPLY",
         "ADAPT_CONF",
         "BAYESIAN",
+        "FOURIER_TREND",
     ]
     self.dynamic_weights = {
-        "BOOK_IMB": 0.30,
-        "TAKER_FLOW": 0.25,
-        "QUANT_IMPLY": 0.20,
+        "BOOK_IMB": 0.25,
+        "TAKER_FLOW": 0.20,
+        "QUANT_IMPLY": 0.15,
         "ADAPT_CONF": 0.15,
         "BAYESIAN": 0.10,
+        "FOURIER_TREND": 0.15,  # Fourier curve ko balanced weight diya gaya hai
     }
 
     # State tracking for Hysteresis / Cooldown (Signal bar-bar change hone se rokne ke liye)
@@ -81,6 +83,27 @@ class TenPaperResearchLab:
     )
     results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
 
+    # 6. Fourier Series / IFFT Trend Curve Feature (Aapka Naya Formula)
+    prices = df["Close"].values
+    xc = prices - np.mean(prices)
+    # FFT calculate karna
+    fft_vals = np.fft.fft(xc)
+    # Frequency masking: Sirf lower frequencies (trend components) ko rakhna, high-frequency noise ko zero karna
+    num_keep = max(
+        1, int(len(fft_vals) * 0.15)
+    )  top 15% low frequencies retain karein
+    fft_masked = np.zeros_like(fft_vals)
+    fft_masked[:num_keep] = fft_vals[:num_keep]
+    fft_masked[-num_keep:] = fft_vals[-num_keep:]
+    # Inverse FFT (IFFT) se smooth trend curve hasil karna
+    trend_curve = np.real(np.fft.ifft(fft_masked))
+    
+    # Current trend slope / deviation ko normalize karke feature banana
+    current_trend_val = trend_curve[-1] - trend_curve[-2]
+    results["FOURIER_TREND"] = np.clip(
+        current_trend_val / (realized_vol * mid_price + 1e-8), -1, 1
+    )
+
     return results
 
   def calculate_all_signals(
@@ -91,7 +114,7 @@ class TenPaperResearchLab:
         [results[k] for k in self.feature_names]
     ).reshape(1, -1)
 
-    # Weighted Linear Score calculation using Top 5 Features
+    # Weighted Linear Score calculation using all features including Fourier Trend
     weight_vector = np.array(
         [self.dynamic_weights[k] for k in self.feature_names]
     )
@@ -111,13 +134,9 @@ class TenPaperResearchLab:
     if current_intent != self.last_signal:
       if self.cooldown_counter > 0:
         self.cooldown_counter -= 1
-        current_intent = (
-            self.last_signal
-        )  # Purani state ko qaim rakho jab tak cooldown khatam na ho
+        current_intent = self.last_signal  # Purani state ko qaim rakho jab tak cooldown khatam na ho
       else:
-        self.cooldown_counter = (
-            3  # 3 candles ka cooldown period taake fake flip na ho
-        )
+        self.cooldown_counter = 3  # 3 candles ka cooldown period taake fake flip na ho
         self.last_signal = current_intent
     else:
       self.cooldown_counter = 3  # Reset counter
