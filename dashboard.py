@@ -965,6 +965,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             t_conf = t.get("confidence", 90)
             t_pnl = t.get("pnl_percent", 0.0)
             t_status = t.get("status", "Open")
+            t_exit = t.get("exit_price", t_entry)
+            t_time = t.get("timestamp", "")
+            t_tf = t.get("timeframe", "15m")
 
             c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
             run_status_bg = (
@@ -982,56 +985,28 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
             pnl_sign = "+" if t_pnl >= 0 else ""
 
-            card_html = f"""
-            <div class="trade-card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
-                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                        <span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>
-                        <span style="font-size: 15px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>
-                        <span style="font-size: 11px; color: #8b949e;">({t.get('timeframe', '15m')}) • {t.get('timestamp','')}</span>
-                    </div>
-                    <div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">
-                        {run_status_text}
-                    </div>
-                </div>
-                
-                <div class="trade-grid-details">
-                    <div>
-                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div>
-                        <div style="font-size: 15px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div>
-                    </div>
-                    <div>
-                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit</div>
-                        <div style="font-size: 15px; font-weight: 700; color: {c_color};">${t.get('exit_price', t_entry):,.2f}</div>
-                    </div>
-                    <div>
-                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div>
-                        <div style="font-size: 15px; font-weight: 700; color: #38bdf8;">$2.00</div>
-                    </div>
-                </div>
-
-                <div class="trade-grid-stats">
-                    <div style="background: #161b22; padding: 6px; border-radius: 6px;">
-                        <div style="font-size: 9px; color: #8b949e;">SL</div>
-                        <div style="font-size: 12px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div>
-                    </div>
-                    <div style="background: #161b22; padding: 6px; border-radius: 6px;">
-                        <div style="font-size: 9px; color: #8b949e;">TP1 (1:2)</div>
-                        <div style="font-size: 12px; font-weight: 700; color: #00e676;">${t_tp1:,.2f}</div>
-                    </div>
-                    <div style="background: #161b22; padding: 6px; border-radius: 6px;">
-                        <div style="font-size: 9px; color: #8b949e;">TP2 (1:3)</div>
-                        <div style="font-size: 12px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div>
-                    </div>
-                    <div style="background: #161b22; padding: 6px; border-radius: 6px;">
-                        <div style="font-size: 9px; color: #8b949e;">CONFIDENCE</div>
-                        <div style="font-size: 12px; font-weight: 700; color: #38bdf8;">{t_conf}%</div>
-                    </div>
-                    <div style="background: #161b22; padding: 6px; border-radius: 6px;">
-                        <div style="font-size: 9px; color: #8b949e;">P&L</div>
-                        <div style="font-size: 12px; font-weight: 700; color: {pnl_color};">{pnl_sign}{t_pnl:.2f}%</div>
-                    </div>
-                </div>
-            </div>
-            """
+            card_html = (
+                '<div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">'
+                f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">'
+                f'<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">'
+                f'<span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>'
+                f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>'
+                f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
+                f"</div>"
+                f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
+                f"</div>"
+                f'<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; background: #0d1117; padding: 10px; border-radius: 8px;">'
+                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div><div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div></div>'
+                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit</div><div style="font-size: 14px; font-weight: 700; color: {c_color};">${t_exit:,.2f}</div></div>'
+                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div><div style="font-size: 14px; font-weight: 700; color: #38bdf8;">$2.00</div></div>'
+                f"</div>"
+                f'<div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; text-align: center;">'
+                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">SL</div><div style="font-size: 11px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div></div>'
+                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP1</div><div style="font-size: 11px; font-weight: 700; color: #00e676;">${t_tp1:,.2f}</div></div>'
+                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP2</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div></div>'
+                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">CONF</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">{t_conf}%</div></div>'
+                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">P&L</div><div style="font-size: 11px; font-weight: 700; color: {pnl_color};">{pnl_sign}{t_pnl:.2f}%</div></div>'
+                f"</div>"
+                f"</div>"
+            )
             st.markdown(card_html, unsafe_allow_html=True)
