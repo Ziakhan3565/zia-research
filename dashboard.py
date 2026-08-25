@@ -309,9 +309,6 @@ st.markdown(
         padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px;
     }
     .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
-    .metric-val-green { font-size: 18px; font-weight: 700; color: #00e676; }
-    .metric-val-red { font-size: 18px; font-weight: 700; color: #ff5252; }
-    .metric-val-blue { font-size: 18px; font-weight: 700; color: #38bdf8; }
     .top-status-bar {
         background: #111622; border: 1px solid #1e2638; border-radius: 10px;
         padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
@@ -525,7 +522,6 @@ if submit_manual:
 symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
 lab = TenPaperResearchLab()
 
-# Cooldown to prevent duplicate active trades per coin (10 mins cooldown)
 HOLDING_COOLDOWN_SECONDS = 600
 
 for sym in symbols_to_scan:
@@ -666,7 +662,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         if trade["outcome"] == "PENDING":
             t_time_str = trade.get("timestamp")
             t_tf = trade.get("timeframe", "15m")
-            # Scalping limit = 30 mins, Intraday limit = 8 hours (480 mins)
             max_duration_mins = (
                 30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
             )
@@ -690,7 +685,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                         else trade["entry_price"]
                     )
 
-                    # Check if duration expired or hit SL/TP
                     if elapsed_mins >= max_duration_mins:
                         trade["status"] = "Closed"
                         trade["exit_price"] = current_price
@@ -704,7 +698,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                         trade["pnl_percent"] = round(pnl_calc, 2)
                         trade["outcome"] = "WIN" if pnl_calc >= 0 else "LOSS"
                     else:
-                        # Live check against TP/SL in candles
                         if not temp_df.empty:
                             for idx, row in temp_df.iterrows():
                                 candle_time = str(row["Time"])
@@ -756,7 +749,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     save_persistent_history(st.session_state.trade_history_log)
 
-    # Calculate Total P&L across all trades
     total_pnl_sum = sum(
         [
             t.get("pnl_percent", 0.0)
@@ -828,7 +820,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         unsafe_allow_html=True,
     )
 
-    # UI Metrics & Layout
     col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
 
     with col_sig:
@@ -881,7 +872,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             unsafe_allow_html=True,
         )
 
-    # Chart & Trade History display area
     col_chart, col_risk_panel = st.columns([2.5, 1])
     with col_chart:
         st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
@@ -977,7 +967,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     st.markdown("---")
 
-    # Futuristic Sticky Header Container
     st.markdown(
         """
     <div class="sticky-dashboard-header">
@@ -1041,8 +1030,34 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 t_tf = t.get("timeframe", "15m")
                 t_outcome = t.get("outcome", "PENDING")
 
+                # Calculate remaining hold time dynamically
+                max_duration_mins = (
+                    30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
+                )
+                time_remaining_str = "Expired"
+                if t_status == "Open" and t_time:
+                    try:
+                        t_dt = datetime.datetime.strptime(
+                            t_time, "%Y-%m-%d %H:%M:%S"
+                        )
+                        elapsed_seconds = (
+                            datetime.datetime.now() - t_dt
+                        ).total_seconds()
+                        total_allowed_seconds = max_duration_mins * 60
+                        rem_sec = total_allowed_seconds - elapsed_seconds
+                        if rem_sec > 0:
+                            rem_m = int(rem_sec // 60)
+                            rem_s = int(rem_sec % 60)
+                            time_remaining_str = f"⏳ {rem_m}m {rem_s}s left"
+                        else:
+                            time_remaining_str = "⌛ Time Expiring..."
+                    except Exception:
+                        time_remaining_str = "Active"
+                else:
+                    time_remaining_str = "🔒 Completed"
+
                 c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
-                
+
                 if t_status == "Open":
                     run_status_bg = "rgba(0, 230, 118, 0.1)"
                     run_status_fg = "#00e676"
@@ -1068,7 +1083,10 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                     f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">{coin_icon} {t_sym}</span>'
                     f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
                     f"</div>"
+                    f'<div style="display: flex; align-items: center; gap: 8px;">'
+                    f'<span style="background: #1f293d; color: #38bdf8; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;">{time_remaining_str}</span>'
                     f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
+                    f"</div>"
                     f"</div>"
                     f'<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; background: #0d1117; padding: 10px; border-radius: 8px;">'
                     f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div><div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div></div>'
