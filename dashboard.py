@@ -1030,11 +1030,11 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 t_tf = t.get("timeframe", "15m")
                 t_outcome = t.get("outcome", "PENDING")
 
-                # Calculate remaining hold time dynamically
+                # Calculate holding time and countdown together
                 max_duration_mins = (
                     30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
                 )
-                time_remaining_str = "Expired"
+                time_display_str = "Completed"
                 if t_status == "Open" and t_time:
                     try:
                         t_dt = datetime.datetime.strptime(
@@ -1043,18 +1043,25 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                         elapsed_seconds = (
                             datetime.datetime.now() - t_dt
                         ).total_seconds()
+                        
+                        # Holding time so far (Elapsed)
+                        hold_m = int(elapsed_seconds // 60)
+                        hold_s = int(elapsed_seconds % 60)
+                        hold_str = f"Held: {hold_m}m {hold_s}s"
+
+                        # Remaining countdown timer
                         total_allowed_seconds = max_duration_mins * 60
                         rem_sec = total_allowed_seconds - elapsed_seconds
                         if rem_sec > 0:
                             rem_m = int(rem_sec // 60)
                             rem_s = int(rem_sec % 60)
-                            time_remaining_str = f"⏳ {rem_m}m {rem_s}s left"
+                            time_display_str = f"⏳ {hold_str} | Left: {rem_m}m {rem_s}s"
                         else:
-                            time_remaining_str = "⌛ Time Expiring..."
+                            time_display_str = f"⏳ {hold_str} | ⌛ Expiring..."
                     except Exception:
-                        time_remaining_str = "Active"
+                        time_display_str = "Active"
                 else:
-                    time_remaining_str = "🔒 Completed"
+                    time_display_str = "🔒 Completed"
 
                 c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
 
@@ -1084,7 +1091,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                     f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
                     f"</div>"
                     f'<div style="display: flex; align-items: center; gap: 8px;">'
-                    f'<span style="background: #1f293d; color: #38bdf8; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;">{time_remaining_str}</span>'
+                    f'<span style="background: #1f293d; color: #38bdf8; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;">{time_display_str}</span>'
                     f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
                     f"</div>"
                     f"</div>"
