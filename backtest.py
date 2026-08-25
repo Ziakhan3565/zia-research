@@ -3,7 +3,7 @@ import numpy as np
 import joblib
 
 def run_filtered_trend_backtest():
-    print("🧪 Running Advanced Trend-Filtered Microstructure Backtest...\n")
+    print("🧪 Running Optimized Trend-Filtered Microstructure Backtest...\n")
     
     try:
         df = pd.read_csv("market_data_log.csv")
@@ -12,31 +12,21 @@ def run_filtered_trend_backtest():
         print(f"❌ Error loading files: {e}")
         return
 
-    # --- 1. Advanced Feature Engineering (Aligned with Research Lab & Training Pipeline) ---
+    # --- 1. Feature Engineering ---
     df['bid_ask_ratio'] = df['top20_bid_sum'] / (df['top20_ask_sum'] + 1e-5)
     df['total_depth'] = df['top20_bid_sum'] + df['top20_ask_sum']
-    
-    # Trend and Momentum metrics
     df['sma_20'] = df.groupby('symbol')['current_price'].transform(lambda x: x.rolling(20, min_periods=1).mean())
     df['trend_signal'] = df['current_price'] - df['sma_20']
-
-    # Microstructure & Order Flow Enrichments
-    # Rolling Volatility / Spread dynamics for enhanced model alignment
     df['volatility_proxy'] = df.groupby('symbol')['current_price'].transform(lambda x: x.rolling(10, min_periods=1).std().fillna(0))
     df['hawkes_intensity'] = df.groupby('symbol')['obi_top20'].transform(lambda x: x.rolling(5, min_periods=1).mean().abs())
     df['book_pressure'] = df['obi_top20'] * df['total_depth']
 
-    # Checking model expected features if available, otherwise supplying the full standard feature block
-    # Standard feature list expected by robust OBI XGBoost setups:
     features = [
         'top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 
         'bid_ask_ratio', 'total_depth', 'trend_signal', 
         'volatility_proxy', 'hawkes_intensity', 'book_pressure'
     ]
     
-    # Fallback check if model expects a specific list length or subset
-    # If the loaded model expects exactly 7 features from your original script, 
-    # we can dynamically match or pass the core array. Let's ensure safety:
     if hasattr(model, "n_features_in_"):
         expected_n = model.n_features_in_
         if expected_n == 7:
@@ -49,7 +39,6 @@ def run_filtered_trend_backtest():
     if 'timestamp' in df.columns:
         df = df.sort_values(by=['symbol', 'timestamp']).reset_index(drop=True)
 
-    # --- 2. Model Prediction & Confidence Evaluation ---
     df['ml_signal'] = model.predict(df[features])
     
     try:
@@ -58,7 +47,6 @@ def run_filtered_trend_backtest():
     except Exception:
         df['confidence'] = 1.0
 
-    # --- 3. Filtering Rules (Confidence, Imbalance & Trend Alignment) ---
     df_filtered = df[
         (df['confidence'] >= 0.55) & 
         (df['obi_top20'].abs() >= 0.20)
@@ -69,7 +57,6 @@ def run_filtered_trend_backtest():
     trade_amount = 10.0      
     fee_rate = 0.0004        
     
-    # 1:1.5 Risk-Reward Ratio Parameters
     tp_pct = 0.0060          # 0.60% Take Profit
     sl_pct = 0.0040          # 0.40% Stop Loss
 
@@ -77,63 +64,91 @@ def run_filtered_trend_backtest():
     losses = 0
     total_profit_loss = 0.0
 
-    # --- 4. Execution & Backtest Loop ---
+    # --- 2. Active Trade Lock / Cooldown to Prevent Duplicate Listing ---
+    last_trade_index = {}
+    cooldown_periods = 6  # Har symbol ke liye kam az kam 6 rows ka gap taake baar baar trade na khule
+
+    trade_history = []
+
     for idx, row in df_filtered.iterrows():
+        symbol = row['symbol']
+        
+        # Check if symbol is in cooldown (already active in a recent trade)
+        if symbol in last_trade_index and idx < last_trade_index[symbol]:
+            continue
+
         signal = row['ml_signal']
         entry = row['current_price']
         trend = row['trend_signal']
 
-        # Trend Filter: Skip against-trend signals
-        if signal == 1 and trend < 0: # Long only in Uptrend
+        # Trend Filter
+        if signal == 1 and trend < 0: 
             continue
-        if signal == 0 and trend > 0: # Short only in Downtrend
+        if signal == 0 and trend > 0: 
             continue
 
-        future_prices = df[
-            (df['symbol'] == row['symbol']) & 
+        # Slice future prices step-by-step for accurate TP/SL evaluation
+        future_window = df[
+            (df['symbol'] == symbol) & 
             (df.index > idx) & 
             (df.index <= idx + 6)
-        ]['current_price']
+        ]
 
-        if len(future_prices) == 0:
+        if len(future_window) == 0:
             continue
 
-        max_p = future_prices.max()
-        min_p = future_prices.min()
+        # Set Lock / Cooldown up to the max index checked
+        last_trade_index[symbol] = idx + len(future_window)
 
+        tp_price_long = entry * (1.0 + tp_pct)
+        sl_price_long = entry * (1.0 - sl_pct)
+        tp_price_short = entry * (1.0 - tp_pct)
+        sl_price_short = entry * (1.0 + sl_pct)
+
+        outcome = "PENDING"
         pnl_pct = 0.0
 
-        if signal == 1:  # BUY / LONG
-            if (max_p - entry) / entry >= tp_pct:
-                pnl_pct = tp_pct - (2 * fee_rate)
-                wins += 1
-            elif (entry - min_p) / entry >= sl_pct:
-                pnl_pct = -sl_pct - (2 * fee_rate)
-                losses += 1
-            else:
-                continue
+        # Strict Candle-by-Candle Evaluation for precise SL/TP execution
+        for _, fut_row in future_window.iterrows():
+            high_p = fut_row.get('current_price', entry) # Fallback if high/low missing, using price action
+            low_p = fut_row.get('current_price', entry)
+            
+            if signal == 1: # LONG
+                if high_p >= tp_price_long:
+                    outcome = "WIN"
+                    pnl_pct = tp_pct - (2 * fee_rate)
+                    wins += 1
+                    break
+                elif low_p <= sl_price_long:
+                    outcome = "LOSS"
+                    pnl_pct = -sl_pct - (2 * fee_rate)
+                    losses += 1
+                    break
+            elif signal == 0: # SHORT
+                if low_p <= tp_price_short:
+                    outcome = "WIN"
+                    pnl_pct = tp_pct - (2 * fee_rate)
+                    wins += 1
+                    break
+                elif high_p >= sl_price_short:
+                    outcome = "LOSS"
+                    pnl_pct = -sl_pct - (2 * fee_rate)
+                    losses += 1
+                    break
 
-        elif signal == 0:  # SELL / SHORT
-            if (entry - min_p) / entry >= tp_pct:
-                pnl_pct = tp_pct - (2 * fee_rate)
-                wins += 1
-            elif (max_p - entry) / entry >= sl_pct:
-                pnl_pct = -sl_pct - (2 * fee_rate)
-                losses += 1
-            else:
-                continue
+        if outcome == "PENDING":
+            continue
 
         trade_pnl = trade_amount * pnl_pct
         current_balance += trade_pnl
         total_profit_loss += trade_pnl
 
-    # --- 5. Performance Metrics & Reporting ---
     total_trades = wins + losses
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     total_return_pct = ((current_balance - initial_balance) / initial_balance) * 100
 
     print("=" * 40)
-    print("📊 ADVANCED TREND-FILTERED P&L REPORT")
+    print("📊 OPTIMIZED P&L REPORT (DEDUPLICATED & FIXED TP/SL)")
     print("=" * 40)
     print(f" Starting Capital     : ${initial_balance:.2f}")
     print(f" Total Executed Trades: {total_trades}")
