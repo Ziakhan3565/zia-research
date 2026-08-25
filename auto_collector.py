@@ -6,10 +6,12 @@ import pandas as pd
 import requests
 
 COINS_LIST = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "NEARUSDT", "LTCUSDT", "BCHUSDT", "APTUSDT", "TRXUSDT",
-    "SHIBUSDT", "UNIUSDT", "ATOMUSDT", "SUIUSDT", "INJUSDT", "ICPUSDT"
+  "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XMRUSDT",
+    "XRPUSDT",
+    "TAOUSDT",
 ]
 
 def fetch_order_book_and_price(symbol, depth_limit=20):
