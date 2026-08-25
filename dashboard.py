@@ -880,27 +880,29 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         # 7. SIDEBAR UTILITIES & EXPORT CONTROLS
         # ==========================================
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### 🛠️ Data Management")
+        st.sidebar.markdown("### 📊 Data Management")
+        
+        # CSV Export Button
+        csv_data = filtered_df.to_csv(index=False).encode('utf-8')
+        st.sidebar.download_button(
+            label="📥 Download Trade History (CSV)",
+            data=csv_data,
+            file_name=f"signal_history_{selected_symbol}_{datetime.datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
 
-        if st.sidebar.button("🗑️ Clear Trade History"):
+        # Clear History Option
+        if st.sidebar.button("🗑️ Clear Local History Log", type="secondary"):
             st.session_state.trade_history_log = []
             if os.path.exists(CSV_FILE):
                 try:
                     os.remove(CSV_FILE)
                 except Exception:
                     pass
-            st.sidebar.success("History cleared successfully!")
+            st.success("Trade history log cleared successfully!")
             st.rerun()
 
-        csv_export_data = filtered_df.to_csv(index=False).encode("utf-8")
-        st.sidebar.download_button(
-            label="📥 Download Filtered History (CSV)",
-            data=csv_export_data,
-            file_name=f"quant_trade_history_{selected_symbol}.csv",
-            mime="text/csv",
-        )
-
+    else:
+        st.warning("⚠️ Insufficient market depth or price history data available to execute the quantitative models.")
 else:
-    st.warning(
-        "⚠️ Insufficient market data or order book depth retrieved from Binance API. Retrying..."
-    )
+    st.error("🚨 Failed to establish connection with market data feeds. Please check network connectivity or API limits.")
