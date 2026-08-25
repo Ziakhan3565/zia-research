@@ -324,40 +324,14 @@ st.markdown(
         background: #111622; border: 1px solid #1e2638; border-radius: 10px;
         padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
     }
-    
-    /* Mobile-Responsive Trade Card Styles */
-    .trade-card {
-        background: #111622;
-        border: 1px solid #1e2638;
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 16px;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-    }
-    .trade-grid-details {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 10px;
-        margin-bottom: 12px;
-        background: #0d1117;
-        padding: 10px;
-        border-radius: 8px;
-    }
-    .trade-grid-stats {
-        display: grid;
-        grid-template-columns: repeat(5, 1fr);
-        gap: 8px;
-        margin-bottom: 12px;
-        text-align: center;
-    }
-    @media (max-width: 768px) {
-        .trade-grid-details {
-            grid-template-columns: 1fr;
-            gap: 8px;
-        }
-        .trade-grid-stats {
-            grid-template-columns: repeat(2, 1fr);
-        }
+    .sticky-dashboard-header {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background: #080a0f;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #1e2638;
     }
 </style>
 """,
@@ -378,8 +352,8 @@ COINS_LIST = [
 ]
 
 TIMEFRAME_MAP = {
-    "15m (Medium TF)": ("15m", 15),
-    "30m (Medium TF)": ("30m", 30),
+    "15m (Scalping)": ("15m", 15),
+    "30m (Scalping)": ("30m", 30),
     "1h (Intraday)": ("1h", 60),
     "4h (Intraday)": ("4h", 240),
 }
@@ -420,7 +394,6 @@ if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
     else:
         st.sidebar.error(f"Training failed: {msg}")
 
-# Clear Trade History Button
 if st.sidebar.button("🗑️ Clear Trade History", use_container_width=True):
     st.session_state.trade_history_log = []
     if os.path.exists(CSV_FILE):
@@ -755,7 +728,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     save_persistent_history(st.session_state.trade_history_log)
 
-    # Total Winning & Losing Trades Calculation (No PnL text attached)
     total_wins = len(
         [
             t
@@ -968,9 +940,18 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         )
 
     st.markdown("---")
-    st.subheader("📊 Active & Closed Trades Cards Dashboard")
 
-    # Tabs for Scalping vs Intraday separation
+    # Futuristic Sticky Header Container
+    st.markdown(
+        """
+    <div class="sticky-dashboard-header">
+        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard</h3>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    # Tabs for Scalping (15m/30m) vs Intraday (1h/4h) separation
     tab_scalping, tab_intraday = st.tabs(
         ["⚡ Scalping (15m / 30m)", "📊 Intraday (1h / 4h)"]
     )
@@ -987,13 +968,32 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             if any(tf in t.get("timeframe", "") for tf in ["1h", "4h"])
         ]
 
+        def get_coin_icon(symbol):
+            if "BTC" in symbol:
+                return "₿"
+            elif "ETH" in symbol:
+                return "Ξ"
+            elif "SOL" in symbol:
+                return "🟣"
+            elif "XRP" in symbol:
+                return "✕"
+            elif "XMR" in symbol:
+                return "🅜"
+            elif "TAO" in symbol:
+                return "τ"
+            else:
+                return "🪙"
+
         def render_trade_cards(trades_subset):
             if not trades_subset:
                 st.info("No trades found for this category.")
                 return
             for t in trades_subset:
                 t_dir = t.get("direction", "LONG")
-                t_sym = t.get("symbol", "BTCUSDT").replace("USDT", "/USDT")
+                raw_sym = t.get("symbol", "BTCUSDT")
+                t_sym = raw_sym.replace("USDT", "/USDT")
+                coin_icon = get_coin_icon(raw_sym)
+
                 t_entry = t.get("entry_price", 0.0)
                 t_sl = t.get("stop_loss", 0.0)
                 t_tp1 = t.get("tp1", 0.0)
@@ -1026,7 +1026,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                     f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">'
                     f'<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">'
                     f'<span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>'
-                    f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>'
+                    f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">{coin_icon} {t_sym}</span>'
                     f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
                     f"</div>"
                     f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
