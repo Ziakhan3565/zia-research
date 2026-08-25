@@ -5,6 +5,9 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
+# Global counter to track closed trades for automatic retraining
+TRADE_COUNTER = 0
+
 def train_trend_aligned_model():
     print("🚀 Training Trend-Aligned Microstructure Model with Advanced Formulas...")
     
@@ -86,5 +89,30 @@ def train_trend_aligned_model():
     joblib.dump(model, "xgboost_obi_model.pkl")
     print("💾 Model saved successfully as 'xgboost_obi_model.pkl'!")
 
+
+def record_trade_outcome_and_check_retrain(outcome):
+    """
+    Yeh function har trade close hone par call hoga (outcome: "WIN" ya "LOSS").
+    Jaise hi 20 trades poori hongi, yeh khud ba khud model ko retrain kar dega.
+    """
+    global TRADE_COUNTER
+    
+    if outcome in ["WIN", "LOSS"]:
+        TRADE_COUNTER += 1
+        print(f"📊 Closed Trades Tracked: {TRADE_COUNTER}/20")
+        
+        if TRADE_COUNTER >= 20:
+            print("🔄 20 Trades target reached! Automatically retraining model with fresh data...")
+            try:
+                train_trend_aligned_model()
+                print("✅ Model successfully retrained & updated after 20 trades!")
+            except Exception as e:
+                print(f"❌ Retraining mein error aaya: {e}")
+            
+            # Counter reset for the next 20 trades
+            TRADE_COUNTER = 0
+
+
 if __name__ == "__main__":
+    # Test ke tor par pehli dafa direct training run karane ke liye:
     train_trend_aligned_model()
