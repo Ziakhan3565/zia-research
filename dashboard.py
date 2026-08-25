@@ -773,7 +773,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             t_pnl = t.get("pnl_percent", 0.0)
             t_status = t.get("status", "Open")
             
-            # Color adjustments
             c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
             run_status_bg = "rgba(0, 230, 118, 0.1)" if t_status == "Open" else "rgba(139, 148, 158, 0.1)"
             run_status_fg = "#00e676" if t_status == "Open" else "#8b949e"
@@ -782,67 +781,65 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
             pnl_sign = "+" if t_pnl >= 0 else ""
 
-            st.markdown(
-                f"""
-                <div class="trade-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-                        <div style="display:flex; align-items:center; gap:10px;">
-                            <span style="background:{c_color}; color:#080a0f; padding:4px 12px; border-radius:6px; font-weight:700; font-size:13px;">{t_dir}</span>
-                            <span style="font-size:16px; font-weight:700; color:#ffffff;">🪙 {t_sym}</span>
-                            <span style="font-size:12px; color:#8b949e;">({t.get('timeframe', '15m')}) • {t.get('timestamp','')}</span>
-                        </div>
-                        <div style="background:{run_status_bg}; border:1px solid {run_status_fg}; color:{run_status_fg}; padding:4px 10px; border-radius:20px; font-size:11px; font-weight:600;">
-                            {run_status_text}
-                        </div>
+            card_html = f"""
+            <div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="background: {c_color}; color: #080a0f; padding: 4px 12px; border-radius: 6px; font-weight: 700; font-size: 13px;">{t_dir}</span>
+                        <span style="font-size: 16px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>
+                        <span style="font-size: 12px; color: #8b949e;">({t.get('timeframe', '15m')}) • {t.get('timestamp','')}</span>
                     </div>
-                    
-                    <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:15px; margin-bottom:14px; background:#0d1117; padding:12px; border-radius:8px;">
-                        <div>
-                            <div style="font-size:10px; color:#8b949e; text-transform:uppercase;">Entry Price</div>
-                            <div style="font-size:16px; font-weight:700; color:#e2e8f0;">${t_entry:,.2f}</div>
-                        </div>
-                        <div>
-                            <div style="font-size:10px; color:#8b949e; text-transform:uppercase;">Current / Exit Price</div>
-                            <div style="font-size:16px; font-weight:700; color:{c_color};">${t.get('exit_price', t_entry):,.2f}</div>
-                        </div>
-                        <div>
-                            <div style="font-size:10px; color:#8b949e; text-transform:uppercase;">Position Size</div>
-                            <div style="font-size:16px; font-weight:700; color:#38bdf8;">$2.00</div>
-                        </div>
-                    </div>
-
-                    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; margin-bottom:14px; text-align:center;">
-                        <div style="background:#161b22; padding:8px; border-radius:6px;">
-                            <div style="font-size:9px; color:#8b949e;">SL</div>
-                            <div style="font-size:13px; font-weight:700; color:#ff5252;">${t_sl:,.2f}</div>
-                        </div>
-                        <div style="background:#161b22; padding:8px; border-radius:6px;">
-                            <div style="font-size:9px; color:#8b949e;">TP1 (1:2)</div>
-                            <div style="font-size:13px; font-weight:700; color:#00e676;">${t_tp1:,.2f} ✅</div>
-                        </div>
-                        <div style="background:#161b22; padding:8px; border-radius:6px;">
-                            <div style="font-size:9px; color:#8b949e;">TP2 (1:3)</div>
-                            <div style="font-size:13px; font-weight:700; color:#38bdf8;">${t_tp2:,.2f}</div>
-                        </div>
-                        <div style="background:#161b22; padding:8px; border-radius:6px;">
-                            <div style="font-size:9px; color:#8b949e;">CONFIDENCE</div>
-                            <div style="font-size:13px; font-weight:700; color:#38bdf8;">{t_conf}%</div>
-                        </div>
-                        <div style="background:#161b22; padding:8px; border-radius:6px;">
-                            <div style="font-size:9px; color:#8b949e;">P&L</div>
-                            <div style="font-size:13px; font-weight:700; color:{pnl_color};">{pnl_sign}${abs(t_pnl*2/100):.2f}<br><span style="font-size:10px;">{pnl_sign}{t_pnl:.2f}%</span></div>
-                        </div>
-                    </div>
-                    
-                    <div style="background:#080a0f; padding:6px 12px; border-radius:6px; display:flex; align-items:center; justify-content:space-between; font-size:11px; color:#8b949e;">
-                        <span>🔴 SL</span>
-                        <div style="flex-grow:1; height:4px; background:#1e2638; margin:0 10px; border-radius:2px; position:relative;">
-                            <div style="position:absolute; width:60%; height:100%; background:#00e676; border-radius:2px;"></div>
-                        </div>
-                        <span style="color:#00e676;">🟢 TP1</span>
-                        <span style="margin-left:15px; color:#38bdf8;">🎯 TP2</span>
+                    <div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;">
+                        {run_status_text}
                     </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 14px; background: #0d1117; padding: 12px; border-radius: 8px;">
+                    <div>
+                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div>
+                        <div style="font-size: 16px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div>
+                    </div>
+                    <div>
+                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit Price</div>
+                        <div style="font-size: 16px; font-weight: 700; color: {c_color};">${t.get('exit_price', t_entry):,.2f}</div>
+                    </div>
+                    <div>
+                        <div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div>
+                        <div style="font-size: 16px; font-weight: 700; color: #38bdf8;">$2.00</div>
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 14px; text-align: center;">
+                    <div style="background: #161b22; padding: 8px; border-radius: 6px;">
+                        <div style="font-size: 9px; color: #8b949e;">SL</div>
+                        <div style="font-size: 13px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div>
+                    </div>
+                    <div style="background: #161b22; padding: 8px; border-radius: 6px;">
+                        <div style="font-size: 9px; color: #8b949e;">TP1 (1:2)</div>
+                        <div style="font-size: 13px; font-weight: 700; color: #00e676;">${t_tp1:,.2f} ✅</div>
+                    </div>
+                    <div style="background: #161b22; padding: 8px; border-radius: 6px;">
+                        <div style="font-size: 9px; color: #8b949e;">TP2 (1:3)</div>
+                        <div style="font-size: 13px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div>
+                    </div>
+                    <div style="background: #161b22; padding: 8px; border-radius: 6px;">
+                        <div style="font-size: 9px; color: #8b949e;">CONFIDENCE</div>
+                        <div style="font-size: 13px; font-weight: 700; color: #38bdf8;">{t_conf}%</div>
+                    </div>
+                    <div style="background: #161b22; padding: 8px; border-radius: 6px;">
+                        <div style="font-size: 9px; color: #8b949e;">P&L</div>
+                        <div style="font-size: 13px; font-weight: 700; color: {pnl_color};">{pnl_sign}${abs(t_pnl*2/100):.2f}<br><span style="font-size: 10px;">{pnl_sign}{t_pnl:.2f}%</span></div>
+                    </div>
+                </div>
+                
+                <div style="background: #080a0f; padding: 6px 12px; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #8b949e;">
+                    <span>🔴 SL</span>
+                    <div style="flex-grow: 1; height: 4px; background: #1e2638; margin: 0 10px; border-radius: 2px; position: relative;">
+                        <div style="position: absolute; width: 60%; height: 100%; background: #00e676; border-radius: 2px;"></div>
+                    </div>
+                    <span style="color: #00e676;">🟢 TP1</span>
+                    <span style="margin-left: 15px; color: #38bdf8;">🎯 TP2</span>
+                </div>
+            </div>
+            """
+            st.markdown(card_html, unsafe_allow_html=True)
