@@ -663,7 +663,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             t_time_str = trade.get("timestamp")
             t_tf = trade.get("timeframe", "15m")
             max_duration_mins = (
-                30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
+                30 if ("15m" in t_tf or "30m" in t_tf) else 480
             )
 
             if t_time_str:
@@ -981,17 +981,18 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     )
 
     if st.session_state.trade_history_log:
-        # FIXED: Corrected filtering logic so 1h and 4h are properly captured in Intraday tab
-        scalping_trades = [
-            t
-            for t in st.session_state.trade_history_log
-            if any(tf in str(t.get("timeframe", "")) for tf in ["15m", "30m"])
-        ]
-        intraday_trades = [
-            t
-            for t in st.session_state.trade_history_log
-            if any(tf in str(t.get("timeframe", "")) for tf in ["1h", "4h"])
-        ]
+        # ROBUST FIXED FILTERING: Checks specifically for 15m/30m vs 1h/4h across the timeframe strings
+        scalping_trades = []
+        intraday_trades = []
+        
+        for t in st.session_state.trade_history_log:
+            tf_str = str(t.get("timeframe", ""))
+            # If timeframe string contains 15m or 30m
+            if "15m" in tf_str or "30m" in tf_str:
+                scalping_trades.append(t)
+            # If timeframe string contains 1h or 4h (or if it doesn't match 15m/30m, categorize safely as intraday)
+            elif "1h" in tf_str or "4h" in tf_str or ("15m" not in tf_str and "30m" not in tf_str):
+                intraday_trades.append(t)
 
         def get_coin_icon(symbol):
             if "BTC" in symbol:
@@ -1031,9 +1032,8 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 t_tf = t.get("timeframe", "15m")
                 t_outcome = t.get("outcome", "PENDING")
 
-                # Format as **Hold:** time / Left: time
                 max_duration_mins = (
-                    30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
+                    30 if ("15m" in t_tf or "30m" in t_tf) else 480
                 )
                 time_display_str = "Completed"
                 if t_status == "Open" and t_time:
