@@ -521,12 +521,36 @@ if submit_manual:
 
 
 # ==========================================
-# LOOP SCANNER / AUTO TRADING ENGINE LOGIC
+# LOOP SCANNER / AUTO TRADING ENGINE LOGIC (600s Holding / Cooldown)
 # ==========================================
 symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
 lab = TenPaperResearchLab()
 
+HOLDING_COOLDOWN_SECONDS = 600  # 600 seconds minimum gap per coin trade
+
 for sym in symbols_to_scan:
+    # Check if a trade for this symbol was opened recently (< 600 seconds)
+    recent_symbol_trade = False
+    for existing_t in st.session_state.trade_history_log:
+        if existing_t.get("symbol") == sym:
+            t_time_str = existing_t.get("timestamp")
+            if t_time_str:
+                try:
+                    t_dt = datetime.datetime.strptime(
+                        t_time_str, "%Y-%m-%d %H:%M:%S"
+                    )
+                    elapsed_sec = (
+                        datetime.datetime.now() - t_dt
+                    ).total_seconds()
+                    if elapsed_sec < HOLDING_COOLDOWN_SECONDS:
+                        recent_symbol_trade = True
+                        break
+                except Exception:
+                    pass
+
+    if recent_symbol_trade:
+        continue  # Skip scanning this symbol if 600s haven't passed yet
+
     scan_df = fetch_klines_data(sym, selected_tf_label)
     scan_bids, scan_asks = fetch_order_book_depth(sym)
 
@@ -566,37 +590,30 @@ for sym in symbols_to_scan:
             continue
 
         if paper_trading_mode and s_dir != "NEUTRAL":
-            lock_sec = tf_minutes * 60
             curr_sec = int(time.time())
-            t_bucket = curr_sec - (curr_sec % lock_sec)
-            loop_trade_id = f"{sym}_{selected_tf_label}_{t_bucket}"
+            loop_trade_id = f"{sym}_{selected_tf_label}_{curr_sec}"
 
-            existing_ids = [
-                item.get("trade_id")
-                for item in st.session_state.trade_history_log
-            ]
-            if loop_trade_id not in existing_ids:
-                loop_trade = {
-                    "trade_id": loop_trade_id,
-                    "timestamp": datetime.datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    "symbol": sym,
-                    "timeframe": selected_tf_label,
-                    "direction": s_dir,
-                    "entry_price": round(s_close_p, 4),
-                    "stop_loss": round(s_sl, 4),
-                    "tp1": round(s_tp1, 4),
-                    "tp2": round(s_tp2, 4),
-                    "exit_price": round(s_close_p, 4),
-                    "confidence": s_conf,
-                    "final_score": round(s_final_score, 3),
-                    "outcome": "PENDING",
-                    "pnl_percent": 1.50,
-                    "duration": "Active",
-                    "status": "Open",
-                }
-                st.session_state.trade_history_log.insert(0, loop_trade)
+            loop_trade = {
+                "trade_id": loop_trade_id,
+                "timestamp": datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "symbol": sym,
+                "timeframe": selected_tf_label,
+                "direction": s_dir,
+                "entry_price": round(s_close_p, 4),
+                "stop_loss": round(s_sl, 4),
+                "tp1": round(s_tp1, 4),
+                "tp2": round(s_tp2, 4),
+                "exit_price": round(s_close_p, 4),
+                "confidence": s_conf,
+                "final_score": round(s_final_score, 3),
+                "outcome": "PENDING",
+                "pnl_percent": 1.50,
+                "duration": "Active",
+                "status": "Open",
+            }
+            st.session_state.trade_history_log.insert(0, loop_trade)
 
 save_persistent_history(st.session_state.trade_history_log)
 
