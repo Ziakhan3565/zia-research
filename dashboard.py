@@ -87,7 +87,6 @@ def train_xgboost_model_automatically(history_list, force=False):
     try:
         X = []
         y = []
-        # Agar closed trades kam hain lekin manual train dabaya gaya hai, toh dummy/synthetic features se train karlo taaki error na aaye
         if len(closed_trades) == 0:
             for _ in range(25):
                 X.append([np.random.uniform(-1, 1) for _ in range(12)])
@@ -331,7 +330,7 @@ st.markdown(
 
 
 # ==========================================
-# 4. SIDEBAR CONTROLS & MANUAL TRAIN BUTTON
+# 4. SIDEBAR CONTROLS & MANUAL/LOOP OPTIONS
 # ==========================================
 COINS_LIST = [
     "BTCUSDT",
@@ -359,7 +358,18 @@ forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎛️ Paper Trading Mode")
-paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
+paper_trading_mode = st.sidebar.toggle("Enable Live Auto-Scans", value=True)
+loop_all_coins = st.sidebar.toggle("🔄 Scan All Coins in Loop", value=False, help="Enable to automatically scan all coins in COINS_LIST concurrently on each refresh cycle.")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🛠️ Manual Trade Execution")
+with st.sidebar.form("manual_trade_form"):
+    m_coin = st.selectbox("Manual Coin", COINS_LIST)
+    m_dir = st.selectbox("Direction", ["LONG", "SHORT"])
+    m_entry = st.number_input("Entry Price", value=0.0, step=0.1, help="0 dalne par current price utha lega")
+    m_sl = st.number_input("Stop Loss", value=0.0, step=0.1)
+    m_tp = st.number_input("Take Profit (TP1)", value=0.0, step=0.1)
+    submit_manual = st.form_submit_button("📥 Open Manual Trade")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 ML Model Controls")
@@ -378,32 +388,7 @@ if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 # ==========================================
-# AUTO-TRAINING CHECK (HAR 20 TRADES KE BAAD)
-# ==========================================
-closed_trades_list = [
-    t
-    for t in st.session_state.get("trade_history_log", [])
-    if t.get("outcome") in ["WIN", "LOSS"]
-]
-closed_count = len(closed_trades_list)
-
-if closed_count >= TRAIN_INTERVAL and closed_count % TRAIN_INTERVAL == 0:
-    milestone_key = f"trained_at_{closed_count}"
-    if milestone_key not in st.session_state:
-        success, msg = train_xgboost_model_automatically(
-            st.session_state.trade_history_log, force=False
-        )
-        if success:
-            st.session_state[milestone_key] = True
-            st.sidebar.success(
-                f"🚀 Model retrained successfully at {closed_count} trades!"
-            )
-            st.cache_resource.clear()
-        else:
-            st.sidebar.error(f"Auto-training failed: {msg}")
-
-# ==========================================
-# 5. DATA FETCHING (SAFE API WITH FALLBACK)
+# DATA FETCHING FUNCTIONS
 # ==========================================
 @st.cache_data(ttl=15)
 def fetch_klines_data(symbol, tf_key, limit=100):
@@ -481,18 +466,114 @@ def fetch_order_book_depth(symbol, depth_limit=20):
     return dummy_bids, dummy_asks
 
 
+# ==========================================
+# MANUAL TRADE SUBMISSION HANDLING
+# ==========================================
+if submit_manual:
+    temp_df_m = fetch_klines_data(m_coin, selected_tf_label, limit=5)
+    current_m_price = temp_df_m["Close"].iloc[-1] if not temp_df_m.empty else 100.0
+    
+    entry_p = m_entry if m_entry > 0 else current_m_price
+    atr_approx = current_m_price * 0.005
+    sl_p = m_sl if m_sl > 0 else (entry_p - 1.5 * atr_approx if m_dir == "LONG" else entry_p + 1.5 * atr_approx)
+    tp_p = m_tp if m_tp > 0 else (entry_p + 3.0 * atr_approx if m_dir == "LONG" else entry_p - 3.0 * atr_approx)
+    
+    manual_trade_id = f"MANUAL_{m_coin}_{int(time.time())}"
+    manual_new_trade = {
+        "trade_id": manual_trade_id,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": m_coin,
+        "timeframe": selected_tf_label,
+        "direction": m_dir,
+        "entry_price": round(entry_p, 4),
+        "stop_loss": round(sl_p, 4),
+        "tp1": round(tp_p, 4),
+        "tp2": round(tp_p * 1.01 if m_dir=="LONG" else tp_p * 0.99, 4),
+        "exit_price": round(entry_p, 4),
+        "confidence": 100,
+        "final_score": 1.0 if m_dir == "LONG" else -1.0,
+        "outcome": "PENDING",
+        "pnl_percent": 0.0,
+        "duration": "Active",
+        "status": "Open",
+    }
+    st.session_state.trade_history_log.insert(0, manual_new_trade)
+    save_persistent_history(st.session_state.trade_history_log)
+    st.sidebar.success(f"Manually added {m_dir} trade for {m_coin}!")
+
+
+# ==========================================
+# LOOP SCANNER / AUTO TRADING ENGINE LOGIC
+# ==========================================
+symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
+
+lab = TenPaperResearchLab()
+
+for sym in symbols_to_scan:
+    scan_df = fetch_klines_data(sym, selected_tf_label)
+    scan_bids, scan_asks = fetch_order_book_depth(sym)
+    
+    if not scan_df.empty and len(scan_df) >= 3 and len(scan_bids) > 0 and len(scan_asks) > 0:
+        _, s_final_score, _ = lab.calculate_all_signals(scan_df, scan_bids, scan_asks)
+        s_close_p = scan_df["Close"].iloc[-1]
+        s_atr = (scan_df["High"] - scan_df["Low"]).rolling(14).mean().iloc[-1]
+        if np.isnan(s_atr):
+            s_atr = s_close_p * 0.005
+            
+        s_dir = "LONG" if s_final_score >= 0.12 else ("SHORT" if s_final_score <= -0.12 else "NEUTRAL")
+        s_conf = int(min(max(abs(s_final_score) * 100, 20), 99))
+        
+        s_risk_dist = 1.5 * s_atr
+        if s_dir == "LONG":
+            s_sl = s_close_p - s_risk_dist
+            s_tp1 = s_close_p + (2.0 * s_risk_dist)
+            s_tp2 = s_close_p + (3.0 * s_risk_dist)
+        elif s_dir == "SHORT":
+            s_sl = s_close_p + s_risk_dist
+            s_tp1 = s_close_p - (2.0 * s_risk_dist)
+            s_tp2 = s_close_p - (3.0 * s_risk_dist)
+        else:
+            continue
+            
+        if paper_trading_mode and s_dir != "NEUTRAL":
+            lock_sec = tf_minutes * 60
+            curr_sec = int(time.time())
+            t_bucket = curr_sec - (curr_sec % lock_sec)
+            loop_trade_id = f"{sym}_{selected_tf_label}_{t_bucket}"
+            
+            existing_ids = [item.get("trade_id") for item in st.session_state.trade_history_log]
+            if loop_trade_id not in existing_ids:
+                loop_trade = {
+                    "trade_id": loop_trade_id,
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": sym,
+                    "timeframe": selected_tf_label,
+                    "direction": s_dir,
+                    "entry_price": round(s_close_p, 4),
+                    "stop_loss": round(s_sl, 4),
+                    "tp1": round(s_tp1, 4),
+                    "tp2": round(s_tp2, 4),
+                    "exit_price": round(s_close_p, 4),
+                    "confidence": s_conf,
+                    "final_score": round(s_final_score, 3),
+                    "outcome": "PENDING",
+                    "pnl_percent": 0.0,
+                    "duration": "Active",
+                    "status": "Open",
+                }
+                st.session_state.trade_history_log.insert(0, loop_trade)
+
+save_persistent_history(st.session_state.trade_history_log)
+
+
+# ==========================================
+# 5. MAIN UI RENDERING FOR SELECTED SYMBOL
+# ==========================================
 df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
 
-
-# ==========================================
-# 6. ENGINE EXECUTION & SIGNAL GENERATION
-# ==========================================
 if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
-    lab = TenPaperResearchLab()
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(
-        df, bids, asks
-    )
+    paper_results, final_score, evolved_weights = lab.calculate_all_signals(df, bids, asks)
 
     close_p = df["Close"].iloc[-1]
     atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
@@ -505,7 +586,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         else ("SHORT" if final_score <= -0.12 else "NEUTRAL")
     )
     confidence = int(min(max(abs(final_score) * 100, 20), 99))
-
     risk_distance = 1.5 * atr_val
 
     if direction == "LONG":
@@ -523,39 +603,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     lock_seconds = tf_minutes * 60
     current_time_sec = int(time.time())
-    time_bucket = current_time_sec - (current_time_sec % lock_seconds)
     time_remaining = lock_seconds - (current_time_sec % lock_seconds)
 
-    trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}"
-
-    if paper_trading_mode and direction != "NEUTRAL":
-        existing_trade_ids = [
-            item.get("trade_id") for item in st.session_state.trade_history_log
-        ]
-        if trade_id not in existing_trade_ids:
-            new_trade = {
-                "trade_id": trade_id,
-                "timestamp": datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "symbol": selected_symbol,
-                "timeframe": selected_tf_label,
-                "direction": direction,
-                "entry_price": round(close_p, 4),
-                "stop_loss": round(sl_val, 4),
-                "tp1": round(tp1_val, 4),
-                "tp2": round(tp2_val, 4),
-                "exit_price": round(close_p, 4),
-                "confidence": confidence,
-                "final_score": round(final_score, 3),
-                "outcome": "PENDING",
-                "pnl_percent": 0.0,
-                "duration": "Active",
-                "status": "Open",
-            }
-            st.session_state.trade_history_log.insert(0, new_trade)
-            save_persistent_history(st.session_state.trade_history_log)
-
+    # Background Outcome Checker for PENDING trades
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING":
             trade_symbol = trade["symbol"]
@@ -567,7 +617,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                     if entry_time_str and candle_time >= entry_time_str:
                         curr_high = row["High"]
                         curr_low = row["Low"]
-
                         entry = trade["entry_price"]
                         sl = trade["stop_loss"]
                         tp = trade["tp1"]
@@ -576,47 +625,32 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                             if curr_high >= tp:
                                 trade["outcome"] = "WIN"
                                 trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((tp - entry) / entry) * 100, 2
-                                )
+                                trade["pnl_percent"] = round(((tp - entry) / entry) * 100, 2)
                                 trade["status"] = "Closed"
                                 break
                             elif curr_low <= sl:
                                 trade["outcome"] = "LOSS"
                                 trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((sl - entry) / entry) * 100, 2
-                                )
+                                trade["pnl_percent"] = round(((sl - entry) / entry) * 100, 2)
                                 trade["status"] = "Closed"
                                 break
                         elif trade["direction"] == "SHORT":
                             if curr_low <= tp:
                                 trade["outcome"] = "WIN"
                                 trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((entry - tp) / entry) * 100, 2
-                                )
+                                trade["pnl_percent"] = round(((entry - tp) / entry) * 100, 2)
                                 trade["status"] = "Closed"
                                 break
                             elif curr_high >= sl:
                                 trade["outcome"] = "LOSS"
                                 trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((entry - sl) / entry) * 100, 2
-                                )
+                                trade["pnl_percent"] = round(((entry - sl) / entry) * 100, 2)
                                 trade["status"] = "Closed"
                                 break
 
     save_persistent_history(st.session_state.trade_history_log)
 
-    closed_count = len(
-        [
-            t
-            for t in st.session_state.trade_history_log
-            if t["outcome"] in ["WIN", "LOSS"]
-        ]
-    )
-    # Dynamic 20-trades training target calculation
+    closed_count = len([t for t in st.session_state.trade_history_log if t["outcome"] in ["WIN", "LOSS"]])
     next_train_target = (closed_count // TRAIN_INTERVAL + 1) * TRAIN_INTERVAL
 
     risk_engine = PowerTradingRiskEngine()
@@ -632,15 +666,9 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         volatility=df["Close"].pct_change().std() + 1e-8,
     )
 
-    dir_color = (
-        "#00e676"
-        if direction == "LONG"
-        else ("#ff5252" if direction == "SHORT" else "#38bdf8")
-    )
+    dir_color = "#00e676" if direction == "LONG" else ("#ff5252" if direction == "SHORT" else "#38bdf8")
     mins_rem, secs_rem = divmod(time_remaining, 60)
-    ml_status_text = (
-        "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
-    )
+    ml_status_text = "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
 
     st.markdown(
         f"""
@@ -648,12 +676,13 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
         ML: <b>{ml_status_text}</b> &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
         Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
-        ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b>
+        ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b> &nbsp;|&nbsp; Loop Scan: <b>{"ON" if loop_all_coins else "OFF"}</b>
     </div>
     """,
         unsafe_allow_html=True,
     )
 
+    # UI Metrics & Layout
     col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
 
     with col_sig:
@@ -670,50 +699,24 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         )
 
     with col_m1:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>', unsafe_allow_html=True)
     with col_m2:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>', unsafe_allow_html=True)
     with col_m3:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>', unsafe_allow_html=True)
     with col_m4:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>', unsafe_allow_html=True)
 
+    # Chart & Trade History display area
     col_chart, col_risk_panel = st.columns([2.5, 1])
     with col_chart:
         st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
         time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [
-            df["Time"].iloc[-1] + (i * time_delta)
-            for i in range(1, forecast_horizon + 1)
-        ]
+        future_times = [df["Time"].iloc[-1] + (i * time_delta) for i in range(1, forecast_horizon + 1)]
         t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
 
         if direction == "LONG":
@@ -724,53 +727,12 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             forecast_prices = [close_p] * forecast_horizon
 
         fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df["Time"],
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="Candles",
-                increasing_line_color="#00e676",
-                decreasing_line_color="#ff5252",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[df["Time"].iloc[-1]] + future_times,
-                y=[close_p] + list(forecast_prices),
-                mode="lines+markers",
-                name="Trajectory",
-                line=dict(color=dir_color, width=2, dash="dot"),
-            )
-        )
-        fig.add_hline(
-            y=tp2_val,
-            line_dash="dash",
-            line_color="#00e676",
-            annotation_text=f"TP2: ${tp2_val:,.4f}",
-        )
-        fig.add_hline(
-            y=tp1_val,
-            line_dash="dash",
-            line_color="#38bdf8",
-            annotation_text=f"TP1: ${tp1_val:,.4f}",
-        )
-        fig.add_hline(
-            y=sl_val,
-            line_dash="dot",
-            line_color="#ff5252",
-            annotation_text=f"SL: ${sl_val:,.4f}",
-        )
-        fig.update_layout(
-            template="plotly_dark",
-            height=420,
-            xaxis_rangeslider_visible=False,
-            paper_bgcolor="#111622",
-            plot_bgcolor="#111622",
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
+        fig.add_trace(go.Candlestick(x=df["Time"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles", increasing_line_color="#00e676", decreasing_line_color="#ff5252"))
+        fig.add_trace(go.Scatter(x=[df["Time"].iloc[-1]] + future_times, y=[close_p] + list(forecast_prices), mode="lines+markers", name="Trajectory", line=dict(color=dir_color, width=2, dash="dot")))
+        fig.add_hline(y=tp2_val, line_dash="dash", line_color="#00e676", annotation_text=f"TP2: ${tp2_val:,.4f}")
+        fig.add_hline(y=tp1_val, line_dash="dash", line_color="#38bdf8", annotation_text=f"TP1: ${tp1_val:,.4f}")
+        fig.add_hline(y=sl_val, line_dash="dot", line_color="#ff5252", annotation_text=f"SL: ${sl_val:,.4f}")
+        fig.update_layout(template="plotly_dark", height=420, xaxis_rangeslider_visible=False, paper_bgcolor="#111622", plot_bgcolor="#111622", margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
     with col_risk_panel:
@@ -778,11 +740,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
         ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
         obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
-        spread_val = (
-            abs(asks[0, 0] - bids[0, 0])
-            if len(bids) > 0 and len(asks) > 0
-            else 0.0
-        )
+        spread_val = abs(asks[0, 0] - bids[0, 0]) if len(bids) > 0 and len(asks) > 0 else 0.0
 
         st.markdown(
             f"""
@@ -791,89 +749,15 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
             <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
             <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.4f}</b></div>
-            <div style="display:flex; justify-content:space-between;"><span>Auto-Retrain</span> <b style="color:#00e676;">ACTIVE (20)</b></div>
+            <div style="display:flex; justify-content:space-between;"><span>Loop Scan</span> <b style="color:#00e676;">{"ACTIVE" if loop_all_coins else "SINGLE"}</b></div>
         </div>
         """,
             unsafe_allow_html=True,
         )
 
     st.markdown("---")
-    st.subheader("📊 Performance Summary & Win Rate")
+    st.subheader("📊 Performance Summary & Trade Logs")
 
     if st.session_state.trade_history_log:
         df_log = pd.DataFrame(st.session_state.trade_history_log)
-
-        f_col1, f_col2, f_col3 = st.columns(3)
-        with f_col1:
-            coin_filter = st.selectbox("Filter Coin", ["ALL"] + COINS_LIST)
-        with f_col2:
-            tf_filter = st.selectbox(
-                "Filter Timeframe", ["ALL"] + list(TIMEFRAME_MAP.keys())
-            )
-        with f_col3:
-            dir_filter = st.selectbox("Filter Direction", ["ALL", "LONG", "SHORT"])
-
-        filtered_df = df_log.copy()
-        if coin_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["symbol"] == coin_filter]
-        if tf_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["timeframe"] == tf_filter]
-        if dir_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["direction"] == dir_filter]
-
-        total_signals = len(filtered_df)
-        wins = len(filtered_df[filtered_df["outcome"] == "WIN"])
-        losses = len(filtered_df[filtered_df["outcome"] == "LOSS"])
-        pending = len(filtered_df[filtered_df["outcome"] == "PENDING"])
-        closed_trades = wins + losses
-        win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0.0
-
-        winning_trades_df = filtered_df[filtered_df["outcome"] == "WIN"]
-        losing_trades_df = filtered_df[filtered_df["outcome"] == "LOSS"]
-
-        gross_profit = (
-            winning_trades_df["pnl_percent"].sum()
-            if not winning_trades_df.empty
-            else 0.0
-        )
-        gross_loss = (
-            abs(losing_trades_df["pnl_percent"].sum())
-            if not losing_trades_df.empty
-            else 0.0
-        )
-        net_pnl = gross_profit - gross_loss
-
-        p1, p2, p3, p4, p5, p6 = st.columns(6)
-        with p1:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-val-green">{win_rate:.1f}%</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p2:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Closed</div><div class="metric-val-blue">{closed_trades}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p3:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Wins/Losses</div><div style="font-size:16px; font-weight:750; color:#00e676;">{wins}W / {losses}L</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p4:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Pending</div><div class="metric-val-blue">{pending}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p5:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Gross PnL</div><div class="metric-val-blue">{gross_profit:.2f}%</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p6:
-            net_color = "metric-val-green" if net_pnl >= 0 else "metric-val-red"
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Net PnL</div><div class="{net_color}">{net_pnl:+.2f}%</div></div>',
-                unsafe_allow_html=True,
-            )
-
-        st.dataframe(filtered_df, use_container_width=True)
+        st.dataframe(df_log, use_container_width=True)
