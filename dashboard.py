@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Smooth background refresh (no jarring full-page blank flash)
+# Smooth background refresh
 count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
 CSV_FILE = "signal_history.csv"
@@ -72,7 +72,7 @@ if "trade_history_log" not in st.session_state:
 # ==========================================
 # XGBOOST AUTO & MANUAL TRAINING SYSTEM
 # ==========================================
-TRAIN_INTERVAL = 20  # Har 20 trades par auto-train
+TRAIN_INTERVAL = 20
 
 
 def train_xgboost_model_automatically(history_list, force=False):
@@ -86,8 +86,7 @@ def train_xgboost_model_automatically(history_list, force=False):
         )
 
     try:
-        X = []
-        y = []
+        X, y = [], []
         if len(closed_trades) == 0:
             for _ in range(25):
                 X.append([np.random.uniform(-1, 1) for _ in range(12)])
@@ -137,7 +136,6 @@ class TenPaperResearchLab:
     def __init__(self, target_vol=0.15):
         self.target_vol = target_vol
         self.scaler = StandardScaler()
-
         self.feature_names = [
             "HAWKES",
             "BOOK_IMB",
@@ -180,7 +178,6 @@ class TenPaperResearchLab:
         results["HAWKES"] = np.clip(
             (hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1
         )
-
         results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
 
         taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
@@ -240,7 +237,6 @@ class TenPaperResearchLab:
         results["REWARD_RISK"] = (
             1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
         )
-
         return results
 
     def calculate_all_signals(self, df, bids, asks):
@@ -248,7 +244,6 @@ class TenPaperResearchLab:
         feature_vector = np.array(
             [results[k] for k in self.feature_names]
         ).reshape(1, -1)
-
         weight_vector = np.array(list(self.dynamic_weights.values()))
         math_score = float(np.dot(feature_vector[0], weight_vector))
 
@@ -286,14 +281,11 @@ class PowerTradingRiskEngine:
         )
         max_ltz = np.max(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
         ltz_score = (max_ltz / (total_ltz + 1e-8)) * 100
-
         spoof_ratio = cancelled_vol / (displayed_vol + 1e-8)
         persistence = min(max(time_exists / (obs_window + 1e-8), 0), 1)
         spoof_score = spoof_ratio * (1 - persistence)
-
         squeeze_risk = total_ltz * open_interest * leverage * volatility
         market_risk = ltz_score + spoof_score + squeeze_risk
-
         return {
             "LTZ_Score": ltz_score,
             "Spoof_Score": spoof_score,
@@ -303,7 +295,7 @@ class PowerTradingRiskEngine:
 
 
 # ==========================================
-# 3. PROFESSIONAL STYLING & MOBILE RESPONSIVE CSS
+# 3. PROFESSIONAL STYLING & CSS
 # ==========================================
 st.markdown(
     """
@@ -325,22 +317,16 @@ st.markdown(
         padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
     }
     .sticky-dashboard-header {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: #080a0f;
-        padding-top: 10px;
-        padding-bottom: 10px;
-        border-bottom: 1px solid #1e2638;
+        position: sticky; top: 0; z-index: 999; background: #080a0f;
+        padding-top: 10px; padding-bottom: 10px; border-bottom: 1px solid #1e2638;
     }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-
 # ==========================================
-# 4. SIDEBAR CONTROLS & MANUAL/LOOP OPTIONS
+# 4. SIDEBAR CONTROLS
 # ==========================================
 COINS_LIST = [
     "BTCUSDT",
@@ -350,7 +336,6 @@ COINS_LIST = [
     "XRPUSDT",
     "TAOUSDT",
 ]
-
 TIMEFRAME_MAP = {
     "15m (Scalping)": ("15m", 15),
     "30m (Scalping)": ("30m", 30),
@@ -426,7 +411,7 @@ def fetch_klines_data(symbol, tf_key, limit=100):
     try:
         res = requests.get(url, timeout=4).json()
         if isinstance(res, dict) or not isinstance(res, list):
-            raise ValueError("API limit or invalid format")
+            raise ValueError("API limit")
         df = pd.DataFrame(
             res,
             columns=[
@@ -484,12 +469,11 @@ def fetch_order_book_depth(symbol, depth_limit=20):
 
 
 # ==========================================
-# MANUAL TRADE SUBMISSION HANDLING
+# MANUAL TRADE SUBMISSION
 # ==========================================
 if submit_manual:
     temp_df_m = fetch_klines_data(m_coin, selected_tf_label, limit=5)
     current_m_price = temp_df_m["Close"].iloc[-1] if not temp_df_m.empty else 100.0
-
     entry_p = m_entry if m_entry > 0 else current_m_price
     atr_approx = current_m_price * 0.005
     sl_p = (
@@ -526,7 +510,7 @@ if submit_manual:
         "confidence": 91,
         "final_score": 1.0 if m_dir == "LONG" else -1.0,
         "outcome": "PENDING",
-        "pnl_percent": 3.30,
+        "pnl_percent": 0.0,
         "duration": "Active",
         "status": "Open",
     }
@@ -536,16 +520,23 @@ if submit_manual:
 
 
 # ==========================================
-# LOOP SCANNER / AUTO TRADING ENGINE LOGIC
+# LOOP SCANNER WITH COOLDOWN (NO REPEATING TRADES)
 # ==========================================
 symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
 lab = TenPaperResearchLab()
 
+# Cooldown to prevent duplicate active trades per coin (10 mins cooldown)
 HOLDING_COOLDOWN_SECONDS = 600
 
 for sym in symbols_to_scan:
     recent_symbol_trade = False
     for existing_t in st.session_state.trade_history_log:
+        if (
+            existing_t.get("symbol") == sym
+            and existing_t.get("status") == "Open"
+        ):
+            recent_symbol_trade = True
+            break
         if existing_t.get("symbol") == sym:
             t_time_str = existing_t.get("timestamp")
             if t_time_str:
@@ -590,8 +581,8 @@ for sym in symbols_to_scan:
             else ("SHORT" if s_final_score <= -0.12 else "NEUTRAL")
         )
         s_conf = int(min(max(abs(s_final_score) * 100, 20), 99))
-
         s_risk_dist = 1.5 * s_atr
+
         if s_dir == "LONG":
             s_sl = s_close_p - s_risk_dist
             s_tp1 = s_close_p + (2.0 * s_risk_dist)
@@ -604,9 +595,7 @@ for sym in symbols_to_scan:
             continue
 
         if paper_trading_mode and s_dir != "NEUTRAL":
-            curr_sec = int(time.time())
-            loop_trade_id = f"{sym}_{selected_tf_label}_{curr_sec}"
-
+            loop_trade_id = f"{sym}_{selected_tf_label}_{int(time.time())}"
             loop_trade = {
                 "trade_id": loop_trade_id,
                 "timestamp": datetime.datetime.now().strftime(
@@ -623,7 +612,7 @@ for sym in symbols_to_scan:
                 "confidence": s_conf,
                 "final_score": round(s_final_score, 3),
                 "outcome": "PENDING",
-                "pnl_percent": 1.50,
+                "pnl_percent": 0.0,
                 "duration": "Active",
                 "status": "Open",
             }
@@ -633,7 +622,7 @@ save_persistent_history(st.session_state.trade_history_log)
 
 
 # ==========================================
-# 5. MAIN UI RENDERING FOR SELECTED SYMBOL
+# 5. MAIN UI RENDERING
 # ==========================================
 df = fetch_klines_data(selected_symbol, selected_tf_label)
 bids, asks = fetch_order_book_depth(selected_symbol)
@@ -642,7 +631,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     paper_results, final_score, evolved_weights = lab.calculate_all_signals(
         df, bids, asks
     )
-
     close_p = df["Close"].iloc[-1]
     atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
     if np.isnan(atr_val):
@@ -673,61 +661,109 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     current_time_sec = int(time.time())
     time_remaining = lock_seconds - (current_time_sec % lock_seconds)
 
-    # Background Outcome Checker for PENDING trades
+    # Outcome & Time Duration Checker (Scalping = 30 mins, Intraday = 8 Hours)
     for trade in st.session_state.trade_history_log:
         if trade["outcome"] == "PENDING":
-            trade_symbol = trade["symbol"]
-            temp_df = fetch_klines_data(
-                trade_symbol, trade["timeframe"], limit=15
+            t_time_str = trade.get("timestamp")
+            t_tf = trade.get("timeframe", "15m")
+            # Scalping limit = 30 mins, Intraday limit = 8 hours (480 mins)
+            max_duration_mins = (
+                30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
             )
-            if not temp_df.empty:
-                entry_time_str = trade.get("timestamp")
-                for idx, row in temp_df.iterrows():
-                    candle_time = str(row["Time"])
-                    if entry_time_str and candle_time >= entry_time_str:
-                        curr_high = row["High"]
-                        curr_low = row["Low"]
-                        entry = trade["entry_price"]
-                        sl = trade["stop_loss"]
-                        tp = trade["tp1"]
 
-                        if trade["direction"] == "LONG":
-                            if curr_high >= tp:
-                                trade["outcome"] = "WIN"
-                                trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((tp - entry) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                            elif curr_low <= sl:
-                                trade["outcome"] = "LOSS"
-                                trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((sl - entry) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                        elif trade["direction"] == "SHORT":
-                            if curr_low <= tp:
-                                trade["outcome"] = "WIN"
-                                trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((entry - tp) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                            elif curr_high >= sl:
-                                trade["outcome"] = "LOSS"
-                                trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((entry - sl) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
+            if t_time_str:
+                try:
+                    t_dt = datetime.datetime.strptime(
+                        t_time_str, "%Y-%m-%d %H:%M:%S"
+                    )
+                    elapsed_mins = (
+                        datetime.datetime.now() - t_dt
+                    ).total_seconds() / 60.0
+
+                    trade_symbol = trade["symbol"]
+                    temp_df = fetch_klines_data(
+                        trade_symbol, trade["timeframe"], limit=15
+                    )
+                    current_price = (
+                        temp_df["Close"].iloc[-1]
+                        if not temp_df.empty
+                        else trade["entry_price"]
+                    )
+
+                    # Check if duration expired or hit SL/TP
+                    if elapsed_mins >= max_duration_mins:
+                        trade["status"] = "Closed"
+                        trade["exit_price"] = current_price
+                        pnl_calc = (
+                            ((current_price - trade["entry_price"]) / trade["entry_price"])
+                            * 100
+                            if trade["direction"] == "LONG"
+                            else ((trade["entry_price"] - current_price) / trade["entry_price"])
+                            * 100
+                        )
+                        trade["pnl_percent"] = round(pnl_calc, 2)
+                        trade["outcome"] = "WIN" if pnl_calc >= 0 else "LOSS"
+                    else:
+                        # Live check against TP/SL in candles
+                        if not temp_df.empty:
+                            for idx, row in temp_df.iterrows():
+                                candle_time = str(row["Time"])
+                                if candle_time >= t_time_str:
+                                    curr_high, curr_low = (
+                                        row["High"],
+                                        row["Low"],
+                                    )
+                                    entry = trade["entry_price"]
+                                    sl = trade["stop_loss"]
+                                    tp = trade["tp1"]
+
+                                    if trade["direction"] == "LONG":
+                                        if curr_high >= tp:
+                                            trade["outcome"] = "WIN"
+                                            trade["exit_price"] = tp
+                                            trade["pnl_percent"] = round(
+                                                ((tp - entry) / entry) * 100, 2
+                                            )
+                                            trade["status"] = "Closed"
+                                            break
+                                        elif curr_low <= sl:
+                                            trade["outcome"] = "LOSS"
+                                            trade["exit_price"] = sl
+                                            trade["pnl_percent"] = round(
+                                                ((sl - entry) / entry) * 100, 2
+                                            )
+                                            trade["status"] = "Closed"
+                                            break
+                                    elif trade["direction"] == "SHORT":
+                                        if curr_low <= tp:
+                                            trade["outcome"] = "WIN"
+                                            trade["exit_price"] = tp
+                                            trade["pnl_percent"] = round(
+                                                ((entry - tp) / entry) * 100, 2
+                                            )
+                                            trade["status"] = "Closed"
+                                            break
+                                        elif curr_high >= sl:
+                                            trade["outcome"] = "LOSS"
+                                            trade["exit_price"] = sl
+                                            trade["pnl_percent"] = round(
+                                                ((entry - sl) / entry) * 100, 2
+                                            )
+                                            trade["status"] = "Closed"
+                                            break
+                except Exception:
+                    pass
 
     save_persistent_history(st.session_state.trade_history_log)
 
+    # Calculate Total P&L across all trades
+    total_pnl_sum = sum(
+        [
+            t.get("pnl_percent", 0.0)
+            for t in st.session_state.trade_history_log
+            if t.get("outcome") in ["WIN", "LOSS"]
+        ]
+    )
     total_wins = len(
         [
             t
@@ -771,20 +807,20 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         else ("#ff5252" if direction == "SHORT" else "#38bdf8")
     )
     mins_rem, secs_rem = divmod(time_remaining, 60)
-    ml_status_text = (
-        "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
-    )
+    pnl_total_color = "#00e676" if total_pnl_sum >= 0 else "#ff5252"
+    pnl_total_sign = "+" if total_pnl_sum >= 0 else ""
 
     st.markdown(
         f"""
     <div class="top-status-bar" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
         <div>
             🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
-            ML: <b>{ml_status_text}</b> &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
+            SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
             Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
-            ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b> &nbsp;|&nbsp; Loop Scan: <b>{"ON" if loop_all_coins else "OFF"}</b>
+            ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b>
         </div>
         <div>
+            💰 Total P&L: <b style="color:{pnl_total_color};">{pnl_total_sign}{total_pnl_sum:.2f}%</b> &nbsp;|&nbsp; 
             🏆 Wins: <b style="color:#00e676;">{total_wins}</b> &nbsp;|&nbsp; ❌ Losses: <b style="color:#ff5252;">{total_losses}</b>
         </div>
     </div>
@@ -945,15 +981,14 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     st.markdown(
         """
     <div class="sticky-dashboard-header">
-        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard</h3>
+        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard (Scalping: 30m | Intraday: 8h)</h3>
     </div>
     """,
         unsafe_allow_html=True,
     )
 
-    # Tabs for Scalping (15m/30m) vs Intraday (1h/4h) separation
     tab_scalping, tab_intraday = st.tabs(
-        ["⚡ Scalping (15m / 30m)", "📊 Intraday (1h / 4h)"]
+        ["⚡ Scalping (15m / 30m - 30m Limit)", "📊 Intraday (1h / 4h - 8h Limit)"]
     )
 
     if st.session_state.trade_history_log:
@@ -1004,19 +1039,23 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 t_exit = t.get("exit_price", t_entry)
                 t_time = t.get("timestamp", "")
                 t_tf = t.get("timeframe", "15m")
+                t_outcome = t.get("outcome", "PENDING")
 
                 c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
-                run_status_bg = (
-                    "rgba(0, 230, 118, 0.1)"
-                    if t_status == "Open"
-                    else "rgba(139, 148, 158, 0.1)"
-                )
-                run_status_fg = "#00e676" if t_status == "Open" else "#8b949e"
-                run_status_text = (
-                    "🟢 RUNNING"
-                    if t_status == "Open"
-                    else f"🔴 {t.get('outcome','CLOSED')}"
-                )
+                
+                if t_status == "Open":
+                    run_status_bg = "rgba(0, 230, 118, 0.1)"
+                    run_status_fg = "#00e676"
+                    run_status_text = "🟢 RUNNING"
+                else:
+                    if t_outcome == "WIN":
+                        run_status_bg = "rgba(0, 230, 118, 0.1)"
+                        run_status_fg = "#00e676"
+                        run_status_text = "🟢 PROFIT (WIN)"
+                    else:
+                        run_status_bg = "rgba(255, 82, 82, 0.1)"
+                        run_status_fg = "#ff5252"
+                        run_status_text = "🔴 LOSS"
 
                 pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
                 pnl_sign = "+" if t_pnl >= 0 else ""
