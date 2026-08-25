@@ -476,7 +476,6 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     time_bucket = current_time_sec - (current_time_sec % lock_seconds)
     time_remaining = lock_seconds - (current_time_sec % lock_seconds)
 
-    # FIXED: Unique Trade ID per Symbol + Timeframe + Time Bucket to prevent duplicate spamming
     trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}"
 
     if paper_trading_mode and direction != "NEUTRAL":
@@ -642,7 +641,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
         )
         st.markdown(
             f'<div class="metric-card"><div class="metric-label">Next Train'
-            f" At</div><div"
+            " At</div><div"
             f' class="metric-val-green">{(closed_count // 100 + 1) * 100}'
             " Trades</div></div>",
             unsafe_allow_html=True,
@@ -877,15 +876,31 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
             height=280,
         )
 
-        if st.sidebar.button("Clear Trade History Log"):
+        # ==========================================
+        # 7. SIDEBAR UTILITIES & EXPORT CONTROLS
+        # ==========================================
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 🛠️ Data Management")
+
+        if st.sidebar.button("🗑️ Clear Trade History"):
             st.session_state.trade_history_log = []
             if os.path.exists(CSV_FILE):
-                os.remove(CSV_FILE)
+                try:
+                    os.remove(CSV_FILE)
+                except Exception:
+                    pass
+            st.sidebar.success("History cleared successfully!")
             st.rerun()
-    else:
-        st.info("No paper trade history recorded yet.")
+
+        csv_export_data = filtered_df.to_csv(index=False).encode("utf-8")
+        st.sidebar.download_button(
+            label="📥 Download Filtered History (CSV)",
+            data=csv_export_data,
+            file_name=f"quant_trade_history_{selected_symbol}.csv",
+            mime="text/csv",
+        )
 
 else:
     st.warning(
-        "⚠️ Data pipeline initializing or connection restricted. Please refresh."
+        "⚠️ Insufficient market data or order book depth retrieved from Binance API. Retrying..."
     )
