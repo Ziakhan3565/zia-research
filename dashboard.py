@@ -378,7 +378,6 @@ COINS_LIST = [
 ]
 
 TIMEFRAME_MAP = {
-    "1m (Scalping)": ("1m", 1),
     "15m (Medium TF)": ("15m", 15),
     "30m (Medium TF)": ("30m", 30),
     "1h (Intraday)": ("1h", 60),
@@ -388,7 +387,7 @@ TIMEFRAME_MAP = {
 st.sidebar.markdown("### ⚡ Terminal Controls")
 selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
 selected_tf_label = st.sidebar.selectbox(
-    "Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1
+    "Select Timeframe", list(TIMEFRAME_MAP.keys()), index=0
 )
 forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
 
@@ -442,16 +441,12 @@ api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 @st.cache_data(ttl=15)
 def fetch_klines_data(symbol, tf_key, limit=100):
     binance_tf = (
-        "1m"
-        if "1m" in tf_key
+        "15m"
+        if "15m" in tf_key
         else (
-            "15m"
-            if "15m" in tf_key
-            else (
-                "30m"
-                if "30m" in tf_key
-                else ("1h" if "1h" in tf_key else "4h")
-            )
+            "30m"
+            if "30m" in tf_key
+            else ("1h" if "1h" in tf_key else "4h")
         )
     )
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
@@ -760,7 +755,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
 
     save_persistent_history(st.session_state.trade_history_log)
 
-    # Total Winning & Losing Trades Calculation
+    # Total Winning & Losing Trades Calculation (No PnL text attached)
     total_wins = len(
         [
             t
@@ -975,59 +970,90 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
     st.markdown("---")
     st.subheader("📊 Active & Closed Trades Cards Dashboard")
 
+    # Tabs for Scalping vs Intraday separation
+    tab_scalping, tab_intraday = st.tabs(
+        ["⚡ Scalping (15m / 30m)", "📊 Intraday (1h / 4h)"]
+    )
+
     if st.session_state.trade_history_log:
-        for t in st.session_state.trade_history_log:
-            t_dir = t.get("direction", "LONG")
-            t_sym = t.get("symbol", "BTCUSDT").replace("USDT", "/USDT")
-            t_entry = t.get("entry_price", 0.0)
-            t_sl = t.get("stop_loss", 0.0)
-            t_tp1 = t.get("tp1", 0.0)
-            t_tp2 = t.get("tp2", 0.0)
-            t_conf = t.get("confidence", 90)
-            t_pnl = t.get("pnl_percent", 0.0)
-            t_status = t.get("status", "Open")
-            t_exit = t.get("exit_price", t_entry)
-            t_time = t.get("timestamp", "")
-            t_tf = t.get("timeframe", "15m")
+        scalping_trades = [
+            t
+            for t in st.session_state.trade_history_log
+            if any(tf in t.get("timeframe", "") for tf in ["15m", "30m"])
+        ]
+        intraday_trades = [
+            t
+            for t in st.session_state.trade_history_log
+            if any(tf in t.get("timeframe", "") for tf in ["1h", "4h"])
+        ]
 
-            c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
-            run_status_bg = (
-                "rgba(0, 230, 118, 0.1)"
-                if t_status == "Open"
-                else "rgba(139, 148, 158, 0.1)"
-            )
-            run_status_fg = "#00e676" if t_status == "Open" else "#8b949e"
-            run_status_text = (
-                "🟢 RUNNING"
-                if t_status == "Open"
-                else f"🔴 {t.get('outcome','CLOSED')}"
-            )
+        def render_trade_cards(trades_subset):
+            if not trades_subset:
+                st.info("No trades found for this category.")
+                return
+            for t in trades_subset:
+                t_dir = t.get("direction", "LONG")
+                t_sym = t.get("symbol", "BTCUSDT").replace("USDT", "/USDT")
+                t_entry = t.get("entry_price", 0.0)
+                t_sl = t.get("stop_loss", 0.0)
+                t_tp1 = t.get("tp1", 0.0)
+                t_tp2 = t.get("tp2", 0.0)
+                t_conf = t.get("confidence", 90)
+                t_pnl = t.get("pnl_percent", 0.0)
+                t_status = t.get("status", "Open")
+                t_exit = t.get("exit_price", t_entry)
+                t_time = t.get("timestamp", "")
+                t_tf = t.get("timeframe", "15m")
 
-            pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
-            pnl_sign = "+" if t_pnl >= 0 else ""
+                c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
+                run_status_bg = (
+                    "rgba(0, 230, 118, 0.1)"
+                    if t_status == "Open"
+                    else "rgba(139, 148, 158, 0.1)"
+                )
+                run_status_fg = "#00e676" if t_status == "Open" else "#8b949e"
+                run_status_text = (
+                    "🟢 RUNNING"
+                    if t_status == "Open"
+                    else f"🔴 {t.get('outcome','CLOSED')}"
+                )
 
-            card_html = (
-                '<div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">'
-                f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">'
-                f'<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">'
-                f'<span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>'
-                f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>'
-                f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
-                f"</div>"
-                f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
-                f"</div>"
-                f'<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; background: #0d1117; padding: 10px; border-radius: 8px;">'
-                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div><div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div></div>'
-                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit</div><div style="font-size: 14px; font-weight: 700; color: {c_color};">${t_exit:,.2f}</div></div>'
-                f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div><div style="font-size: 14px; font-weight: 700; color: #38bdf8;">$2.00</div></div>'
-                f"</div>"
-                f'<div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; text-align: center;">'
-                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">SL</div><div style="font-size: 11px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div></div>'
-                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP1</div><div style="font-size: 11px; font-weight: 700; color: #00e676;">${t_tp1:,.2f}</div></div>'
-                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP2</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div></div>'
-                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">CONF</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">{t_conf}%</div></div>'
-                f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">P&L</div><div style="font-size: 11px; font-weight: 700; color: {pnl_color};">{pnl_sign}{t_pnl:.2f}%</div></div>'
-                f"</div>"
-                f"</div>"
-            )
-            st.markdown(card_html, unsafe_allow_html=True)
+                pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
+                pnl_sign = "+" if t_pnl >= 0 else ""
+
+                card_html = (
+                    '<div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">'
+                    f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">'
+                    f'<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">'
+                    f'<span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>'
+                    f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">🪙 {t_sym}</span>'
+                    f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
+                    f"</div>"
+                    f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
+                    f"</div>"
+                    f'<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; background: #0d1117; padding: 10px; border-radius: 8px;">'
+                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div><div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div></div>'
+                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit</div><div style="font-size: 14px; font-weight: 700; color: {c_color};">${t_exit:,.2f}</div></div>'
+                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div><div style="font-size: 14px; font-weight: 700; color: #38bdf8;">$2.00</div></div>'
+                    f"</div>"
+                    f'<div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; text-align: center;">'
+                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">SL</div><div style="font-size: 11px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div></div>'
+                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP1</div><div style="font-size: 11px; font-weight: 700; color: #00e676;">${t_tp1:,.2f}</div></div>'
+                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP2</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div></div>'
+                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">CONF</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">{t_conf}%</div></div>'
+                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">P&L</div><div style="font-size: 11px; font-weight: 700; color: {pnl_color};">{pnl_sign}{t_pnl:.2f}%</div></div>'
+                    f"</div>"
+                    f"</div>"
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
+
+        with tab_scalping:
+            render_trade_cards(scalping_trades)
+
+        with tab_intraday:
+            render_trade_cards(intraday_trades)
+    else:
+        with tab_scalping:
+            st.info("No trade history available yet.")
+        with tab_intraday:
+            st.info("No trade history available yet.")
