@@ -1,9 +1,12 @@
-import pandas as pd
+import time
+import datetime
+import os
 import numpy as np
+import pandas as pd
 import joblib
 
 def run_filtered_trend_backtest():
-    print("🧪 Running Optimized Trend-Filtered Microstructure Backtest...\n")
+    print("🧪 Running Optimized Trend-Filtered Microstructure Backtest with Fourier Features...\n")
     
     try:
         df = pd.read_csv("market_data_log.csv")
@@ -12,7 +15,7 @@ def run_filtered_trend_backtest():
         print(f"❌ Error loading files: {e}")
         return
 
-    # --- 1. Feature Engineering ---
+    # --- 1. Feature Engineering & Fourier Trend Integration ---
     df['bid_ask_ratio'] = df['top20_bid_sum'] / (df['top20_ask_sum'] + 1e-5)
     df['total_depth'] = df['top20_bid_sum'] + df['top20_ask_sum']
     df['sma_20'] = df.groupby('symbol')['current_price'].transform(lambda x: x.rolling(20, min_periods=1).mean())
@@ -21,17 +24,34 @@ def run_filtered_trend_backtest():
     df['hawkes_intensity'] = df.groupby('symbol')['obi_top20'].transform(lambda x: x.rolling(5, min_periods=1).mean().abs())
     df['book_pressure'] = df['obi_top20'] * df['total_depth']
 
+    # Fourier Trend Feature Calculation for Backtest DataFrame per symbol
+    def compute_fourier_trend(sub_df):
+        prices = sub_df['current_price'].values
+        if len(prices) < 15:
+            return pd.Series(0.0, index=sub_df.index)
+        xc = prices - np.mean(prices)
+        fft_vals = np.fft.fft(xc)
+        num_keep = max(1, int(len(fft_vals) * 0.15))
+        fft_masked = np.zeros_like(fft_vals)
+        fft_masked[:num_keep] = fft_vals[:num_keep]
+        fft_masked[-num_keep:] = fft_vals[-num_keep:]
+        trend_curve = np.real(np.fft.ifft(fft_masked))
+        diffs = np.gradient(trend_curve)
+        return pd.Series(diffs, index=sub_df.index)
+
+    df['FOURIER_TREND'] = df.groupby('symbol').apply(compute_fourier_trend).reset_index(level=0, drop=True)
+
+    # Base features pool including Fourier Trend
     features = [
         'top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 
         'bid_ask_ratio', 'total_depth', 'trend_signal', 
-        'volatility_proxy', 'hawkes_intensity', 'book_pressure'
+        'volatility_proxy', 'hawkes_intensity', 'book_pressure', 'FOURIER_TREND'
     ]
     
+    # Automatically adjust feature list based on what the loaded model expects
     if hasattr(model, "n_features_in_"):
         expected_n = model.n_features_in_
-        if expected_n == 7:
-            features = ['top20_bid_sum', 'top20_ask_sum', 'obi_top20', 'spread', 'bid_ask_ratio', 'total_depth', 'trend_signal']
-        elif expected_n <= len(features):
+        if expected_n <= len(features):
             features = features[:expected_n]
 
     df = df.dropna(subset=features + ['current_price', 'symbol']).copy()
@@ -57,8 +77,8 @@ def run_filtered_trend_backtest():
     trade_amount = 10.0      
     fee_rate = 0.0004        
     
-    tp_pct = 0.0060          # 0.60% Take Profit
-    sl_pct = 0.0040          # 0.40% Stop Loss
+    tp_pct = 0.0060           # 0.60% Take Profit
+    sl_pct = 0.0040           # 0.40% Stop Loss
 
     wins = 0
     losses = 0
@@ -66,9 +86,6 @@ def run_filtered_trend_backtest():
 
     # --- 2. Active Trade Lock / Cooldown to Prevent Duplicate Listing ---
     last_trade_index = {}
-    cooldown_periods = 6  # Har symbol ke liye kam az kam 6 rows ka gap taake baar baar trade na khule
-
-    trade_history = []
 
     for idx, row in df_filtered.iterrows():
         symbol = row['symbol']
@@ -110,7 +127,7 @@ def run_filtered_trend_backtest():
 
         # Strict Candle-by-Candle Evaluation for precise SL/TP execution
         for _, fut_row in future_window.iterrows():
-            high_p = fut_row.get('current_price', entry) # Fallback if high/low missing, using price action
+            high_p = fut_row.get('current_price', entry) 
             low_p = fut_row.get('current_price', entry)
             
             if signal == 1: # LONG
@@ -148,7 +165,7 @@ def run_filtered_trend_backtest():
     total_return_pct = ((current_balance - initial_balance) / initial_balance) * 100
 
     print("=" * 40)
-    print("📊 OPTIMIZED P&L REPORT (DEDUPLICATED & FIXED TP/SL)")
+    print("📊 OPTIMIZED P&L REPORT (FOURIER + OBI INTEGRATED)")
     print("=" * 40)
     print(f" Starting Capital     : ${initial_balance:.2f}")
     print(f" Total Executed Trades: {total_trades}")
