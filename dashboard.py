@@ -68,13 +68,16 @@ def save_persistent_history(history_list):
 if "trade_history_log" not in st.session_state:
     st.session_state.trade_history_log = load_persistent_history()
 
-
 # ==========================================
 # XGBOOST AUTO-TRAINING & LOADING SYSTEM
 # ==========================================
 def train_xgboost_model_automatically(history_list):
-    closed_trades = [t for t in history_list if t["outcome"] in ["WIN", "LOSS"]]
-    if len(closed_trades) < 20:
+    # 'WIN' ya 'LOSS' walay closed trades nikalna
+    closed_trades = [t for t in history_list if t.get("outcome") in ["WIN", "LOSS"]]
+    closed_count = len(closed_trades)
+    
+    # Agar total closed trades 20 se kam hain toh train mat karo
+    if closed_count < 20:
         return False
 
     try:
@@ -351,6 +354,24 @@ paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
 
 api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
+# ==========================================
+# AUTO-TRAINING CHECK (HAR 20 TRADES KE BAAD)
+# ==========================================
+closed_trades_list = [t for t in st.session_state.get('trade_history_log', []) if t.get('outcome') in ["WIN", "LOSS"]]
+closed_count = len(closed_trades_list)
+
+TRAIN_INTERVAL = 20
+if closed_count >= TRAIN_INTERVAL and closed_count % TRAIN_INTERVAL == 0:
+    milestone_key = f"trained_at_{closed_count}"
+    if milestone_key not in st.session_state:
+        # Yahan aap ke function se success aur msg return ho raha hai, toh isay manage karein:
+        success, msg = train_xgboost_model_automatically(st.session_state.trade_history_log)
+        if success:
+            st.session_state[milestone_key] = True
+            st.sidebar.success(f"🚀 Model retrained successfully at {closed_count} trades!")
+            st.cache_resource.clear()
+        else:
+            st.sidebar.error(f"Auto-training failed: {msg}")
 
 # ==========================================
 # 5. DATA FETCHING (SAFE API WITH FALLBACK)
