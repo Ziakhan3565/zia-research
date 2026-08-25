@@ -1030,7 +1030,7 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                 t_tf = t.get("timeframe", "15m")
                 t_outcome = t.get("outcome", "PENDING")
 
-                # Calculate holding time and countdown together
+                # Format as **Hold:** time / Left: time
                 max_duration_mins = (
                     30 if any(tf in t_tf for tf in ["15m", "30m"]) else 480
                 )
@@ -1044,20 +1044,18 @@ if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
                             datetime.datetime.now() - t_dt
                         ).total_seconds()
                         
-                        # Holding time so far (Elapsed)
                         hold_m = int(elapsed_seconds // 60)
                         hold_s = int(elapsed_seconds % 60)
-                        hold_str = f"Held: {hold_m}m {hold_s}s"
+                        hold_str = f"{hold_m}m {hold_s}s"
 
-                        # Remaining countdown timer
                         total_allowed_seconds = max_duration_mins * 60
                         rem_sec = total_allowed_seconds - elapsed_seconds
                         if rem_sec > 0:
                             rem_m = int(rem_sec // 60)
                             rem_s = int(rem_sec % 60)
-                            time_display_str = f"⏳ {hold_str} | Left: {rem_m}m {rem_s}s"
+                            time_display_str = f"⏳ <b>Hold:</b> {hold_str} / Left: {rem_m}m {rem_s}s"
                         else:
-                            time_display_str = f"⏳ {hold_str} | ⌛ Expiring..."
+                            time_display_str = f"⏳ <b>Hold:</b> {hold_str} / ⌛ Expiring..."
                     except Exception:
                         time_display_str = "Active"
                 else:
