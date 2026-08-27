@@ -26,16 +26,21 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
+
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
+    precision_score,
+    recall_score,
+    f1_score,
 )
+
 from xgboost import XGBClassifier
 
 
@@ -51,11 +56,22 @@ METADATA_FILE = "ml_model_metadata.json"
 
 MIN_ROWS = 150
 
+# Number of collected observations into the future.
 FUTURE_STEPS = 5
+
+# Minimum meaningful future move.
+#
+# 0.0005 = 0.05%
+#
+# This avoids treating extremely tiny price movements
+# as meaningful UP signals.
+MIN_FUTURE_RETURN = 0.0005
 
 TEST_SIZE = 0.20
 
 RANDOM_STATE = 42
+
+MODEL_VERSION = "ZIA_XGBOOST_DIRECTION_V2"
 
 
 # ============================================================
@@ -63,41 +79,63 @@ RANDOM_STATE = 42
 # ============================================================
 #
 # IMPORTANT:
-# Research Lab / prediction side should use THIS EXACT order.
+#
+# Research Lab / prediction side MUST use this exact order.
 #
 # Do not manually reorder these features elsewhere.
 # ============================================================
 
 FEATURES: List[str] = [
+
+    # --------------------------------------------------------
     # Order book
+    # --------------------------------------------------------
+
     "top20_bid_sum",
     "top20_ask_sum",
+
     "obi_5",
     "obi_10",
     "obi_20",
     "obi_50",
 
+    # --------------------------------------------------------
     # Market microstructure
+    # --------------------------------------------------------
+
     "spread",
     "spread_pct",
+
     "bid_ask_ratio_20",
     "bid_ask_ratio_50",
+
     "top20_total_depth",
     "top50_total_depth",
 
+    # --------------------------------------------------------
     # Taker flow
+    # --------------------------------------------------------
+
     "taker_buy_volume",
     "taker_sell_volume",
+
     "taker_flow",
     "taker_flow_ratio",
 
+    # --------------------------------------------------------
     # Price / trend
+    # --------------------------------------------------------
+
     "price_return",
     "price_change",
+
     "sma_distance",
     "realized_volatility",
 
+    # --------------------------------------------------------
     # Research features
+    # --------------------------------------------------------
+
     "BOOK_IMB",
     "QUANT_IMPLY",
     "ADAPT_CONF",
@@ -111,17 +149,29 @@ FEATURES: List[str] = [
 # ============================================================
 
 MODEL_PARAMS = {
+
     "n_estimators": 250,
+
     "learning_rate": 0.03,
+
     "max_depth": 4,
+
     "min_child_weight": 2,
+
     "subsample": 0.90,
+
     "colsample_bytree": 0.90,
+
     "reg_alpha": 0.05,
+
     "reg_lambda": 1.50,
+
     "objective": "binary:logistic",
+
     "eval_metric": "logloss",
+
     "random_state": RANDOM_STATE,
+
     "n_jobs": -1,
 }
 
@@ -154,7 +204,9 @@ def load_market_data(
     Load market_data_log.csv.
     """
 
-    if not os.path.exists(file_path):
+    if not os.path.exists(
+        file_path
+    ):
 
         print(
             f"❌ Market data file not found: {file_path}"
@@ -210,6 +262,23 @@ def ensure_base_columns(
     """
 
     df = df.copy()
+
+    # --------------------------------------------------------
+    # Required identifiers
+    # --------------------------------------------------------
+
+    if "symbol" not in df.columns:
+
+        raise ValueError(
+            "market_data_log.csv must contain 'symbol'."
+        )
+
+    if "current_price" not in df.columns:
+
+        raise ValueError(
+            "market_data_log.csv must contain "
+            "'current_price'."
+        )
 
     # --------------------------------------------------------
     # Old OBI compatibility
@@ -278,23 +347,6 @@ def ensure_base_columns(
 
             df[column] = default
 
-    # --------------------------------------------------------
-    # Required identifiers
-    # --------------------------------------------------------
-
-    if "symbol" not in df.columns:
-
-        raise ValueError(
-            "market_data_log.csv must contain 'symbol'."
-        )
-
-    if "current_price" not in df.columns:
-
-        raise ValueError(
-            "market_data_log.csv must contain "
-            "'current_price'."
-        )
-
     return df
 
 
@@ -323,8 +375,37 @@ def prepare_order(
 
         df["_timestamp"] = pd.NaT
 
+    # --------------------------------------------------------
+    # Numeric price
+    # --------------------------------------------------------
+
+    df["current_price"] = safe_numeric(
+        df["current_price"]
+    )
+
+    # --------------------------------------------------------
+    # Remove invalid prices
+    # --------------------------------------------------------
+
+    df = df[
+        df["current_price"].notna()
+    ].copy()
+
+    df = df[
+        np.isfinite(
+            df["current_price"]
+        )
+    ].copy()
+
+    # --------------------------------------------------------
+    # Chronological order
+    # --------------------------------------------------------
+
     df = df.sort_values(
-        ["symbol", "_timestamp"],
+        [
+            "symbol",
+            "_timestamp",
+        ],
         kind="mergesort",
     ).reset_index(
         drop=True
@@ -379,7 +460,7 @@ def add_price_features(
     )
 
     # --------------------------------------------------------
-    # SMA
+    # SMA 20
     # --------------------------------------------------------
 
     df["sma_20"] = (
@@ -396,7 +477,7 @@ def add_price_features(
     )
 
     # --------------------------------------------------------
-    # Price distance from SMA
+    # Distance from SMA
     # --------------------------------------------------------
 
     df["sma_distance"] = (
@@ -404,7 +485,8 @@ def add_price_features(
             df["current_price"]
             - df["sma_20"]
         )
-        / (
+        /
+        (
             df["sma_20"]
             + 1e-12
         )
@@ -444,37 +526,47 @@ def add_microstructure_features(
 
     df = df.copy()
 
-    # --------------------------------------------------------
-    # Numeric conversion
-    # --------------------------------------------------------
-
     numeric_columns = [
+
         "top20_bid_sum",
         "top20_ask_sum",
+
         "obi_5",
         "obi_10",
         "obi_20",
         "obi_50",
+
         "spread",
         "spread_pct",
+
         "bid_ask_ratio_20",
         "bid_ask_ratio_50",
+
         "top20_total_depth",
         "top50_total_depth",
+
         "taker_buy_volume",
         "taker_sell_volume",
+
         "taker_flow",
         "taker_flow_ratio",
     ]
 
     for column in numeric_columns:
 
-        df[column] = safe_numeric(
-            df[column]
-        ).fillna(0.0)
+        df[column] = (
+            safe_numeric(
+                df[column]
+            )
+            .replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            .fillna(0.0)
+        )
 
     # --------------------------------------------------------
-    # BOOK_IMB
+    # BOOK IMBALANCE
     # --------------------------------------------------------
 
     df["BOOK_IMB"] = (
@@ -490,12 +582,24 @@ def add_microstructure_features(
         )
     )
 
+    df["BOOK_IMB"] = np.clip(
+        df["BOOK_IMB"],
+        -1.0,
+        1.0,
+    )
+
     # --------------------------------------------------------
-    # QUANT_IMPLY
+    # QUANT IMPLIED
     # --------------------------------------------------------
 
     df["QUANT_IMPLY"] = np.clip(
-        df["BOOK_IMB"] * 1.5,
+        (
+            df["BOOK_IMB"] * 1.0
+        )
+        +
+        (
+            df["obi_20"] * 0.5
+        ),
         -1.0,
         1.0,
     )
@@ -552,16 +656,13 @@ def add_microstructure_features(
     # --------------------------------------------------------
     # Bayesian
     # --------------------------------------------------------
-    #
-    # Prior is deliberately moderate.
-    # We do NOT hard-code a huge directional bias.
-    # --------------------------------------------------------
 
     prior = 0.50
 
     positive_likelihood = np.clip(
         0.50
-        + (
+        +
+        (
             df["BOOK_IMB"]
             * 0.40
         ),
@@ -587,7 +688,8 @@ def add_microstructure_features(
             negative_likelihood
             * (1.0 - prior)
         )
-        + 1e-12
+        +
+        1e-12
     )
 
     df["BAYESIAN"] = np.clip(
@@ -611,12 +713,17 @@ def calculate_fourier_series(
     prices: np.ndarray,
 ) -> np.ndarray:
     """
-    Calculate a causal-ish rolling Fourier trend.
-
-    Only the current rolling window is used.
+    Calculate Fourier trend from a rolling window.
     """
 
-    length = len(prices)
+    prices = np.asarray(
+        prices,
+        dtype=float,
+    )
+
+    length = len(
+        prices
+    )
 
     if length < 15:
 
@@ -625,16 +732,20 @@ def calculate_fourier_series(
             dtype=float,
         )
 
-    values = (
-        np.asarray(
+    if not np.isfinite(
+        prices
+    ).all():
+
+        prices = np.nan_to_num(
             prices,
-            dtype=float,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-    )
 
     centered = (
-        values
-        - np.mean(values)
+        prices
+        - np.mean(prices)
     )
 
     fft_values = np.fft.fft(
@@ -657,9 +768,11 @@ def calculate_fourier_series(
         fft_values[:keep]
     )
 
-    filtered[-keep:] = (
-        fft_values[-keep:]
-    )
+    if keep > 0:
+
+        filtered[-keep:] = (
+            fft_values[-keep:]
+        )
 
     curve = np.real(
         np.fft.ifft(
@@ -689,6 +802,8 @@ def add_fourier_feature(
         dtype=float,
     )
 
+    window = 30
+
     for symbol, group in df.groupby(
         "symbol",
         sort=False,
@@ -696,17 +811,18 @@ def add_fourier_feature(
 
         indexes = group.index
 
-        prices = group[
-            "current_price"
-        ].values.astype(float)
+        prices = (
+            group[
+                "current_price"
+            ]
+            .values
+            .astype(float)
+        )
 
         values = np.zeros(
             len(group),
             dtype=float,
         )
-
-        # Rolling Fourier window.
-        window = 30
 
         for i in range(
             len(prices)
@@ -729,7 +845,7 @@ def add_fourier_feature(
                     )
                 )
 
-                values[i] = (
+                values[i] = float(
                     fft_result[-1]
                 )
 
@@ -737,10 +853,17 @@ def add_fourier_feature(
 
                 values[i] = 0.0
 
-        result.loc[indexes] = values
+        result.loc[
+            indexes
+        ] = values
 
     df["FOURIER_TREND"] = (
         result
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        .fillna(0.0)
     )
 
     return df
@@ -757,17 +880,20 @@ def create_target(
     Future direction target.
 
     target = 1
-        future price > current price
+        future return >= MIN_FUTURE_RETURN
 
     target = 0
-        future price <= current price
+        future return < MIN_FUTURE_RETURN
 
-    IMPORTANT:
     Future price is used ONLY for target creation.
-    It is NOT included in features.
+    It is NEVER included in ML features.
     """
 
     df = df.copy()
+
+    # --------------------------------------------------------
+    # Future price
+    # --------------------------------------------------------
 
     df["future_price"] = (
         df.groupby("symbol")[
@@ -778,18 +904,114 @@ def create_target(
         )
     )
 
+    # --------------------------------------------------------
+    # Remove unavailable future rows
+    # --------------------------------------------------------
+
     df = df.dropna(
         subset=[
-            "future_price"
+            "future_price",
+            "current_price",
         ]
     ).copy()
 
+    # --------------------------------------------------------
+    # Future return
+    # --------------------------------------------------------
+
+    df["future_return"] = (
+        (
+            df["future_price"]
+            /
+            (
+                df["current_price"]
+                + 1e-12
+            )
+        )
+        - 1.0
+    )
+
+    df["future_return"] = (
+        df["future_return"]
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+    )
+
+    df = df.dropna(
+        subset=[
+            "future_return"
+        ]
+    ).copy()
+
+    # --------------------------------------------------------
+    # Binary target
+    # --------------------------------------------------------
+
     df["target"] = (
-        df["future_price"]
-        > df["current_price"]
+        df["future_return"]
+        >= MIN_FUTURE_RETURN
     ).astype(int)
 
     return df
+
+
+# ============================================================
+# DATA LEAKAGE CHECK
+# ============================================================
+
+def validate_no_target_leakage():
+
+    forbidden = {
+        "future_price",
+        "future_return",
+        "target",
+    }
+
+    leakage = (
+        forbidden
+        .intersection(
+            set(FEATURES)
+        )
+    )
+
+    if leakage:
+
+        raise RuntimeError(
+            "❌ DATA LEAKAGE DETECTED: "
+            + ", ".join(
+                sorted(leakage)
+            )
+        )
+
+
+# ============================================================
+# FEATURE VALIDATION
+# ============================================================
+
+def validate_feature_schema(
+    df: pd.DataFrame,
+):
+
+    missing = [
+        feature
+        for feature in FEATURES
+        if feature not in df.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            "Missing ML features:\n"
+            +
+            "\n".join(
+                f"  - {x}"
+                for x in missing
+            )
+        )
+
+    validate_no_target_leakage()
 
 
 # ============================================================
@@ -807,13 +1029,25 @@ def build_training_dataset(
         "\n🧠 Building ML research features..."
     )
 
+    # --------------------------------------------------------
+    # Base columns
+    # --------------------------------------------------------
+
     df = ensure_base_columns(
         df
     )
 
+    # --------------------------------------------------------
+    # Chronological order
+    # --------------------------------------------------------
+
     df = prepare_order(
         df
     )
+
+    # --------------------------------------------------------
+    # Features
+    # --------------------------------------------------------
 
     df = add_price_features(
         df
@@ -827,32 +1061,21 @@ def build_training_dataset(
         df
     )
 
+    # --------------------------------------------------------
+    # Target
+    # --------------------------------------------------------
+
     df = create_target(
         df
     )
 
     # --------------------------------------------------------
-    # Ensure all features exist
+    # Feature validation
     # --------------------------------------------------------
 
-    missing = [
-        feature
-        for feature in FEATURES
-        if feature not in df.columns
-    ]
-
-    if missing:
-
-        print(
-            "❌ Missing ML features:"
-        )
-
-        for feature in missing:
-            print(
-                f"   - {feature}"
-            )
-
-        return None
+    validate_feature_schema(
+        df
+    )
 
     # --------------------------------------------------------
     # Numeric cleanup
@@ -860,22 +1083,51 @@ def build_training_dataset(
 
     for feature in FEATURES:
 
-        df[feature] = safe_numeric(
-            df[feature]
+        df[feature] = (
+            safe_numeric(
+                df[feature]
+            )
+            .replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
         )
 
-    df = df.replace(
-        [np.inf, -np.inf],
-        np.nan,
+    # --------------------------------------------------------
+    # Target cleanup
+    # --------------------------------------------------------
+
+    df["target"] = (
+        pd.to_numeric(
+            df["target"],
+            errors="coerce",
+        )
     )
 
+    df["current_price"] = (
+        safe_numeric(
+            df["current_price"]
+        )
+    )
+
+    # --------------------------------------------------------
+    # Remove invalid rows
+    # --------------------------------------------------------
+
     df = df.dropna(
-        subset=FEATURES + [
-            "target",
-            "current_price",
-            "symbol",
-        ]
+        subset=(
+            FEATURES
+            + [
+                "target",
+                "current_price",
+                "symbol",
+            ]
+        )
     ).copy()
+
+    # --------------------------------------------------------
+    # Minimum dataset size
+    # --------------------------------------------------------
 
     if len(df) < MIN_ROWS:
 
@@ -887,31 +1139,85 @@ def build_training_dataset(
         return None
 
     # --------------------------------------------------------
-    # Feature clipping for stability
+    # Feature clipping
     # --------------------------------------------------------
 
-    for feature in [
+    bounded_features = [
+
         "obi_5",
         "obi_10",
         "obi_20",
         "obi_50",
+
         "BOOK_IMB",
         "QUANT_IMPLY",
+
         "ADAPT_CONF",
+
         "BAYESIAN",
-        "FOURIER_TREND",
+
         "taker_flow_ratio",
-    ]:
+    ]
+
+    for feature in bounded_features:
 
         if feature in df.columns:
 
-            if feature != "FOURIER_TREND":
+            df[feature] = np.clip(
+                df[feature],
+                -10.0,
+                10.0,
+            )
 
-                df[feature] = np.clip(
-                    df[feature],
-                    -10.0,
-                    10.0,
+    # --------------------------------------------------------
+    # Fourier extreme-value protection
+    # --------------------------------------------------------
+
+    if "FOURIER_TREND" in df.columns:
+
+        q_low = (
+            df["FOURIER_TREND"]
+            .quantile(0.01)
+        )
+
+        q_high = (
+            df["FOURIER_TREND"]
+            .quantile(0.99)
+        )
+
+        if np.isfinite(
+            q_low
+        ) and np.isfinite(
+            q_high
+        ):
+
+            df["FOURIER_TREND"] = (
+                df["FOURIER_TREND"]
+                .clip(
+                    q_low,
+                    q_high,
                 )
+            )
+
+    # --------------------------------------------------------
+    # Final finite-value check
+    # --------------------------------------------------------
+
+    feature_values = (
+        df[FEATURES]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    if not np.isfinite(
+        feature_values
+    ).all():
+
+        raise ValueError(
+            "❌ Non-finite values remain "
+            "inside ML features."
+        )
 
     return df
 
@@ -922,23 +1228,51 @@ def build_training_dataset(
 
 def chronological_split(
     df: pd.DataFrame,
-):
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+]:
     """
     Time-series split.
-
-    NO random train_test_split.
 
     Earlier data:
         TRAIN
 
     Later data:
         TEST
+
+    NO random split.
     """
 
-    df = df.sort_values(
-        ["_timestamp", "symbol"],
-        kind="mergesort",
-    ).reset_index(
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # Sort globally by timestamp.
+    #
+    # If timestamps are unavailable, preserve existing order.
+    # --------------------------------------------------------
+
+    if (
+        "_timestamp" in df.columns
+        and df["_timestamp"].notna().any()
+    ):
+
+        df = df.sort_values(
+            [
+                "_timestamp",
+                "symbol",
+            ],
+            kind="mergesort",
+        )
+
+    else:
+
+        df = df.sort_values(
+            ["symbol"],
+            kind="mergesort",
+        )
+
+    df = df.reset_index(
         drop=True
     )
 
@@ -976,14 +1310,80 @@ def chronological_split(
 def train_model(
     train_df: pd.DataFrame,
 ) -> XGBClassifier:
+    """
+    Train XGBoost using the exact feature schema.
+    """
 
-    X_train = train_df[
-        FEATURES
+    X_train = (
+        train_df[
+            FEATURES
+        ]
+        .copy()
+    )
+
+    y_train = (
+        train_df[
+            "target"
+        ]
+        .astype(int)
+    )
+
+    # --------------------------------------------------------
+    # Schema check
+    # --------------------------------------------------------
+
+    missing = [
+        feature
+        for feature in FEATURES
+        if feature not in X_train.columns
     ]
 
-    y_train = train_df[
-        "target"
-    ]
+    if missing:
+
+        raise ValueError(
+            "Missing training features: "
+            +
+            ", ".join(missing)
+        )
+
+    # --------------------------------------------------------
+    # NaN check
+    # --------------------------------------------------------
+
+    if X_train.isna().any().any():
+
+        raise ValueError(
+            "❌ NaN detected in training features."
+        )
+
+    # --------------------------------------------------------
+    # Inf check
+    # --------------------------------------------------------
+
+    if not np.isfinite(
+        X_train.to_numpy(
+            dtype=float
+        )
+    ).all():
+
+        raise ValueError(
+            "❌ Inf detected in training features."
+        )
+
+    # --------------------------------------------------------
+    # Target check
+    # --------------------------------------------------------
+
+    if y_train.nunique() < 2:
+
+        raise ValueError(
+            "❌ Training target contains "
+            "only one class."
+        )
+
+    # --------------------------------------------------------
+    # XGBoost
+    # --------------------------------------------------------
 
     model = XGBClassifier(
         **MODEL_PARAMS
@@ -1006,30 +1406,72 @@ def evaluate_model(
     model: XGBClassifier,
     test_df: pd.DataFrame,
 ) -> float:
+    """
+    Evaluate model on chronological holdout data.
+    """
 
-    X_test = test_df[
-        FEATURES
-    ]
+    X_test = (
+        test_df[
+            FEATURES
+        ]
+        .copy()
+    )
 
-    y_test = test_df[
-        "target"
-    ]
+    y_test = (
+        test_df[
+            "target"
+        ]
+        .astype(int)
+    )
 
-    probabilities = model.predict_proba(
-        X_test
-    )[:, 1]
+    # --------------------------------------------------------
+    # Predictions
+    # --------------------------------------------------------
+
+    probabilities = (
+        model.predict_proba(
+            X_test
+        )[:, 1]
+    )
 
     predictions = (
         probabilities >= 0.50
     ).astype(int)
+
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
 
     accuracy = accuracy_score(
         y_test,
         predictions,
     )
 
+    precision = precision_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+
+    recall = recall_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+
+    f1 = f1_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+
+    # --------------------------------------------------------
+    # Display
+    # --------------------------------------------------------
+
     print(
-        "\n============================================================"
+        "\n"
+        "============================================================"
     )
 
     print(
@@ -1046,6 +1488,18 @@ def evaluate_model(
 
     print(
         f"Accuracy  : {accuracy * 100:.2f}%"
+    )
+
+    print(
+        f"Precision : {precision * 100:.2f}%"
+    )
+
+    print(
+        f"Recall    : {recall * 100:.2f}%"
+    )
+
+    print(
+        f"F1 Score  : {f1 * 100:.2f}%"
     )
 
     print(
@@ -1105,10 +1559,11 @@ def print_feature_importance(
 
         rows.append(
             {
-                "feature": feature,
-                "importance": float(
-                    value
-                ),
+                "feature":
+                    feature,
+
+                "importance":
+                    float(value),
             }
         )
 
@@ -1118,9 +1573,17 @@ def print_feature_importance(
         reverse=True,
     )
 
-    for row in rows:
+    print(
+        "\nRanked features:"
+    )
+
+    for index, row in enumerate(
+        rows,
+        start=1,
+    ):
 
         print(
+            f"{index:02d}. "
             f"{row['feature']:25} "
             f"{row['importance']:.6f}"
         )
@@ -1156,6 +1619,9 @@ def save_model(
 
     metadata = {
 
+        "model_version":
+            MODEL_VERSION,
+
         "model_file":
             MODEL_FILE,
 
@@ -1166,10 +1632,13 @@ def save_model(
             "BINANCE_USDM_FUTURES",
 
         "target":
-            "future_price_5_steps_up",
+            "future_return_threshold",
 
         "future_steps":
             FUTURE_STEPS,
+
+        "minimum_future_return":
+            MIN_FUTURE_RETURN,
 
         "features":
             FEATURES,
@@ -1177,18 +1646,20 @@ def save_model(
         "feature_count":
             len(FEATURES),
 
+        "feature_order_locked":
+            True,
+
         "accuracy":
-            accuracy,
+            float(accuracy),
 
         "train_rows":
-            train_rows,
+            int(train_rows),
 
         "test_rows":
-            test_rows,
+            int(test_rows),
 
         "model_params":
             MODEL_PARAMS,
-
     }
 
     with open(
@@ -1206,6 +1677,65 @@ def save_model(
     print(
         f"🧾 Metadata saved: {METADATA_FILE}"
     )
+
+
+# ============================================================
+# MODEL COMPATIBILITY CHECK
+# ============================================================
+
+def validate_saved_model_schema(
+    model: XGBClassifier,
+):
+
+    # --------------------------------------------------------
+    # XGBoost feature count
+    # --------------------------------------------------------
+
+    expected_count = len(
+        FEATURES
+    )
+
+    actual_count = getattr(
+        model,
+        "n_features_in_",
+        None,
+    )
+
+    if (
+        actual_count is not None
+        and actual_count
+        != expected_count
+    ):
+
+        raise RuntimeError(
+            "❌ MODEL FEATURE COUNT MISMATCH\n"
+            f"Expected: {expected_count}\n"
+            f"Actual: {actual_count}"
+        )
+
+    # --------------------------------------------------------
+    # Feature names if available
+    # --------------------------------------------------------
+
+    model_features = getattr(
+        model,
+        "feature_names_in_",
+        None,
+    )
+
+    if model_features is not None:
+
+        model_features = list(
+            model_features
+        )
+
+        if model_features != FEATURES:
+
+            raise RuntimeError(
+                "❌ MODEL FEATURE ORDER MISMATCH\n\n"
+                f"Expected:\n{FEATURES}\n\n"
+                f"Model has:\n{model_features}"
+            )
 
 
 # ============================================================
@@ -1232,7 +1762,13 @@ def train_trend_aligned_model():
     )
 
     print(
-        f"Target horizon: {FUTURE_STEPS} collected steps"
+        f"Target horizon: "
+        f"{FUTURE_STEPS} collected steps"
+    )
+
+    print(
+        f"Minimum future move: "
+        f"{MIN_FUTURE_RETURN * 100:.3f}%"
     )
 
     print(
@@ -1240,8 +1776,18 @@ def train_trend_aligned_model():
     )
 
     print(
+        f"Model version: {MODEL_VERSION}"
+    )
+
+    print(
         "============================================================"
     )
+
+    # --------------------------------------------------------
+    # Validate schema before training
+    # --------------------------------------------------------
+
+    validate_no_target_leakage()
 
     # --------------------------------------------------------
     # Load
@@ -1250,17 +1796,29 @@ def train_trend_aligned_model():
     df = load_market_data()
 
     if df is None:
+
         return False
 
     # --------------------------------------------------------
     # Build dataset
     # --------------------------------------------------------
 
-    dataset = build_training_dataset(
-        df
-    )
+    try:
+
+        dataset = build_training_dataset(
+            df
+        )
+
+    except Exception as e:
+
+        print(
+            f"\n❌ Feature engineering failed: {e}"
+        )
+
+        return False
 
     if dataset is None:
+
         return False
 
     print(
@@ -1273,7 +1831,9 @@ def train_trend_aligned_model():
     # --------------------------------------------------------
 
     target_counts = (
-        dataset["target"]
+        dataset[
+            "target"
+        ]
         .value_counts()
         .sort_index()
     )
@@ -1282,7 +1842,9 @@ def train_trend_aligned_model():
         "\n🎯 Target distribution:"
     )
 
-    for target, count in target_counts.items():
+    for target, count in (
+        target_counts.items()
+    ):
 
         percentage = (
             count
@@ -1306,7 +1868,13 @@ def train_trend_aligned_model():
     # Need both classes
     # --------------------------------------------------------
 
-    if dataset["target"].nunique() < 2:
+    if (
+        dataset[
+            "target"
+        ]
+        .nunique()
+        < 2
+    ):
 
         print(
             "❌ Training requires both target classes."
@@ -1325,29 +1893,49 @@ def train_trend_aligned_model():
     )
 
     print(
-        f"\n📚 Train rows: {len(train_df):,}"
+        f"\n📚 Train rows: "
+        f"{len(train_df):,}"
     )
 
     print(
-        f"🧪 Test rows : {len(test_df):,}"
+        f"🧪 Test rows : "
+        f"{len(test_df):,}"
     )
 
     # --------------------------------------------------------
-    # Verify both classes
+    # Verify train classes
     # --------------------------------------------------------
 
-    if train_df["target"].nunique() < 2:
+    if (
+        train_df[
+            "target"
+        ]
+        .nunique()
+        < 2
+    ):
 
         print(
-            "❌ Training set contains only one class."
+            "❌ Training set contains "
+            "only one class."
         )
 
         return False
 
-    if test_df["target"].nunique() < 2:
+    # --------------------------------------------------------
+    # Test class warning
+    # --------------------------------------------------------
+
+    if (
+        test_df[
+            "target"
+        ]
+        .nunique()
+        < 2
+    ):
 
         print(
-            "⚠️ Test set contains only one class."
+            "⚠️ Test set contains only "
+            "one class."
         )
 
     # --------------------------------------------------------
@@ -1358,22 +1946,60 @@ def train_trend_aligned_model():
         "\n🤖 Training XGBoost..."
     )
 
-    model = train_model(
-        train_df
-    )
+    try:
+
+        model = train_model(
+            train_df
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ XGBoost training failed: {e}"
+        )
+
+        return False
 
     print(
         "✅ XGBoost training complete."
     )
 
     # --------------------------------------------------------
+    # Validate model schema
+    # --------------------------------------------------------
+
+    try:
+
+        validate_saved_model_schema(
+            model
+        )
+
+    except Exception as e:
+
+        print(
+            str(e)
+        )
+
+        return False
+
+    # --------------------------------------------------------
     # Evaluate
     # --------------------------------------------------------
 
-    accuracy = evaluate_model(
-        model,
-        test_df,
-    )
+    try:
+
+        accuracy = evaluate_model(
+            model,
+            test_df,
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Model evaluation failed: {e}"
+        )
+
+        return False
 
     # --------------------------------------------------------
     # Feature importance
@@ -1395,7 +2021,8 @@ def train_trend_aligned_model():
     )
 
     print(
-        "\n============================================================"
+        "\n"
+        "============================================================"
     )
 
     print(
@@ -1403,7 +2030,8 @@ def train_trend_aligned_model():
     )
 
     print(
-        f"🎯 Holdout Accuracy: {accuracy * 100:.2f}%"
+        f"🎯 Holdout Accuracy: "
+        f"{accuracy * 100:.2f}%"
     )
 
     print(
@@ -1422,7 +2050,7 @@ def train_trend_aligned_model():
 
 
 # ============================================================
-# MODEL PREDICTION HELPER
+# LOAD TRAINED MODEL
 # ============================================================
 
 def load_trained_model():
@@ -1436,10 +2064,20 @@ def load_trained_model():
             "Train the model first."
         )
 
-    return joblib.load(
+    model = joblib.load(
         MODEL_FILE
     )
 
+    validate_saved_model_schema(
+        model
+    )
+
+    return model
+
+
+# ============================================================
+# PREDICTION HELPER
+# ============================================================
 
 def predict_direction(
     feature_data: Dict[str, float],
@@ -1447,21 +2085,33 @@ def predict_direction(
     """
     Prediction helper for research_lab.py.
 
-    feature_data must contain the FEATURES listed above.
+    IMPORTANT:
+    Uses EXACTLY the same 25 features and
+    EXACTLY the same order used during training.
 
     Returns:
 
         direction:
             LONG / SHORT
 
-        probability:
-            0-1 probability of UP
+        probability_up:
+            0-1
+
+        probability_down:
+            0-1
 
         confidence:
             0-100
+
+        model_version:
+            current ML model version
     """
 
     model = load_trained_model()
+
+    # --------------------------------------------------------
+    # Build row using exact training order
+    # --------------------------------------------------------
 
     row = {}
 
@@ -1485,18 +2135,44 @@ def predict_direction(
 
             value = 0.0
 
+        if not np.isfinite(
+            value
+        ):
+
+            value = 0.0
+
         row[feature] = value
+
+    # --------------------------------------------------------
+    # DataFrame in EXACT feature order
+    # --------------------------------------------------------
 
     X = pd.DataFrame(
         [row],
         columns=FEATURES,
     )
 
-    probability_up = float(
+    # --------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------
+
+    probabilities = (
         model.predict_proba(
             X
-        )[0][1]
+        )[0]
     )
+
+    probability_down = float(
+        probabilities[0]
+    )
+
+    probability_up = float(
+        probabilities[1]
+    )
+
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
 
     if probability_up >= 0.50:
 
@@ -1512,9 +2188,37 @@ def predict_direction(
         direction = "SHORT"
 
         confidence = (
-            (1.0 - probability_up)
+            probability_down
             * 100.0
         )
+
+    # --------------------------------------------------------
+    # Safety
+    # --------------------------------------------------------
+
+    confidence = float(
+        np.clip(
+            confidence,
+            0.0,
+            100.0,
+        )
+    )
+
+    probability_up = float(
+        np.clip(
+            probability_up,
+            0.0,
+            1.0,
+        )
+    )
+
+    probability_down = float(
+        np.clip(
+            probability_down,
+            0.0,
+            1.0,
+        )
+    )
 
     return {
 
@@ -1524,13 +2228,19 @@ def predict_direction(
         "probability_up":
             probability_up,
 
+        "probability_down":
+            probability_down,
+
         "confidence":
             confidence,
+
+        "model_version":
+            MODEL_VERSION,
     }
 
 
 # ============================================================
-# TEST PREDICTION
+# TEST SAVED MODEL
 # ============================================================
 
 def test_saved_model():
@@ -1549,10 +2259,14 @@ def test_saved_model():
             f"❌ {e}"
         )
 
-        return
+        return False
 
     print(
         f"✅ Loaded {MODEL_FILE}"
+    )
+
+    print(
+        f"Model version: {MODEL_VERSION}"
     )
 
     print(
@@ -1560,7 +2274,7 @@ def test_saved_model():
     )
 
     print(
-        "Feature order:"
+        "\nFeature order:"
     )
 
     for index, feature in enumerate(
@@ -1572,9 +2286,59 @@ def test_saved_model():
             f"  {index:02d}. {feature}"
         )
 
+    # --------------------------------------------------------
+    # Test prediction with neutral values
+    # --------------------------------------------------------
+
+    neutral_features = {
+        feature: 0.0
+        for feature in FEATURES
+    }
+
+    try:
+
+        result = predict_direction(
+            neutral_features
+        )
+
+        print(
+            "\n🧪 Neutral prediction test:"
+        )
+
+        print(
+            f"   Direction       : "
+            f"{result['direction']}"
+        )
+
+        print(
+            f"   Probability UP  : "
+            f"{result['probability_up'] * 100:.2f}%"
+        )
+
+        print(
+            f"   Probability DOWN: "
+            f"{result['probability_down'] * 100:.2f}%"
+        )
+
+        print(
+            f"   Confidence      : "
+            f"{result['confidence']:.2f}%"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Prediction test failed: {e}"
+        )
+
+        return False
+
     print(
-        "\n✅ Model is ready for Research Lab prediction."
+        "\n✅ Model is ready for "
+        "Research Lab prediction."
     )
+
+    return True
 
 
 # ============================================================
@@ -1583,4 +2347,16 @@ def test_saved_model():
 
 if __name__ == "__main__":
 
-    train_trend_aligned_model()
+    success = (
+        train_trend_aligned_model()
+    )
+
+    if success:
+
+        test_saved_model()
+
+    else:
+
+        print(
+            "\n❌ ML training did not complete."
+        )
