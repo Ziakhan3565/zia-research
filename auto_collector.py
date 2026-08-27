@@ -1,5 +1,3 @@
-# auto_collector.py
-
 from __future__ import annotations
 
 import os
@@ -17,33 +15,35 @@ import requests
 # BINANCE USDⓈ-M FUTURES AUTO COLLECTOR
 # ============================================================
 #
-# DATA FLOW
+# MARKET DATA ENGINE
 #
-# Binance USDⓈ-M Futures
-#          ↓
-# auto_collector.py
-#          ↓
-# ┌─────────────────────────────┐
-# │ Futures Order Book           │
-# │ Futures Recent Trades        │
-# │ Futures OHLCV                │
-# └─────────────────────────────┘
-#          ↓
+# Binance Futures
+#      ↓
+# Order Book
+# Recent Trades
+# OHLCV
+#      ↓
+# Feature Engineering
+#      ↓
+# market_data_log.csv
+# futures_trades_log.csv
+# futures_ohlcv_log.csv
+#      ↓
 # research_lab.py
-#          ↓
-# OBI 5 / 10 / 20 / 50
-# Taker Flow
-# Fourier
-# Bayesian
-# Adaptive Trend
-# ML
-# TRI
-#          ↓
-# bot_engine.py
-#          ↓
-# FINAL SIGNAL
-#          ↓
-# dashboard.py
+#
+# TIMEFRAME DESIGN
+#
+# SCALPING
+#   Signal horizon : 30 minutes
+#   Max trade time : 15 minutes
+#
+# 1H
+#   Signal horizon : 1 hour
+#   Max trade time : 1.5 hours
+#
+# 4H
+#   Signal horizon : 4 hours
+#   Max trade time : 24 hours
 #
 # ============================================================
 
@@ -77,35 +77,58 @@ COINS_LIST = [
 
 
 # ============================================================
-# 2. BINANCE USDⓈ-M FUTURES CONFIG
+# 2. BINANCE CONFIG
 # ============================================================
 
 BASE_URL = "https://fapi.binance.com"
 
 ORDER_BOOK_LIMIT = 100
 
-REQUEST_TIMEOUT = 7
+REQUEST_TIMEOUT = 10
 
-SYMBOL_DELAY = 0.20
+SYMBOL_DELAY = 0.15
 
 CYCLE_DELAY = 5
 
 TRADES_LIMIT = 1000
 
-# OHLCV timeframes required by research engine
+# Keep historical candles available for research
+KLINE_LIMIT = 250
+
 KLINE_INTERVALS = [
     "5m",
     "15m",
+    "30m",
     "1h",
     "4h",
 ]
 
-# How many candles to request
-KLINE_LIMIT = 250
+
+# ============================================================
+# 3. TRADE HORIZONS
+# ============================================================
+
+TIMEFRAME_CONFIG = {
+    "SCALP": {
+        "signal_timeframe": "30m",
+        "max_trade_minutes": 15,
+        "evaluation_minutes": 15,
+    },
+    "1H": {
+        "signal_timeframe": "1h",
+        "max_trade_minutes": 90,
+        "evaluation_minutes": 90,
+    },
+    "4H": {
+        "signal_timeframe": "4h",
+        "max_trade_minutes": 1440,
+        "evaluation_minutes": 1440,
+    },
+}
 
 
 # ============================================================
-# 3. CSV FILES
+# 4. CSV FILES
 # ============================================================
 
 MARKET_DATA_FILE = "market_data_log.csv"
@@ -116,27 +139,32 @@ OHLCV_DATA_FILE = "futures_ohlcv_log.csv"
 
 
 # ============================================================
-# 4. HTTP SESSION
+# 5. HTTP SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update(
     {
-        "User-Agent": "Zia-Research-Futures-Collector/1.0"
+        "User-Agent": "Zia-Research-Futures-Collector/2.0"
     }
 )
 
 
 # ============================================================
-# 5. TIME HELPERS
+# 6. REQUEST RETRY SETTINGS
+# ============================================================
+
+MAX_RETRIES = 3
+
+RETRY_DELAY = 1.0
+
+
+# ============================================================
+# 7. TIME HELPERS
 # ============================================================
 
 def utc_now_string() -> str:
-    """
-    UTC timestamp for CSV logs.
-    """
-
     return dt.datetime.now(
         dt.timezone.utc
     ).strftime(
@@ -144,12 +172,15 @@ def utc_now_string() -> str:
     )
 
 
+def utc_now_iso() -> str:
+    return dt.datetime.now(
+        dt.timezone.utc
+    ).isoformat()
+
+
 def ms_to_datetime_string(
     milliseconds: int,
 ) -> str:
-    """
-    Binance milliseconds -> UTC string.
-    """
 
     try:
         value = dt.datetime.fromtimestamp(
@@ -166,7 +197,33 @@ def ms_to_datetime_string(
 
 
 # ============================================================
-# 6. SAFE BINANCE GET
+# 8. SAFE NUMBER
+# ============================================================
+
+def safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
+    try:
+
+        number = float(value)
+
+        if not np.isfinite(number):
+            return default
+
+        return number
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return default
+
+
+# ============================================================
+# 9. BINANCE GET
 # ============================================================
 
 def binance_get(
@@ -174,93 +231,151 @@ def binance_get(
     params: Optional[Dict[str, Any]] = None,
 ):
     """
-    Safe GET request to Binance USDⓈ-M Futures API.
+    Safe Binance Futures GET with retry logic.
     """
 
     url = f"{BASE_URL}{endpoint}"
 
-    try:
+    for attempt in range(1, MAX_RETRIES + 1):
 
-        response = session.get(
-            url,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
+        try:
 
-        # Explicit Binance error handling
-        if response.status_code != 200:
+            response = session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            # ------------------------------------------------
+            # Success
+            # ------------------------------------------------
+
+            if response.status_code == 200:
+
+                try:
+                    return response.json()
+
+                except ValueError:
+
+                    print(
+                        f"⚠️ Invalid JSON | {endpoint}"
+                    )
+
+                    return None
+
+            # ------------------------------------------------
+            # Rate limit
+            # ------------------------------------------------
+
+            if response.status_code in (
+                418,
+                429,
+            ):
+
+                retry_after = response.headers.get(
+                    "Retry-After"
+                )
+
+                try:
+                    wait_time = float(
+                        retry_after
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    wait_time = RETRY_DELAY * attempt
+
+                print(
+                    f"⚠️ Binance rate limit | "
+                    f"waiting {wait_time:.1f}s"
+                )
+
+                time.sleep(
+                    wait_time
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Server errors
+            # ------------------------------------------------
+
+            if response.status_code >= 500:
+
+                print(
+                    f"⚠️ Binance server error "
+                    f"{response.status_code} | "
+                    f"attempt {attempt}/{MAX_RETRIES}"
+                )
+
+                time.sleep(
+                    RETRY_DELAY * attempt
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Other HTTP errors
+            # ------------------------------------------------
 
             print(
-                f"⚠️ Binance HTTP {response.status_code} "
-                f"| {endpoint}"
+                f"⚠️ Binance HTTP "
+                f"{response.status_code} | "
+                f"{endpoint}"
             )
 
             try:
-                print(
-                    f"   {response.json()}"
-                )
+                print(response.json())
             except Exception:
                 pass
 
             return None
 
-        return response.json()
+        except requests.exceptions.Timeout:
 
-    except requests.exceptions.Timeout:
+            print(
+                f"⚠️ Timeout | "
+                f"{endpoint} | "
+                f"attempt {attempt}/{MAX_RETRIES}"
+            )
 
-        print(
-            f"⚠️ Binance timeout | {endpoint}"
-        )
+        except requests.exceptions.ConnectionError:
 
-        return None
+            print(
+                f"⚠️ Connection error | "
+                f"attempt {attempt}/{MAX_RETRIES}"
+            )
 
-    except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException as error:
 
-        print(
-            f"⚠️ Binance connection error | {endpoint}"
-        )
+            print(
+                f"⚠️ Request error: {error}"
+            )
 
-        return None
+        except Exception as error:
 
-    except requests.exceptions.RequestException as e:
+            print(
+                f"⚠️ Unexpected Binance error: "
+                f"{error}"
+            )
 
-        print(
-            f"⚠️ Binance request error: {e}"
-        )
+        if attempt < MAX_RETRIES:
 
-        return None
+            time.sleep(
+                RETRY_DELAY * attempt
+            )
 
-    except ValueError:
-
-        print(
-            f"⚠️ Binance returned invalid JSON | {endpoint}"
-        )
-
-        return None
-
-    except Exception as e:
-
-        print(
-            f"⚠️ Unexpected Binance error: {e}"
-        )
-
-        return None
+    return None
 
 
 # ============================================================
-# 7. FUTURES PRICE
+# 10. FUTURES PRICE
 # ============================================================
 
 def fetch_futures_price(
     symbol: str,
 ) -> Optional[float]:
-    """
-    Binance USDⓈ-M Futures mark-independent
-    latest contract price.
-
-    Endpoint:
-        /fapi/v1/ticker/price
-    """
 
     data = binance_get(
         "/fapi/v1/ticker/price",
@@ -269,26 +384,17 @@ def fetch_futures_price(
         },
     )
 
-    if not data:
+    if not isinstance(data, dict):
         return None
 
-    try:
-
-        return float(
-            data["price"]
-        )
-
-    except (
-        KeyError,
-        TypeError,
-        ValueError,
-    ):
-
-        return None
+    return safe_float(
+        data.get("price"),
+        0.0,
+    ) or None
 
 
 # ============================================================
-# 8. FUTURES ORDER BOOK
+# 11. ORDER BOOK
 # ============================================================
 
 def fetch_futures_order_book(
@@ -298,20 +404,6 @@ def fetch_futures_order_book(
     Optional[np.ndarray],
     Optional[np.ndarray],
 ]:
-    """
-    Binance USDⓈ-M Futures order book.
-
-    Endpoint:
-        /fapi/v1/depth
-
-    Returns:
-
-        bids:
-            [[price, quantity], ...]
-
-        asks:
-            [[price, quantity], ...]
-    """
 
     data = binance_get(
         "/fapi/v1/depth",
@@ -321,7 +413,7 @@ def fetch_futures_order_book(
         },
     )
 
-    if not data:
+    if not isinstance(data, dict):
         return None, None
 
     try:
@@ -349,32 +441,32 @@ def fetch_futures_order_book(
             dtype=np.float64,
         )
 
-        if bids.ndim != 2:
+        if (
+            bids.ndim != 2
+            or asks.ndim != 2
+        ):
             return None, None
 
-        if asks.ndim != 2:
-            return None, None
-
-        if bids.shape[1] < 2:
-            return None, None
-
-        if asks.shape[1] < 2:
+        if (
+            bids.shape[1] < 2
+            or asks.shape[1] < 2
+        ):
             return None, None
 
         return bids, asks
 
-    except Exception as e:
+    except Exception as error:
 
         print(
             f"⚠️ Order book parsing error "
-            f"[{symbol}]: {e}"
+            f"[{symbol}]: {error}"
         )
 
         return None, None
 
 
 # ============================================================
-# 9. OBI
+# 12. OBI
 # ============================================================
 
 def calculate_obi(
@@ -382,27 +474,14 @@ def calculate_obi(
     asks: np.ndarray,
     levels: int,
 ) -> float:
-    """
-    OBI formula:
-
-        OBI =
-        (Bid Volume - Ask Volume)
-        /
-        (Bid Volume + Ask Volume)
-
-    Range approximately:
-        -1 → strong sell-side depth
-         0 → balanced
-        +1 → strong buy-side depth
-    """
 
     if bids is None or asks is None:
         return 0.0
 
-    if len(bids) < levels:
-        return 0.0
-
-    if len(asks) < levels:
+    if (
+        len(bids) < levels
+        or len(asks) < levels
+    ):
         return 0.0
 
     bid_volume = float(
@@ -426,12 +505,13 @@ def calculate_obi(
         return 0.0
 
     return (
-        bid_volume - ask_volume
+        bid_volume
+        - ask_volume
     ) / total
 
 
 # ============================================================
-# 10. DEPTH VOLUME
+# 13. DEPTH
 # ============================================================
 
 def calculate_depth(
@@ -439,18 +519,17 @@ def calculate_depth(
     asks: np.ndarray,
     levels: int,
 ) -> Tuple[float, float, float]:
-    """
-    Returns:
 
-        bid_volume
-        ask_volume
-        total_volume
-    """
-
-    if len(bids) < levels:
+    if (
+        bids is None
+        or asks is None
+    ):
         return 0.0, 0.0, 0.0
 
-    if len(asks) < levels:
+    if (
+        len(bids) < levels
+        or len(asks) < levels
+    ):
         return 0.0, 0.0, 0.0
 
     bid_volume = float(
@@ -465,7 +544,7 @@ def calculate_depth(
         )
     )
 
-    total_volume = (
+    total = (
         bid_volume
         + ask_volume
     )
@@ -473,12 +552,12 @@ def calculate_depth(
     return (
         bid_volume,
         ask_volume,
-        total_volume,
+        total,
     )
 
 
 # ============================================================
-# 11. BID / ASK RATIO
+# 14. BID ASK RATIO
 # ============================================================
 
 def calculate_bid_ask_ratio(
@@ -496,7 +575,7 @@ def calculate_bid_ask_ratio(
 
 
 # ============================================================
-# 12. SPREAD
+# 15. SPREAD
 # ============================================================
 
 def calculate_spread(
@@ -512,11 +591,11 @@ def calculate_spread(
     ):
         return 0.0, 0.0
 
-    best_bid = float(
+    best_bid = safe_float(
         bids[0, 0]
     )
 
-    best_ask = float(
+    best_ask = safe_float(
         asks[0, 0]
     )
 
@@ -548,31 +627,13 @@ def calculate_spread(
 
 
 # ============================================================
-# 13. FUTURES TRADES
+# 16. RECENT FUTURES TRADES
 # ============================================================
 
 def fetch_futures_trades(
     symbol: str,
     limit: int = TRADES_LIMIT,
 ) -> List[Dict[str, Any]]:
-    """
-    Binance USDⓈ-M Futures recent trades.
-
-    Endpoint:
-        /fapi/v1/aggTrades
-
-    Used by Research Lab for Taker Flow.
-
-    Binance field 'm':
-
-        True
-            buyer is market maker
-            → aggressive seller
-
-        False
-            buyer is taker
-            → aggressive buyer
-    """
 
     data = binance_get(
         "/fapi/v1/aggTrades",
@@ -589,37 +650,23 @@ def fetch_futures_trades(
 
 
 # ============================================================
-# 14. TAKER FLOW
+# 17. TAKER FLOW
 # ============================================================
 
 def calculate_taker_flow(
     trades: List[Dict[str, Any]],
 ) -> Dict[str, float]:
-    """
-    Calculate aggressive buy/sell flow.
-
-    BUY:
-        buyer is taker
-
-    SELL:
-        seller is taker
-
-    Flow:
-
-        buy_volume - sell_volume
-    """
 
     buy_volume = 0.0
-
     sell_volume = 0.0
 
     buy_notional = 0.0
-
     sell_notional = 0.0
 
     trade_count = 0
 
     if not trades:
+
         return {
             "taker_buy_volume": 0.0,
             "taker_sell_volume": 0.0,
@@ -642,17 +689,16 @@ def calculate_taker_flow(
                 trade["q"]
             )
 
-            is_buyer_maker = bool(
+            buyer_maker = bool(
                 trade["m"]
             )
 
             notional = (
-                price * quantity
+                price
+                * quantity
             )
 
-            # buyer is maker
-            # therefore seller is aggressive
-            if is_buyer_maker:
+            if buyer_maker:
 
                 sell_volume += quantity
 
@@ -707,51 +753,250 @@ def calculate_taker_flow(
 
 
 # ============================================================
-# 15. SAVE RAW TRADE SUMMARY
+# 18. TECHNICAL INDICATORS
 # ============================================================
 
-def save_trade_summary(
-    symbol: str,
-    flow: Dict[str, float],
-    file_path: str = TRADES_DATA_FILE,
-) -> bool:
+def calculate_ema(
+    series: pd.Series,
+    period: int,
+) -> pd.Series:
 
-    try:
-
-        row = {
-            "timestamp": utc_now_string(),
-            "symbol": symbol,
-            **flow,
-        }
-
-        df = pd.DataFrame(
-            [row]
+    return (
+        series
+        .ewm(
+            span=period,
+            adjust=False,
         )
+        .mean()
+    )
 
-        file_exists = os.path.isfile(
-            file_path
+
+def calculate_rsi(
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    rs = avg_gain / (
+        avg_loss + 1e-12
+    )
+
+    rsi = (
+        100
+        - (
+            100
+            / (1 + rs)
         )
+    )
 
-        df.to_csv(
-            file_path,
-            mode="a",
-            header=not file_exists,
-            index=False,
+    return rsi
+
+
+def calculate_atr(
+    df: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
+
+    high = df["high"]
+
+    low = df["low"]
+
+    close = df["close"]
+
+    previous_close = close.shift(1)
+
+    tr1 = (
+        high
+        - low
+    )
+
+    tr2 = (
+        high
+        - previous_close
+    ).abs()
+
+    tr3 = (
+        low
+        - previous_close
+    ).abs()
+
+    true_range = pd.concat(
+        [
+            tr1,
+            tr2,
+            tr3,
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return true_range.ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+
+def calculate_vwap(
+    df: pd.DataFrame,
+) -> pd.Series:
+
+    typical_price = (
+        df["high"]
+        + df["low"]
+        + df["close"]
+    ) / 3.0
+
+    cumulative_volume = (
+        df["volume"]
+        .cumsum()
+    )
+
+    cumulative_pv = (
+        typical_price
+        * df["volume"]
+    ).cumsum()
+
+    return (
+        cumulative_pv
+        / (
+            cumulative_volume
+            + 1e-12
         )
+    )
 
-        return True
 
-    except Exception as e:
+def enrich_ohlcv(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
 
-        print(
-            f"⚠️ Trade CSV error: {e}"
+    if df is None or df.empty:
+        return df
+
+    result = df.copy()
+
+    result["ema_20"] = calculate_ema(
+        result["close"],
+        20,
+    )
+
+    result["ema_50"] = calculate_ema(
+        result["close"],
+        50,
+    )
+
+    result["ema_200"] = calculate_ema(
+        result["close"],
+        200,
+    )
+
+    result["rsi_14"] = calculate_rsi(
+        result["close"],
+        14,
+    )
+
+    result["atr_14"] = calculate_atr(
+        result,
+        14,
+    )
+
+    result["atr_pct"] = (
+        result["atr_14"]
+        / (
+            result["close"]
+            + 1e-12
         )
+    ) * 100.0
 
-        return False
+    result["vwap"] = calculate_vwap(
+        result
+    )
+
+    result["ema_trend"] = np.where(
+        (
+            result["ema_20"]
+            > result["ema_50"]
+        )
+        & (
+            result["ema_50"]
+            > result["ema_200"]
+        ),
+        1,
+        np.where(
+            (
+                result["ema_20"]
+                < result["ema_50"]
+            )
+            & (
+                result["ema_50"]
+                < result["ema_200"]
+            ),
+            -1,
+            0,
+        ),
+    )
+
+    result["price_vs_vwap"] = (
+        result["close"]
+        - result["vwap"]
+    )
+
+    result["return_1"] = (
+        result["close"]
+        .pct_change()
+    )
+
+    result["volatility_20"] = (
+        result["return_1"]
+        .rolling(
+            20,
+            min_periods=5,
+        )
+        .std()
+        * 100.0
+    )
+
+    result["volume_sma_20"] = (
+        result["volume"]
+        .rolling(
+            20,
+            min_periods=1,
+        )
+        .mean()
+    )
+
+    result["volume_ratio"] = (
+        result["volume"]
+        / (
+            result["volume_sma_20"]
+            + 1e-12
+        )
+    )
+
+    return result
 
 
 # ============================================================
-# 16. FUTURES OHLCV
+# 19. FUTURES OHLCV
 # ============================================================
 
 def fetch_futures_ohlcv(
@@ -759,12 +1004,6 @@ def fetch_futures_ohlcv(
     interval: str,
     limit: int = KLINE_LIMIT,
 ) -> Optional[pd.DataFrame]:
-    """
-    Binance USDⓈ-M Futures Klines.
-
-    Endpoint:
-        /fapi/v1/klines
-    """
 
     data = binance_get(
         "/fapi/v1/klines",
@@ -855,11 +1094,15 @@ def fetch_futures_ohlcv(
 
     df["timeframe"] = interval
 
+    df = enrich_ohlcv(
+        df
+    )
+
     return df
 
 
 # ============================================================
-# 17. SAVE OHLCV
+# 20. SAVE OHLCV WITHOUT DUPLICATES
 # ============================================================
 
 def save_ohlcv(
@@ -872,12 +1115,49 @@ def save_ohlcv(
 
     try:
 
+        latest = df.tail(1).copy()
+
         file_exists = os.path.isfile(
             file_path
         )
 
-        # Save only latest candle from each request
-        latest = df.tail(1)
+        # ----------------------------------------------------
+        # Existing data
+        # ----------------------------------------------------
+
+        if file_exists:
+
+            try:
+
+                existing = pd.read_csv(
+                    file_path,
+                    usecols=[
+                        "symbol",
+                        "timeframe",
+                        "open_time",
+                    ],
+                )
+
+                keys = set(
+                    zip(
+                        existing["symbol"].astype(str),
+                        existing["timeframe"].astype(str),
+                        existing["open_time"].astype(str),
+                    )
+                )
+
+                new_key = (
+                    str(latest.iloc[0]["symbol"]),
+                    str(latest.iloc[0]["timeframe"]),
+                    str(latest.iloc[0]["open_time"]),
+                )
+
+                if new_key in keys:
+
+                    return True
+
+            except Exception:
+                pass
 
         latest.to_csv(
             file_path,
@@ -888,34 +1168,66 @@ def save_ohlcv(
 
         return True
 
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"⚠️ OHLCV CSV error: {e}"
+            f"⚠️ OHLCV CSV error: {error}"
         )
 
         return False
 
 
 # ============================================================
-# 18. COMPLETE MARKET SNAPSHOT
+# 21. SAVE TRADE SUMMARY
+# ============================================================
+
+def save_trade_summary(
+    symbol: str,
+    flow: Dict[str, float],
+    file_path: str = TRADES_DATA_FILE,
+) -> bool:
+
+    try:
+
+        row = {
+            "timestamp": utc_now_string(),
+            "symbol": symbol,
+            **flow,
+        }
+
+        df = pd.DataFrame(
+            [row]
+        )
+
+        file_exists = os.path.isfile(
+            file_path
+        )
+
+        df.to_csv(
+            file_path,
+            mode="a",
+            header=not file_exists,
+            index=False,
+        )
+
+        return True
+
+    except Exception as error:
+
+        print(
+            f"⚠️ Trade CSV error: {error}"
+        )
+
+        return False
+
+
+# ============================================================
+# 22. MARKET SNAPSHOT
 # ============================================================
 
 def collect_market_snapshot(
     symbol: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Collect:
-
-        Price
-        Order Book
-        OBI 5/10/20/50
-        Top20 depth
-        Top50 depth
-        Spread
-        Ratios
-        Taker Flow
-    """
 
     price = fetch_futures_price(
         symbol
@@ -929,7 +1241,10 @@ def collect_market_snapshot(
     if price is None:
         return None
 
-    if bids is None or asks is None:
+    if (
+        bids is None
+        or asks is None
+    ):
         return None
 
     # --------------------------------------------------------
@@ -961,7 +1276,7 @@ def collect_market_snapshot(
     )
 
     # --------------------------------------------------------
-    # TOP 20
+    # Depth
     # --------------------------------------------------------
 
     (
@@ -974,10 +1289,6 @@ def collect_market_snapshot(
         20,
     )
 
-    # --------------------------------------------------------
-    # TOP 50
-    # --------------------------------------------------------
-
     (
         bid50,
         ask50,
@@ -989,7 +1300,7 @@ def collect_market_snapshot(
     )
 
     # --------------------------------------------------------
-    # SPREAD
+    # Spread
     # --------------------------------------------------------
 
     (
@@ -1001,7 +1312,7 @@ def collect_market_snapshot(
     )
 
     # --------------------------------------------------------
-    # RATIOS
+    # Ratios
     # --------------------------------------------------------
 
     ratio20 = calculate_bid_ask_ratio(
@@ -1015,7 +1326,7 @@ def collect_market_snapshot(
     )
 
     # --------------------------------------------------------
-    # TRADES
+    # Trades
     # --------------------------------------------------------
 
     trades = fetch_futures_trades(
@@ -1028,11 +1339,14 @@ def collect_market_snapshot(
     )
 
     # --------------------------------------------------------
-    # SNAPSHOT
+    # Snapshot
     # --------------------------------------------------------
 
     data = {
+
         "timestamp": utc_now_string(),
+
+        "timestamp_iso": utc_now_iso(),
 
         "symbol": symbol,
 
@@ -1040,7 +1354,10 @@ def collect_market_snapshot(
 
         "current_price": price,
 
+        # ----------------------------------------------------
         # OBI
+        # ----------------------------------------------------
+
         "obi_5": round(
             obi_5,
             8,
@@ -1061,13 +1378,16 @@ def collect_market_snapshot(
             8,
         ),
 
-        # Compatibility with existing Research Lab
+        # Existing compatibility
         "obi_top20": round(
             obi_20,
             8,
         ),
 
-        # Top 20
+        # ----------------------------------------------------
+        # TOP 20
+        # ----------------------------------------------------
+
         "top20_bid_sum": round(
             bid20,
             8,
@@ -1083,7 +1403,10 @@ def collect_market_snapshot(
             8,
         ),
 
-        # Top 50
+        # ----------------------------------------------------
+        # TOP 50
+        # ----------------------------------------------------
+
         "top50_bid_sum": round(
             bid50,
             8,
@@ -1099,7 +1422,10 @@ def collect_market_snapshot(
             8,
         ),
 
-        # Ratios
+        # ----------------------------------------------------
+        # RATIOS
+        # ----------------------------------------------------
+
         "bid_ask_ratio_20": round(
             ratio20,
             8,
@@ -1110,7 +1436,10 @@ def collect_market_snapshot(
             8,
         ),
 
-        # Spread
+        # ----------------------------------------------------
+        # SPREAD
+        # ----------------------------------------------------
+
         "spread": round(
             spread,
             8,
@@ -1121,7 +1450,10 @@ def collect_market_snapshot(
             8,
         ),
 
-        # Taker Flow
+        # ----------------------------------------------------
+        # TAKER FLOW
+        # ----------------------------------------------------
+
         "taker_buy_volume": round(
             taker["taker_buy_volume"],
             8,
@@ -1156,7 +1488,10 @@ def collect_market_snapshot(
             taker["trade_count"]
         ),
 
-        # Depth levels
+        # ----------------------------------------------------
+        # BOOK QUALITY
+        # ----------------------------------------------------
+
         "bid_levels": int(
             len(bids)
         ),
@@ -1164,13 +1499,42 @@ def collect_market_snapshot(
         "ask_levels": int(
             len(asks)
         ),
+
+        "orderbook_levels_requested": int(
+            ORDER_BOOK_LIMIT
+        ),
+
+        "data_quality": (
+            "OK"
+            if (
+                len(bids) >= 50
+                and len(asks) >= 50
+            )
+            else "LIMITED"
+        ),
+
+        # ----------------------------------------------------
+        # SIGNAL HORIZON METADATA
+        # ----------------------------------------------------
+
+        "scalp_signal_tf": "30m",
+
+        "scalp_max_trade_minutes": 15,
+
+        "one_hour_signal_tf": "1h",
+
+        "one_hour_max_trade_minutes": 90,
+
+        "four_hour_signal_tf": "4h",
+
+        "four_hour_max_trade_minutes": 1440,
     }
 
     return data
 
 
 # ============================================================
-# 19. SAVE MARKET SNAPSHOT
+# 23. SAVE MARKET DATA
 # ============================================================
 
 def save_market_data(
@@ -1200,24 +1564,30 @@ def save_market_data(
 
         return True
 
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"⚠️ Market CSV error: {e}"
+            f"⚠️ Market CSV error: {error}"
         )
 
         return False
 
 
 # ============================================================
-# 20. COLLECT OHLCV FOR ALL TIMEFRAMES
+# 24. COLLECT OHLCV
 # ============================================================
 
 def collect_ohlcv_for_symbol(
     symbol: str,
 ):
     """
-    Collect latest 5m / 15m / 1h / 4h candles.
+    Collect latest candles for:
+
+        5m
+        15m
+        30m
+        1h
+        4h
     """
 
     for interval in KLINE_INTERVALS:
@@ -1236,34 +1606,30 @@ def collect_ohlcv_for_symbol(
                     df
                 )
 
-        except Exception as e:
+        except Exception as error:
 
             print(
                 f"⚠️ OHLCV error "
-                f"[{symbol} {interval}]: {e}"
+                f"[{symbol} {interval}]: "
+                f"{error}"
             )
 
 
 # ============================================================
-# 21. ONE SYMBOL COLLECTION
+# 25. COLLECT ONE SYMBOL
 # ============================================================
 
 def collect_symbol(
     symbol: str,
     count: int,
 ) -> int:
-    """
-    Collect all required data for one symbol.
-
-    Returns updated count.
-    """
 
     print(
         f"\n📡 Collecting {symbol}..."
     )
 
     # --------------------------------------------------------
-    # Main snapshot
+    # Main market snapshot
     # --------------------------------------------------------
 
     data = collect_market_snapshot(
@@ -1289,7 +1655,7 @@ def collect_symbol(
         count += 1
 
     # --------------------------------------------------------
-    # Save taker flow
+    # Taker flow
     # --------------------------------------------------------
 
     taker_flow = {
@@ -1347,19 +1713,40 @@ def collect_symbol(
 
 
 # ============================================================
-# 22. AUTO COLLECTOR
+# 26. DATA DIRECTORY CHECK
 # ============================================================
 
-def log_auto_data(
-    file_path: str = MARKET_DATA_FILE,
-):
-    """
-    Continuous collector.
-    """
+def ensure_data_files():
+
+    files = [
+        MARKET_DATA_FILE,
+        TRADES_DATA_FILE,
+        OHLCV_DATA_FILE,
+    ]
+
+    for file_path in files:
+
+        directory = os.path.dirname(
+            os.path.abspath(
+                file_path
+            )
+        )
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+
+# ============================================================
+# 27. COLLECTOR STATUS
+# ============================================================
+
+def print_system_config():
 
     print(
-        "\n"
-        "============================================================"
+        "\n============================================================"
     )
 
     print(
@@ -1367,7 +1754,7 @@ def log_auto_data(
     )
 
     print(
-        "📡 BINANCE USDⓈ-M FUTURES AUTO COLLECTOR"
+        "📡 BINANCE USDⓈ-M FUTURES AUTO COLLECTOR v2"
     )
 
     print(
@@ -1375,36 +1762,106 @@ def log_auto_data(
     )
 
     print(
-        f"🪙 Coins       : {len(COINS_LIST)}"
+        f"🪙 Coins              : {len(COINS_LIST)}"
     )
 
     print(
-        f"📚 Order Book  : {ORDER_BOOK_LIMIT} levels"
+        f"📚 Order Book         : {ORDER_BOOK_LIMIT} levels"
     )
 
     print(
-        "📊 OBI         : 5 / 10 / 20 / 50"
+        "📊 OBI                : 5 / 10 / 20 / 50"
     )
 
     print(
-        "🔥 Taker Flow  : Futures AggTrades"
+        "🔥 Taker Flow         : Futures AggTrades"
     )
 
     print(
-        "📈 OHLCV       : 5m / 15m / 1h / 4h"
+        "📈 OHLCV              : "
+        "5m / 15m / 30m / 1h / 4h"
     )
 
     print(
-        "🌐 Market      : Binance USDⓈ-M Futures"
+        "📐 EMA                : 20 / 50 / 200"
     )
 
     print(
-        f"💾 Market CSV  : {file_path}"
+        "📊 RSI                : 14"
+    )
+
+    print(
+        "📏 ATR                : 14"
+    )
+
+    print(
+        "📍 VWAP               : Enabled"
+    )
+
+    print(
+        "🌊 Volatility         : Enabled"
+    )
+
+    print(
+        "📈 Volume Ratio       : Enabled"
+    )
+
+    print(
+        "🌐 Market             : Binance USDⓈ-M Futures"
+    )
+
+    print(
+        "\nTIMEFRAME TRADE WINDOWS"
+    )
+
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        "SCALPING  | Signal: 30m | Max trade: 15 minutes"
+    )
+
+    print(
+        "1H        | Signal: 1h  | Max trade: 90 minutes"
+    )
+
+    print(
+        "4H        | Signal: 4h  | Max trade: 24 hours"
+    )
+
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        f"💾 Market CSV         : {MARKET_DATA_FILE}"
+    )
+
+    print(
+        f"💾 Trades CSV         : {TRADES_DATA_FILE}"
+    )
+
+    print(
+        f"💾 OHLCV CSV          : {OHLCV_DATA_FILE}"
     )
 
     print(
         "============================================================\n"
     )
+
+
+# ============================================================
+# 28. AUTO COLLECTOR
+# ============================================================
+
+def log_auto_data(
+    file_path: str = MARKET_DATA_FILE,
+):
+
+    ensure_data_files()
+
+    print_system_config()
 
     count = 0
 
@@ -1451,13 +1908,13 @@ def log_auto_data(
 
                 raise
 
-            except Exception as e:
+            except Exception as error:
 
                 failed += 1
 
                 print(
                     f"❌ Symbol error "
-                    f"[{symbol}]: {e}"
+                    f"[{symbol}]: {error}"
                 )
 
             time.sleep(
@@ -1478,19 +1935,19 @@ def log_auto_data(
         )
 
         print(
-            f"   Success : {successful}"
+            f"   Success          : {successful}"
         )
 
         print(
-            f"   Failed  : {failed}"
+            f"   Failed           : {failed}"
         )
 
         print(
-            f"   Time    : {elapsed:.2f}s"
+            f"   Cycle Time       : {elapsed:.2f}s"
         )
 
         print(
-            f"   Total snapshots: {count}"
+            f"   Total Snapshots  : {count}"
         )
 
         print(
@@ -1503,17 +1960,14 @@ def log_auto_data(
 
 
 # ============================================================
-# 23. TEST MODE
+# 29. TEST COLLECTOR
 # ============================================================
 
 def test_collector(
     symbol: str = "BTCUSDT",
 ):
-    """
-    One-shot collector test.
 
-    Does NOT start infinite loop.
-    """
+    ensure_data_files()
 
     print(
         "\n============================================================"
@@ -1527,6 +1981,10 @@ def test_collector(
         "============================================================"
     )
 
+    # --------------------------------------------------------
+    # Market snapshot
+    # --------------------------------------------------------
+
     data = collect_market_snapshot(
         symbol
     )
@@ -1534,7 +1992,7 @@ def test_collector(
     if data is None:
 
         print(
-            "❌ Test failed."
+            "❌ Market test failed."
         )
 
         return
@@ -1544,6 +2002,7 @@ def test_collector(
     )
 
     important_fields = [
+
         "market",
         "symbol",
         "current_price",
@@ -1567,6 +2026,7 @@ def test_collector(
 
         "taker_buy_volume",
         "taker_sell_volume",
+
         "taker_flow",
         "taker_flow_ratio",
 
@@ -1574,12 +2034,23 @@ def test_collector(
 
         "bid_levels",
         "ask_levels",
+
+        "data_quality",
+
+        "scalp_signal_tf",
+        "scalp_max_trade_minutes",
+
+        "one_hour_signal_tf",
+        "one_hour_max_trade_minutes",
+
+        "four_hour_signal_tf",
+        "four_hour_max_trade_minutes",
     ]
 
     for key in important_fields:
 
         print(
-            f"{key:28} : "
+            f"{key:30} : "
             f"{data.get(key)}"
         )
 
@@ -1588,11 +2059,15 @@ def test_collector(
     )
 
     # --------------------------------------------------------
-    # Test OHLCV
+    # OHLCV test
     # --------------------------------------------------------
 
     print(
-        "📈 OHLCV TEST"
+        "📈 OHLCV / INDICATOR TEST"
+    )
+
+    print(
+        "------------------------------------------------------------"
     )
 
     for interval in KLINE_INTERVALS:
@@ -1609,28 +2084,100 @@ def test_collector(
                 f"❌ {interval}: failed"
             )
 
-        else:
+            continue
 
-            print(
-                f"✅ {interval}: "
-                f"{len(df)} candles | "
-                f"Latest close: "
-                f"{df.iloc[-1]['close']}"
-            )
+        latest = df.iloc[-1]
+
+        print(
+            f"\n✅ {interval}"
+        )
+
+        print(
+            f"   Candles      : {len(df)}"
+        )
+
+        print(
+            f"   Latest Close : "
+            f"{latest['close']}"
+        )
+
+        print(
+            f"   EMA20        : "
+            f"{latest.get('ema_20', 0)}"
+        )
+
+        print(
+            f"   EMA50        : "
+            f"{latest.get('ema_50', 0)}"
+        )
+
+        print(
+            f"   EMA200       : "
+            f"{latest.get('ema_200', 0)}"
+        )
+
+        print(
+            f"   RSI14        : "
+            f"{latest.get('rsi_14', 0)}"
+        )
+
+        print(
+            f"   ATR14        : "
+            f"{latest.get('atr_14', 0)}"
+        )
+
+        print(
+            f"   ATR%         : "
+            f"{latest.get('atr_pct', 0)}"
+        )
+
+        print(
+            f"   VWAP         : "
+            f"{latest.get('vwap', 0)}"
+        )
+
+        print(
+            f"   EMA Trend    : "
+            f"{latest.get('ema_trend', 0)}"
+        )
+
+        print(
+            f"   Volatility   : "
+            f"{latest.get('volatility_20', 0)}"
+        )
+
+        print(
+            f"   Volume Ratio : "
+            f"{latest.get('volume_ratio', 0)}"
+        )
+
+    print(
+        "\n============================================================"
+    )
+
+    print(
+        "✅ TEST COMPLETE"
+    )
+
+    print(
+        "============================================================"
+    )
 
 
 # ============================================================
-# 24. MAIN
+# 30. MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
     # --------------------------------------------------------
+    # TEST_MODE
+    #
     # True:
-    # Test only BTCUSDT once.
+    #   BTCUSDT one-shot test
     #
     # False:
-    # Start continuous collector.
+    #   Continuous collector
     # --------------------------------------------------------
 
     TEST_MODE = False
@@ -1653,8 +2200,9 @@ if __name__ == "__main__":
             "\n\n🛑 Collector stopped by user."
         )
 
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"\n❌ FATAL COLLECTOR ERROR: {e}"
+            f"\n❌ FATAL COLLECTOR ERROR: "
+            f"{error}"
         )
