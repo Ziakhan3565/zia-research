@@ -1,19 +1,326 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
+import requests
 
-from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import CalibratedClassifierCV
+from dataclasses import dataclass
+from typing import Dict, Optional, Any
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BINANCE_API = "https://api.binance.com/api/v3/klines"
+
+DEFAULT_SYMBOL = "BTCUSDT"
+
+SUPPORTED_TIMEFRAMES = {
+    "MONTHLY": "1M",
+    "WEEKLY": "1w",
+    "DAILY": "1d",
+    "4H": "4h",
+    "1H": "1h",
+    "30M": "30m",
+    "15M": "15m",
+}
+
+
+# ============================================================
+# TRI LINE DATA
+# ============================================================
+
+@dataclass
+class TRILineLevels:
+    timeframe: str
+
+    open: float
+    high: float
+    low: float
+    close: float
+
+    body_high: float
+    body_low: float
+
+    body_50: float
+    upper_50: float
+    lower_50: float
+
+    candle_time: int
+
+
+# ============================================================
+# TRI LINE ENGINE
+# ============================================================
+
+class TRILineEngine:
+
+    def __init__(
+        self,
+        symbol: str = DEFAULT_SYMBOL,
+        enabled_timeframes: Optional[Dict[str, bool]] = None,
+        timeout: int = 10,
+    ):
+
+        self.symbol = symbol.upper()
+        self.timeout = timeout
+
+        self.enabled = {
+            "MONTHLY": True,
+            "WEEKLY": True,
+            "DAILY": True,
+            "4H": True,
+            "1H": True,
+            "30M": True,
+            "15M": True,
+        }
+
+        if enabled_timeframes:
+            self.enabled.update(
+                enabled_timeframes
+            )
+
+    # --------------------------------------------------------
+    # SYMBOL
+    # --------------------------------------------------------
+
+    def set_symbol(self, symbol: str):
+
+        self.symbol = symbol.upper()
+
+    # --------------------------------------------------------
+    # GET KLINES
+    # --------------------------------------------------------
+
+    def get_klines(
+        self,
+        interval: str,
+        limit: int = 5
+    ):
+
+        params = {
+            "symbol": self.symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+
+        response = requests.get(
+            BINANCE_API,
+            params=params,
+            timeout=self.timeout
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    # --------------------------------------------------------
+    # PREVIOUS COMPLETED CANDLE
+    # --------------------------------------------------------
+
+    def get_previous_candle(
+        self,
+        interval: str
+    ):
+
+        candles = self.get_klines(
+            interval,
+            5
+        )
+
+        if len(candles) < 2:
+            raise RuntimeError(
+                "Not enough candle data"
+            )
+
+        candle = candles[-2]
+
+        return {
+            "time": int(candle[0]),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4]),
+            "volume": float(candle[5]),
+        }
+
+    # --------------------------------------------------------
+    # TRI FORMULAS
+    # --------------------------------------------------------
+
+    def calculate_levels(
+        self,
+        timeframe: str
+    ) -> TRILineLevels:
+
+        timeframe = timeframe.upper()
+
+        if timeframe not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"Unsupported timeframe: {timeframe}"
+            )
+
+        interval = SUPPORTED_TIMEFRAMES[
+            timeframe
+        ]
+
+        candle = self.get_previous_candle(
+            interval
+        )
+
+        o = candle["open"]
+        h = candle["high"]
+        l = candle["low"]
+        c = candle["close"]
+
+        body_high = max(o, c)
+        body_low = min(o, c)
+
+        # BODY 50%
+        body_50 = (
+            body_high
+            + body_low
+        ) / 2.0
+
+        # UPPER WICK 50%
+        upper_50 = (
+            h
+            + body_high
+        ) / 2.0
+
+        # LOWER WICK 50%
+        lower_50 = (
+            l
+            + body_low
+        ) / 2.0
+
+        return TRILineLevels(
+            timeframe=timeframe,
+
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+
+            body_high=body_high,
+            body_low=body_low,
+
+            body_50=body_50,
+            upper_50=upper_50,
+            lower_50=lower_50,
+
+            candle_time=candle["time"],
+        )
+
+    # --------------------------------------------------------
+    # CURRENT PRICE
+    # --------------------------------------------------------
+
+    def get_current_price(
+        self,
+        timeframe="15M"
+    ):
+
+        interval = SUPPORTED_TIMEFRAMES[
+            timeframe.upper()
+        ]
+
+        candles = self.get_klines(
+            interval,
+            1
+        )
+
+        return float(
+            candles[0][4]
+        )
+
+    # --------------------------------------------------------
+    # ALL TRI LEVELS
+    # --------------------------------------------------------
+
+    def calculate_all(self):
+
+        results = {}
+
+        for timeframe in SUPPORTED_TIMEFRAMES:
+
+            if not self.enabled.get(
+                timeframe,
+                False
+            ):
+                continue
+
+            try:
+
+                results[timeframe] = (
+                    self.calculate_levels(
+                        timeframe
+                    )
+                )
+
+            except Exception as error:
+
+                results[timeframe] = {
+                    "error": str(error)
+                }
+
+        return results
+
+
+# ============================================================
+# TEN PAPER RESEARCH LAB
+# ============================================================
 
 class TenPaperResearchLab:
 
-    def __init__(self, target_vol=0.15):
+    def __init__(
+        self,
+        target_vol=0.15,
+        tri_engine=None
+    ):
+
         self.target_vol = target_vol
 
-        # =====================================================
-        # MACHINE LEARNING
-        # =====================================================
+        self.tri_engine = (
+            tri_engine
+            if tri_engine is not None
+            else TRILineEngine()
+        )
+
+        # ====================================================
+        # TRADE MODES
+        # ====================================================
+
+        self.trade_modes = {
+
+            "15M": {
+                "confirmation": "15M",
+                "reference": ["1H", "4H"],
+            },
+
+            "1H": {
+                "confirmation": "1H",
+                "reference": ["DAILY", "WEEKLY"],
+            },
+
+            "4H": {
+                "confirmation": "4H",
+                "reference": ["WEEKLY", "MONTHLY"],
+            },
+
+        }
+
+        # ====================================================
+        # TRI TOUCH
+        # ====================================================
+
+        self.tri_touch_tolerance = 0.0015
+
+        # ====================================================
+        # ML
+        # ====================================================
+
         self.scaler = StandardScaler()
 
         self.base_model = SGDClassifier(
@@ -26,100 +333,140 @@ class TenPaperResearchLab:
         )
 
         self.ml_model = None
+
         self.is_model_trained = False
 
-        # Same six research features
+        # ====================================================
+        # SIX RESEARCH FEATURES
+        # ====================================================
+
         self.feature_names = [
+
             "BOOK_IMB",
             "TAKER_FLOW",
             "QUANT_IMPLY",
             "ADAPT_CONF",
             "BAYESIAN",
             "FOURIER_TREND",
+
         ]
 
-        # =====================================================
-        # MULTI LEVEL OBI
-        # =====================================================
-        self.obi_level_weights = {
-            5: 0.10,
-            10: 0.20,
-            20: 0.40,
-            50: 0.30,
-        }
+        # ====================================================
+        # WEIGHTS
+        # ====================================================
 
-        # =====================================================
-        # RESEARCH WEIGHTS
-        # =====================================================
         self.dynamic_weights = {
+
             "BOOK_IMB": 0.25,
+
             "TAKER_FLOW": 0.20,
+
             "QUANT_IMPLY": 0.15,
+
             "ADAPT_CONF": 0.15,
+
             "BAYESIAN": 0.10,
+
             "FOURIER_TREND": 0.15,
+
         }
 
-        # =====================================================
-        # FINAL SIGNAL SETTINGS
-        # =====================================================
         self.quant_weight = 0.65
         self.ml_weight = 0.35
 
         self.long_threshold = 0.45
         self.short_threshold = -0.45
 
+        # ====================================================
+        # HYSTERESIS
+        # ====================================================
+
         self.last_signal = "NEUTRAL"
         self.cooldown_counter = 0
 
-    # =========================================================
-    # HELPERS
-    # =========================================================
+    # ========================================================
+    # SAFE FLOAT
+    # ========================================================
 
     @staticmethod
-    def _safe_float(value, default=0.0):
+    def safe_float(
+        value,
+        default=0.0
+    ):
+
         try:
+
             value = float(value)
+
             if np.isfinite(value):
                 return value
+
         except Exception:
             pass
+
         return default
 
+    # ========================================================
+    # CLIP
+    # ========================================================
+
     @staticmethod
-    def _clip(value, low=-1.0, high=1.0):
-        return float(np.clip(value, low, high))
+    def clip(
+        value,
+        low=-1.0,
+        high=1.0
+    ):
 
-    # =========================================================
+        return float(
+            np.clip(
+                value,
+                low,
+                high
+            )
+        )
+
+    # ========================================================
     # ATR
-    # =========================================================
+    # ========================================================
 
-    def _calculate_atr(self, df, period=14):
+    def calculate_atr(
+        self,
+        df,
+        period=14
+    ):
 
         if df is None or df.empty:
             return 0.0
 
         if not all(
-            c in df.columns
-            for c in ["High", "Low", "Close"]
+            col in df.columns
+            for col in [
+                "High",
+                "Low",
+                "Close"
+            ]
         ):
+
             close = pd.to_numeric(
                 df["Close"],
                 errors="coerce"
             )
 
-            returns = close.pct_change()
+            vol = (
+                close
+                .pct_change()
+                .rolling(period)
+                .std()
+                .iloc[-1]
+            )
 
-            vol = returns.rolling(
-                period
-            ).std().iloc[-1]
-
-            price = self._safe_float(
+            price = self.safe_float(
                 close.iloc[-1]
             )
 
             return max(
-                self._safe_float(vol) * price,
+                self.safe_float(vol)
+                * price,
                 price * 0.001
             )
 
@@ -138,51 +485,57 @@ class TenPaperResearchLab:
             errors="coerce"
         )
 
-        previous_close = close.shift(1)
+        prev_close = close.shift(1)
 
         tr = pd.concat(
             [
                 high - low,
-                (high - previous_close).abs(),
-                (low - previous_close).abs()
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
             ],
             axis=1
         ).max(axis=1)
 
-        atr = tr.ewm(
-            alpha=1.0 / period,
-            adjust=False,
-            min_periods=period
-        ).mean()
+        atr = (
+            tr
+            .ewm(
+                alpha=1.0 / period,
+                adjust=False,
+                min_periods=period
+            )
+            .mean()
+        )
 
         value = atr.iloc[-1]
 
         if not np.isfinite(value):
-            value = tr.tail(period).mean()
+
+            value = (
+                tr
+                .tail(period)
+                .mean()
+            )
 
         return max(
-            self._safe_float(value),
+            self.safe_float(value),
             0.0
         )
 
-    # =========================================================
-    # MULTI LEVEL OBI
-    # =========================================================
+    # ========================================================
+    # OBI SINGLE LEVEL
+    # ========================================================
 
-    def _calculate_obi_level(
+    def calculate_obi_level(
         self,
         bids,
         asks,
         levels
     ):
-        """
-        OBI_N =
-        (Weighted Bid Volume - Weighted Ask Volume)
-        /
-        (Weighted Bid Volume + Weighted Ask Volume)
-        """
 
-        if len(bids) == 0 or len(asks) == 0:
+        if (
+            len(bids) == 0
+            or len(asks) == 0
+        ):
             return 0.0
 
         n = min(
@@ -191,71 +544,73 @@ class TenPaperResearchLab:
             len(asks)
         )
 
-        if n <= 0:
-            return 0.0
-
-        bid_total = 0.0
-        ask_total = 0.0
+        bid_sum = 0.0
+        ask_sum = 0.0
 
         for i in range(n):
 
             bid_size = max(
-                self._safe_float(
+                self.safe_float(
                     bids[i][1]
                 ),
                 0.0
             )
 
             ask_size = max(
-                self._safe_float(
+                self.safe_float(
                     asks[i][1]
                 ),
                 0.0
             )
 
-            # Nearest levels receive greater weight.
-            weight = 1.0 / (i + 1.0)
+            # Nearer levels receive higher weight.
+            weight = 1.0 / (
+                i + 1.0
+            )
 
-            bid_total += (
+            bid_sum += (
                 bid_size * weight
             )
 
-            ask_total += (
+            ask_sum += (
                 ask_size * weight
             )
 
-        denominator = (
-            bid_total
-            + ask_total
-            + 1e-12
-        )
-
-        return self._clip(
+        return self.clip(
             (
-                bid_total
-                - ask_total
-            ) / denominator
+                bid_sum
+                - ask_sum
+            )
+            /
+            (
+                bid_sum
+                + ask_sum
+                + 1e-12
+            )
         )
 
-    def _calculate_multi_level_obi(
+    # ========================================================
+    # MULTI LEVEL OBI
+    # ========================================================
+
+    def calculate_multi_level_obi(
         self,
         bids,
         asks
     ):
-        """
-        OBI_MULTI =
-            0.10*OBI5
-          + 0.20*OBI10
-          + 0.40*OBI20
-          + 0.30*OBI50
-        """
+
+        levels = {
+            5: 0.10,
+            10: 0.20,
+            20: 0.40,
+            50: 0.30,
+        }
 
         values = {}
+
         weights = {}
 
-        for level, weight in (
-            self.obi_level_weights.items()
-        ):
+        for level, weight in levels.items():
 
             if (
                 len(bids) >= level
@@ -263,7 +618,7 @@ class TenPaperResearchLab:
             ):
 
                 values[level] = (
-                    self._calculate_obi_level(
+                    self.calculate_obi_level(
                         bids,
                         asks,
                         level
@@ -272,7 +627,6 @@ class TenPaperResearchLab:
 
                 weights[level] = weight
 
-        # If fewer than 5 levels are available.
         if not values:
 
             available = min(
@@ -283,7 +637,7 @@ class TenPaperResearchLab:
             if available <= 0:
                 return 0.0
 
-            return self._calculate_obi_level(
+            return self.calculate_obi_level(
                 bids,
                 asks,
                 available
@@ -293,57 +647,40 @@ class TenPaperResearchLab:
             weights.values()
         )
 
-        result = 0.0
+        final = 0.0
 
-        for level in values:
+        for level, value in values.items():
 
-            result += (
-                values[level]
+            final += (
+                value
                 * weights[level]
                 / total_weight
             )
 
-        return self._clip(result)
+        return self.clip(
+            final
+        )
 
-    # =========================================================
+    # ========================================================
     # ACTUAL TAKER FLOW
-    # =========================================================
+    # ========================================================
 
-    def _calculate_taker_flow(
+    def calculate_taker_flow(
         self,
         trades
     ):
-        """
-        Actual trade-flow formula:
-
-        Taker Flow =
-        (Aggressive Buy Volume - Aggressive Sell Volume)
-        /
-        (Aggressive Buy Volume + Aggressive Sell Volume)
-
-        Supported trade formats:
-
-        dict:
-            {"side": "buy", "qty": 1.2}
-
-        dict:
-            {"side": "sell", "quantity": 1.2}
-
-        DataFrame:
-            side + qty/quantity/volume
-        """
 
         if trades is None:
             return 0.0
 
+        buy_volume = 0.0
+        sell_volume = 0.0
+
         try:
 
-            buy_volume = 0.0
-            sell_volume = 0.0
-
-            # -------------------------------------------------
+            # ------------------------------------------------
             # DATAFRAME
-            # -------------------------------------------------
+            # ------------------------------------------------
 
             if isinstance(
                 trades,
@@ -363,6 +700,7 @@ class TenPaperResearchLab:
                 ]:
 
                     if col in trades.columns:
+
                         side_col = col
                         break
 
@@ -376,6 +714,7 @@ class TenPaperResearchLab:
                 ]:
 
                     if col in trades.columns:
+
                         qty_col = col
                         break
 
@@ -385,14 +724,18 @@ class TenPaperResearchLab:
                 ):
                     return 0.0
 
-                for _, row in trades.tail(500).iterrows():
+                rows = trades.tail(
+                    500
+                )
+
+                for _, row in rows.iterrows():
 
                     side = str(
                         row[side_col]
                     ).lower()
 
                     qty = max(
-                        self._safe_float(
+                        self.safe_float(
                             row[qty_col]
                         ),
                         0.0
@@ -401,22 +744,22 @@ class TenPaperResearchLab:
                     if side in [
                         "buy",
                         "b",
-                        "long",
-                        "bid"
+                        "long"
                     ]:
+
                         buy_volume += qty
 
                     elif side in [
                         "sell",
                         "s",
-                        "short",
-                        "ask"
+                        "short"
                     ]:
+
                         sell_volume += qty
 
-            # -------------------------------------------------
-            # LIST / TUPLE OF DICTS
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # LIST OF DICTS
+            # ------------------------------------------------
 
             elif isinstance(
                 trades,
@@ -449,31 +792,31 @@ class TenPaperResearchLab:
                                 "volume",
                                 trade.get(
                                     "size",
-                                    0
+                                    0.0
                                 )
                             )
                         )
                     )
 
                     qty = max(
-                        self._safe_float(qty),
+                        self.safe_float(qty),
                         0.0
                     )
 
                     if side in [
                         "buy",
                         "b",
-                        "long",
-                        "bid"
+                        "long"
                     ]:
+
                         buy_volume += qty
 
                     elif side in [
                         "sell",
                         "s",
-                        "short",
-                        "ask"
+                        "short"
                     ]:
+
                         sell_volume += qty
 
             total = (
@@ -482,21 +825,23 @@ class TenPaperResearchLab:
                 + 1e-12
             )
 
-            return self._clip(
+            return self.clip(
                 (
                     buy_volume
                     - sell_volume
-                ) / total
+                )
+                / total
             )
 
         except Exception:
+
             return 0.0
 
-    # =========================================================
+    # ========================================================
     # MICROPRICE
-    # =========================================================
+    # ========================================================
 
-    def _calculate_microprice(
+    def calculate_microprice(
         self,
         bids,
         asks
@@ -508,23 +853,23 @@ class TenPaperResearchLab:
         ):
             return 0.0
 
-        bid = self._safe_float(
+        bid = self.safe_float(
             bids[0][0]
         )
 
-        ask = self._safe_float(
+        ask = self.safe_float(
             asks[0][0]
         )
 
         bid_size = max(
-            self._safe_float(
+            self.safe_float(
                 bids[0][1]
             ),
             0.0
         )
 
         ask_size = max(
-            self._safe_float(
+            self.safe_float(
                 asks[0][1]
             ),
             0.0
@@ -540,28 +885,34 @@ class TenPaperResearchLab:
         )
 
         microprice = (
+
             ask * bid_size
-            + bid * ask_size
+            +
+            bid * ask_size
+
         ) / (
+
             bid_size
             + ask_size
             + 1e-12
+
         )
 
-        return self._clip(
+        return self.clip(
             np.tanh(
                 (
                     microprice
                     - mid
-                ) / spread
+                )
+                / spread
             )
         )
 
-    # =========================================================
-    # BAYESIAN FEATURE
-    # =========================================================
+    # ========================================================
+    # BAYESIAN
+    # ========================================================
 
-    def _calculate_bayesian(
+    def calculate_bayesian(
         self,
         book_imbalance,
         performance_history=None
@@ -578,7 +929,7 @@ class TenPaperResearchLab:
 
                 col = None
 
-                for name in [
+                for candidate in [
                     "outcome",
                     "result",
                     "win",
@@ -586,8 +937,11 @@ class TenPaperResearchLab:
                     "label"
                 ]:
 
-                    if name in performance_history.columns:
-                        col = name
+                    if candidate in (
+                        performance_history.columns
+                    ):
+
+                        col = candidate
                         break
 
                 if col:
@@ -605,14 +959,19 @@ class TenPaperResearchLab:
                         )
 
                         prior = (
+
                             values.sum()
                             + 1.0
+
                         ) / (
+
                             len(values)
                             + 2.0
+
                         )
 
         except Exception:
+
             prior = 0.50
 
         prior = np.clip(
@@ -623,47 +982,70 @@ class TenPaperResearchLab:
 
         obi = np.clip(
             book_imbalance,
-            -1.0,
-            1.0
+            -1,
+            1
         )
 
         strength = (
             0.50
-            + 0.45 * abs(obi)
+            + 0.45
+            * abs(obi)
         )
 
         if obi >= 0:
+
             likelihood = strength
+
         else:
-            likelihood = 1.0 - strength
+
+            likelihood = (
+                1.0
+                - strength
+            )
 
         numerator = (
-            likelihood * prior
+            likelihood
+            * prior
         )
 
         denominator = (
+
             numerator
-            + (1.0 - likelihood)
-            * (1.0 - prior)
+            +
+            (
+                1.0
+                - likelihood
+            )
+            *
+            (
+                1.0
+                - prior
+            )
+
         )
 
         posterior = (
             numerator
-            / (denominator + 1e-12)
+            /
+            (
+                denominator
+                + 1e-12
+            )
         )
 
-        return self._clip(
+        return self.clip(
             (
                 posterior
                 - 0.5
-            ) * 2.0
+            )
+            * 2.0
         )
 
-    # =========================================================
-    # FOURIER
-    # =========================================================
+    # ========================================================
+    # FOURIER TREND
+    # ========================================================
 
-    def _calculate_fourier(
+    def calculate_fourier(
         self,
         close,
         atr
@@ -681,17 +1063,16 @@ class TenPaperResearchLab:
         if len(prices) < 16:
             return 0.0
 
-        # Recent observations only.
         prices = prices[
-            -min(64, len(prices)):
+            -min(
+                64,
+                len(prices)
+            ):
         ]
 
-        mean_price = np.mean(
-            prices
-        )
-
         centered = (
-            prices - mean_price
+            prices
+            - np.mean(prices)
         )
 
         fft_values = np.fft.fft(
@@ -704,7 +1085,9 @@ class TenPaperResearchLab:
 
         keep = max(
             2,
-            int(n * 0.10)
+            int(
+                n * 0.10
+            )
         )
 
         mask = np.zeros(
@@ -734,19 +1117,21 @@ class TenPaperResearchLab:
 
         denominator = max(
             atr,
-            mean_price * 1e-6,
+            np.mean(prices)
+            * 1e-6,
             1e-12
         )
 
-        return self._clip(
+        return self.clip(
             np.tanh(
-                delta / denominator
+                delta
+                / denominator
             )
         )
 
-    # =========================================================
+    # ========================================================
     # FEATURE EXTRACTION
-    # =========================================================
+    # ========================================================
 
     def extract_features(
         self,
@@ -758,8 +1143,8 @@ class TenPaperResearchLab:
     ):
 
         results = {
-            key: 0.0
-            for key in self.feature_names
+            feature: 0.0
+            for feature in self.feature_names
         }
 
         if (
@@ -769,9 +1154,7 @@ class TenPaperResearchLab:
             or len(bids) == 0
             or len(asks) == 0
         ):
-            return results
 
-        if "Close" not in df.columns:
             return results
 
         try:
@@ -781,31 +1164,12 @@ class TenPaperResearchLab:
                 errors="coerce"
             ).ffill().bfill()
 
-            if len(close) < 15:
-                return results
-
-            current_price = self._safe_float(
+            current_price = self.safe_float(
                 close.iloc[-1]
             )
 
-            best_bid = self._safe_float(
-                bids[0][0],
-                current_price
-            )
-
-            best_ask = self._safe_float(
-                asks[0][0],
-                current_price
-            )
-
-            mid_price = (
-                best_bid
-                + best_ask
-            ) / 2.0
-
-            atr = self._calculate_atr(
-                df,
-                14
+            atr = self.calculate_atr(
+                df
             )
 
             atr = max(
@@ -814,41 +1178,41 @@ class TenPaperResearchLab:
                 1e-12
             )
 
-            # =================================================
-            # 1. MULTI LEVEL OBI
-            # =================================================
+            # ------------------------------------------------
+            # BOOK IMBALANCE
+            # ------------------------------------------------
 
             results["BOOK_IMB"] = (
-                self._calculate_multi_level_obi(
+                self.calculate_multi_level_obi(
                     bids,
                     asks
                 )
             )
 
-            # =================================================
-            # 2. ACTUAL TAKER FLOW
-            # =================================================
+            # ------------------------------------------------
+            # ACTUAL TAKER FLOW
+            # ------------------------------------------------
 
             results["TAKER_FLOW"] = (
-                self._calculate_taker_flow(
+                self.calculate_taker_flow(
                     trades
                 )
             )
 
-            # =================================================
-            # 3. MICROPRICE / QUANT IMPLY
-            # =================================================
+            # ------------------------------------------------
+            # MICROPRICE
+            # ------------------------------------------------
 
             results["QUANT_IMPLY"] = (
-                self._calculate_microprice(
+                self.calculate_microprice(
                     bids,
                     asks
                 )
             )
 
-            # =================================================
-            # 4. EMA20 / EMA50 + ATR
-            # =================================================
+            # ------------------------------------------------
+            # ADAPTIVE TREND
+            # ------------------------------------------------
 
             ema20 = (
                 close
@@ -874,42 +1238,41 @@ class TenPaperResearchLab:
             ) / atr
 
             results["ADAPT_CONF"] = (
-                self._clip(
+                self.clip(
                     np.tanh(
                         trend / 3.0
                     )
                 )
             )
 
-            # =================================================
-            # 5. BAYESIAN
-            # =================================================
+            # ------------------------------------------------
+            # BAYESIAN
+            # ------------------------------------------------
 
             results["BAYESIAN"] = (
-                self._calculate_bayesian(
+                self.calculate_bayesian(
                     results["BOOK_IMB"],
                     performance_history
                 )
             )
 
-            # =================================================
-            # 6. FOURIER
-            # =================================================
+            # ------------------------------------------------
+            # FOURIER
+            # ------------------------------------------------
 
             results["FOURIER_TREND"] = (
-                self._calculate_fourier(
+                self.calculate_fourier(
                     close.values,
                     atr
                 )
             )
 
-            # Final normalization
-            for key in self.feature_names:
+            for feature in self.feature_names:
 
-                results[key] = (
-                    self._clip(
-                        self._safe_float(
-                            results[key]
+                results[feature] = (
+                    self.clip(
+                        self.safe_float(
+                            results[feature]
                         )
                     )
                 )
@@ -917,30 +1280,21 @@ class TenPaperResearchLab:
             return results
 
         except Exception:
+
             return {
-                key: 0.0
-                for key in self.feature_names
+                feature: 0.0
+                for feature in self.feature_names
             }
 
-    # =========================================================
+    # ========================================================
     # ML TRAINING
-    # =========================================================
+    # ========================================================
 
     def train_ml(
         self,
         feature_data,
         labels
     ):
-        """
-        Train only on historical data.
-
-        feature_data:
-            DataFrame containing the six feature columns.
-
-        labels:
-            1 = future bullish outcome
-            0 = future bearish outcome
-        """
 
         try:
 
@@ -954,12 +1308,16 @@ class TenPaperResearchLab:
                 labels
             ).astype(int)
 
-            valid = (
-                X.replace(
-                    [np.inf, -np.inf],
-                    np.nan
-                ).notna().all(axis=1)
-                & y.notna()
+            if len(X) != len(y):
+                return False
+
+            X = X.replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+
+            valid = X.notna().all(
+                axis=1
             )
 
             X = X.loc[valid]
@@ -971,19 +1329,51 @@ class TenPaperResearchLab:
             if y.nunique() < 2:
                 return False
 
-            # Fit scaler ONLY on training data.
-            X_scaled = (
+            # Chronological split
+            split = int(
+                len(X) * 0.80
+            )
+
+            X_train = X.iloc[
+                :split
+            ]
+
+            y_train = y.iloc[
+                :split
+            ]
+
+            X_cal = X.iloc[
+                split:
+            ]
+
+            y_cal = y.iloc[
+                split:
+            ]
+
+            if (
+                y_train.nunique() < 2
+                or y_cal.nunique() < 2
+            ):
+
+                return False
+
+            X_train_scaled = (
                 self.scaler.fit_transform(
-                    X
+                    X_train
+                )
+            )
+
+            X_cal_scaled = (
+                self.scaler.transform(
+                    X_cal
                 )
             )
 
             self.base_model.fit(
-                X_scaled,
-                y
+                X_train_scaled,
+                y_train
             )
 
-            # Calibration needs enough observations.
             self.ml_model = (
                 CalibratedClassifierCV(
                     self.base_model,
@@ -992,74 +1382,50 @@ class TenPaperResearchLab:
                 )
             )
 
-            # Use a separate calibration subset.
-            calibration_size = max(
-                20,
-                int(len(X_scaled) * 0.20)
+            self.ml_model.fit(
+                X_cal_scaled,
+                y_cal
             )
-
-            if (
-                len(X_scaled)
-                >= calibration_size + 30
-            ):
-
-                split = (
-                    len(X_scaled)
-                    - calibration_size
-                )
-
-                self.base_model.fit(
-                    X_scaled[:split],
-                    y.iloc[:split]
-                )
-
-                self.ml_model = (
-                    CalibratedClassifierCV(
-                        self.base_model,
-                        method="sigmoid",
-                        cv="prefit"
-                    )
-                )
-
-                self.ml_model.fit(
-                    X_scaled[split:],
-                    y.iloc[split:]
-                )
-
-            else:
-
-                self.ml_model = None
 
             self.is_model_trained = True
 
             return True
 
         except Exception:
+
             self.is_model_trained = False
             self.ml_model = None
+
             return False
 
-    # =========================================================
+    # ========================================================
     # ML PREDICTION
-    # =========================================================
+    # ========================================================
 
     def predict_ml(
         self,
-        feature_results
+        features
     ):
 
         if (
             not self.is_model_trained
             or self.ml_model is None
         ):
-            return 0.50, 0.0
+
+            return (
+                0.50,
+                0.0
+            )
 
         try:
 
             X = np.array(
                 [
-                    feature_results[key]
-                    for key in self.feature_names
+                    features[
+                        name
+                    ]
+                    for name in
+                    self.feature_names
                 ],
                 dtype=float
             ).reshape(
@@ -1068,10 +1434,7 @@ class TenPaperResearchLab:
             )
 
             X = np.nan_to_num(
-                X,
-                nan=0.0,
-                posinf=1.0,
-                neginf=-1.0
+                X
             )
 
             X_scaled = (
@@ -1080,139 +1443,600 @@ class TenPaperResearchLab:
                 )
             )
 
-            probability = (
+            probabilities = (
                 self.ml_model
                 .predict_proba(
                     X_scaled
                 )[0]
             )
 
-            classes = (
-                self.ml_model
-                .classes_
+            classes = list(
+                self.ml_model.classes_
             )
 
-            if 1 in classes:
+            if 1 not in classes:
 
-                idx = list(
-                    classes
-                ).index(1)
-
-                p_up = float(
-                    probability[idx]
+                return (
+                    0.50,
+                    0.0
                 )
 
-            else:
+            index = classes.index(
+                1
+            )
 
-                p_up = 0.50
+            probability_up = float(
+                probabilities[index]
+            )
 
             ml_score = (
-                p_up - 0.50
+                probability_up
+                - 0.50
             ) * 2.0
 
             return (
+
                 float(
                     np.clip(
-                        p_up,
-                        0.0,
-                        1.0
+                        probability_up,
+                        0,
+                        1
                     )
                 ),
-                self._clip(
+
+                self.clip(
                     ml_score
                 )
+
             )
 
         except Exception:
-            return 0.50, 0.0
 
-    # =========================================================
-    # SL / TP
-    # =========================================================
+            return (
+                0.50,
+                0.0
+            )
 
-    def calculate_fourier_sl_tp(
+    # ========================================================
+    # TRI LEVELS
+    # ========================================================
+
+    def get_tri_levels(
         self,
-        df,
-        current_price,
-        signal_intent
+        timeframes
     ):
 
-        current_price = self._safe_float(
-            current_price
+        result = {}
+
+        for timeframe in timeframes:
+
+            try:
+
+                result[timeframe] = (
+                    self.tri_engine
+                    .calculate_levels(
+                        timeframe
+                    )
+                )
+
+            except Exception:
+
+                result[timeframe] = None
+
+        return result
+
+    # ========================================================
+    # ALL LINES
+    # ========================================================
+
+    def get_line_prices(
+        self,
+        levels
+    ):
+
+        prices = []
+
+        for timeframe, data in (
+            levels.items()
+        ):
+
+            if data is None:
+                continue
+
+            prices.extend(
+                [
+                    float(data.body_50),
+                    float(data.upper_50),
+                    float(data.lower_50),
+                ]
+            )
+
+        return sorted(
+            set(
+                p for p in prices
+                if p > 0
+            )
         )
 
-        if current_price <= 0:
-            return 0.0, 0.0
+    # ========================================================
+    # LINE TOUCH
+    # ========================================================
+
+    def line_touch(
+        self,
+        price,
+        line
+    ):
+
+        if line <= 0:
+            return False
+
+        distance = (
+            abs(
+                price - line
+            )
+            /
+            line
+        )
+
+        return (
+            distance
+            <= self.tri_touch_tolerance
+        )
+
+    # ========================================================
+    # NEXT TRI LINE
+    # ========================================================
+
+    def next_tri_line(
+        self,
+        price,
+        direction,
+        levels
+    ):
+
+        lines = self.get_line_prices(
+            levels
+        )
+
+        if direction == "LONG":
+
+            higher = [
+                x for x in lines
+                if x > price
+            ]
+
+            if higher:
+                return min(
+                    higher
+                )
+
+        elif direction == "SHORT":
+
+            lower = [
+                x for x in lines
+                if x < price
+            ]
+
+            if lower:
+                return max(
+                    lower
+                )
+
+        return None
+
+    # ========================================================
+    # TRADE MODE TRI SETUP
+    # ========================================================
+
+    def calculate_tri_setup(
+        self,
+        trade_mode,
+        current_price,
+        confirmation_score,
+        ml_probability,
+        df
+    ):
+
+        result = {
+
+            "trade_mode":
+                trade_mode,
+
+            "tri_signal":
+                "NEUTRAL",
+
+            "tri_touched":
+                False,
+
+            "tri_timeframe":
+                None,
+
+            "tri_line":
+                None,
+
+            "next_tri_target":
+                None,
+
+            "tri_stop_loss":
+                None,
+
+            "tri_rr":
+                0.0,
+
+            "tri_reason":
+                "NO_SETUP",
+
+        }
+
+        if trade_mode not in (
+            self.trade_modes
+        ):
+
+            return result
+
+        reference_timeframes = (
+            self.trade_modes[
+                trade_mode
+            ]["reference"]
+        )
+
+        levels = self.get_tri_levels(
+            reference_timeframes
+        )
+
+        # ----------------------------------------------------
+        # FIND NEAREST REFERENCE LINE
+        # ----------------------------------------------------
+
+        closest = None
+        closest_distance = float(
+            "inf"
+        )
+
+        for timeframe, data in (
+            levels.items()
+        ):
+
+            if data is None:
+                continue
+
+            line_map = {
+
+                "BODY_50":
+                    data.body_50,
+
+                "UPPER_50":
+                    data.upper_50,
+
+                "LOWER_50":
+                    data.lower_50,
+
+            }
+
+            for line_name, line_price in (
+                line_map.items()
+            ):
+
+                if line_price <= 0:
+                    continue
+
+                distance = (
+                    abs(
+                        current_price
+                        - line_price
+                    )
+                    /
+                    line_price
+                )
+
+                if distance < closest_distance:
+
+                    closest_distance = distance
+
+                    closest = (
+                        timeframe,
+                        line_name,
+                        line_price
+                    )
+
+        if closest is None:
+
+            result[
+                "tri_reason"
+            ] = "NO_REFERENCE_LINE"
+
+            return result
+
+        timeframe, line_name, line_price = (
+            closest
+        )
+
+        # ----------------------------------------------------
+        # MUST TOUCH REFERENCE LINE
+        # ----------------------------------------------------
+
+        if not self.line_touch(
+            current_price,
+            line_price
+        ):
+
+            result[
+                "tri_reason"
+            ] = (
+                "WAITING_FOR_"
+                + timeframe
+                + "_LINE"
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # CONFIRMATION
+        # ----------------------------------------------------
+
+        if (
+            confirmation_score >= 0.25
+            and ml_probability >= 0.55
+        ):
+
+            direction = "LONG"
+
+        elif (
+            confirmation_score <= -0.25
+            and ml_probability <= 0.45
+        ):
+
+            direction = "SHORT"
+
+        else:
+
+            result[
+                "tri_reason"
+            ] = "CONFIRMATION_FAILED"
+
+            return result
+
+        # ----------------------------------------------------
+        # NEXT TRI TARGET
+        # ----------------------------------------------------
+
+        target = self.next_tri_line(
+            current_price,
+            direction,
+            levels
+        )
+
+        if target is None:
+
+            result[
+                "tri_reason"
+            ] = "NO_NEXT_TRI_LINE"
+
+            return result
+
+        # ----------------------------------------------------
+        # ATR STOP
+        # ----------------------------------------------------
 
         atr = max(
-            self._calculate_atr(
+            self.calculate_atr(
                 df,
                 14
             ),
-            current_price * 0.0005
+            current_price
+            * 0.0005
         )
 
-        # Hard maximum risk = 0.6%
-        max_risk = (
-            current_price * 0.006
-        )
+        if direction == "LONG":
 
-        # Base risk around ATR.
-        risk_distance = min(
-            max(
-                atr,
-                current_price * 0.0005
-            ),
-            max_risk
-        )
-
-        if signal_intent == "LONG":
-
-            sl = (
+            stop = (
                 current_price
-                - risk_distance
+                - atr
             )
 
-            tp = (
-                current_price
-                + 2.0
-                * risk_distance
+            reward = (
+                target
+                - current_price
             )
 
-        elif signal_intent == "SHORT":
-
-            sl = (
+            risk = (
                 current_price
-                + risk_distance
-            )
-
-            tp = (
-                current_price
-                - 2.0
-                * risk_distance
+                - stop
             )
 
         else:
 
-            sl = (
+            stop = (
                 current_price
-                - risk_distance
+                + atr
             )
 
-            tp = (
+            reward = (
                 current_price
-                + 2.0
-                * risk_distance
+                - target
+            )
+
+            risk = (
+                stop
+                - current_price
+            )
+
+        if risk <= 0:
+            return result
+
+        rr = reward / risk
+
+        # Minimum 1:2
+        if rr < 2.0:
+
+            result[
+                "tri_reason"
+            ] = "RR_BELOW_1_TO_2"
+
+            return result
+
+        result.update({
+
+            "tri_signal":
+                direction,
+
+            "tri_touched":
+                True,
+
+            "tri_timeframe":
+                timeframe,
+
+            "tri_line":
+                float(line_price),
+
+            "next_tri_target":
+                float(target),
+
+            "tri_stop_loss":
+                float(stop),
+
+            "tri_rr":
+                float(rr),
+
+            "tri_reason":
+                (
+                    "TRI_LINE_TOUCH_"
+                    "CONFIRMED"
+                ),
+
+        })
+
+        return result
+
+    # ========================================================
+    # SL / TP
+    # ========================================================
+
+    def calculate_sl_tp(
+        self,
+        df,
+        current_price,
+        direction,
+        tri_setup
+    ):
+
+        atr = max(
+            self.calculate_atr(
+                df,
+                14
+            ),
+            current_price
+            * 0.0005
+        )
+
+        max_risk = (
+            current_price
+            * 0.006
+        )
+
+        risk = min(
+            atr,
+            max_risk
+        )
+
+        # TRI target first
+        if (
+            tri_setup
+            and tri_setup.get(
+                "tri_signal"
+            ) == direction
+            and tri_setup.get(
+                "next_tri_target"
+            ) is not None
+        ):
+
+            stop = tri_setup[
+                "tri_stop_loss"
+            ]
+
+            target = tri_setup[
+                "next_tri_target"
+            ]
+
+            if direction == "LONG":
+
+                stop = max(
+                    stop,
+                    current_price
+                    - max_risk
+                )
+
+            elif direction == "SHORT":
+
+                stop = min(
+                    stop,
+                    current_price
+                    + max_risk
+                )
+
+            return (
+                round(
+                    float(stop),
+                    4
+                ),
+                round(
+                    float(target),
+                    4
+                )
+            )
+
+        # ATR fallback
+        if direction == "LONG":
+
+            stop = (
+                current_price
+                - risk
+            )
+
+            target = (
+                current_price
+                + 2.0 * risk
+            )
+
+        elif direction == "SHORT":
+
+            stop = (
+                current_price
+                + risk
+            )
+
+            target = (
+                current_price
+                - 2.0 * risk
+            )
+
+        else:
+
+            stop = (
+                current_price
+                - risk
+            )
+
+            target = (
+                current_price
+                + 2.0 * risk
             )
 
         return (
-            round(float(sl), 4),
-            round(float(tp), 4)
+            round(
+                float(stop),
+                4
+            ),
+            round(
+                float(target),
+                4
+            )
         )
 
-    # =========================================================
-    # FINAL SIGNAL
-    # =========================================================
+    # ========================================================
+    # FINAL SIGNAL ENGINE
+    # ========================================================
 
     def calculate_all_signals(
         self,
@@ -1221,120 +2045,199 @@ class TenPaperResearchLab:
         asks,
         current_inventory=0,
         performance_history=None,
-        trades=None
+        trades=None,
+        trade_mode="15M"
     ):
 
-        # -----------------------------------------------------
-        # FEATURES
-        # -----------------------------------------------------
+        trade_mode = str(
+            trade_mode
+        ).upper()
 
-        results = self.extract_features(
-            df=df,
-            bids=bids,
-            asks=asks,
-            trades=trades,
-            performance_history=performance_history
+        if trade_mode not in (
+            self.trade_modes
+        ):
+
+            trade_mode = "15M"
+
+        # ----------------------------------------------------
+        # FEATURES
+        # ----------------------------------------------------
+
+        features = (
+            self.extract_features(
+                df,
+                bids,
+                asks,
+                trades,
+                performance_history
+            )
         )
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # QUANT SCORE
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
-        feature_vector = np.array(
+        vector = np.array(
             [
-                results[key]
-                for key in self.feature_names
+                features[name]
+                for name in
+                self.feature_names
             ],
             dtype=float
         )
 
-        weight_vector = np.array(
+        weights = np.array(
             [
-                self.dynamic_weights[key]
-                for key in self.feature_names
+                self.dynamic_weights[name]
+                for name in
+                self.feature_names
             ],
             dtype=float
         )
 
         quant_score = float(
             np.dot(
-                feature_vector,
-                weight_vector
+                vector,
+                weights
             )
         )
 
-        quant_score = self._clip(
+        quant_score = self.clip(
             quant_score
         )
 
-        # -----------------------------------------------------
-        # ML SCORE
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # ML
+        # ----------------------------------------------------
 
-        ml_probability, ml_score = (
-            self.predict_ml(
-                results
-            )
+        (
+            ml_probability,
+            ml_score
+        ) = self.predict_ml(
+            features
         )
 
-        # -----------------------------------------------------
-        # FINAL SCORE
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # FINAL QUANT + ML
+        # ----------------------------------------------------
 
         if self.is_model_trained:
 
             final_score = (
+
                 self.quant_weight
                 * quant_score
+
                 +
+
                 self.ml_weight
                 * ml_score
+
             )
 
         else:
 
-            # No trained ML model:
-            # don't pretend ML is working.
-            final_score = quant_score
+            final_score = (
+                quant_score
+            )
 
-        final_score = self._clip(
+        final_score = self.clip(
             final_score
         )
 
-        # -----------------------------------------------------
-        # SIGNAL
-        # -----------------------------------------------------
-
-        current_intent = "NEUTRAL"
+        # ----------------------------------------------------
+        # BASIC DIRECTION
+        # ----------------------------------------------------
 
         if (
             final_score
             >= self.long_threshold
         ):
 
-            current_intent = "LONG"
+            intent = "LONG"
 
         elif (
             final_score
             <= self.short_threshold
         ):
 
-            current_intent = "SHORT"
+            intent = "SHORT"
 
-        # -----------------------------------------------------
-        # HYSTERESIS / COOLDOWN
-        # -----------------------------------------------------
+        else:
+
+            intent = "NEUTRAL"
+
+        # ----------------------------------------------------
+        # CURRENT PRICE
+        # ----------------------------------------------------
+
+        current_price = 0.0
 
         if (
-            current_intent
-            != self.last_signal
+            df is not None
+            and not df.empty
         ):
+
+            current_price = (
+                self.safe_float(
+                    df["Close"].iloc[-1]
+                )
+            )
+
+        # ----------------------------------------------------
+        # TRI SETUP
+        # ----------------------------------------------------
+
+        tri_setup = (
+            self.calculate_tri_setup(
+                trade_mode,
+                current_price,
+                quant_score,
+                ml_probability,
+                df
+            )
+        )
+
+        # ----------------------------------------------------
+        # TRI CONFIRMATION
+        # ----------------------------------------------------
+
+        if (
+            tri_setup[
+                "tri_signal"
+            ] in [
+                "LONG",
+                "SHORT"
+            ]
+        ):
+
+            tri_direction = (
+                tri_setup[
+                    "tri_signal"
+                ]
+            )
+
+            if intent == "NEUTRAL":
+
+                intent = (
+                    tri_direction
+                )
+
+            elif intent != tri_direction:
+
+                intent = "NEUTRAL"
+
+        # ----------------------------------------------------
+        # HYSTERESIS
+        # ----------------------------------------------------
+
+        if intent != self.last_signal:
 
             if self.cooldown_counter > 0:
 
                 self.cooldown_counter -= 1
 
-                current_intent = (
+                intent = (
                     self.last_signal
                 )
 
@@ -1343,70 +2246,115 @@ class TenPaperResearchLab:
                 self.cooldown_counter = 3
 
                 self.last_signal = (
-                    current_intent
+                    intent
                 )
 
         else:
 
             self.cooldown_counter = 3
 
-        # -----------------------------------------------------
-        # PRICE
-        # -----------------------------------------------------
-
-        if (
-            df is not None
-            and not df.empty
-            and "Close" in df.columns
-        ):
-
-            current_price = (
-                self._safe_float(
-                    df["Close"].iloc[-1]
-                )
-            )
-
-        else:
-
-            current_price = 0.0
-
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # SL / TP
-        # -----------------------------------------------------
+        # ----------------------------------------------------
 
         stop_loss, take_profit = (
-            self.calculate_fourier_sl_tp(
+            self.calculate_sl_tp(
                 df,
                 current_price,
-                current_intent
+                intent,
+                tri_setup
             )
         )
 
-        # -----------------------------------------------------
-        # PAYLOAD
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------
 
-        signal_payload = {
-            "intent": current_intent,
-            "score": final_score,
-            "quant_score": quant_score,
-            "ml_probability": ml_probability,
-            "ml_score": ml_score,
-            "ml_trained": self.is_model_trained,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit
+        payload = {
+
+            "intent":
+                intent,
+
+            "score":
+                final_score,
+
+            "quant_score":
+                quant_score,
+
+            "ml_probability":
+                ml_probability,
+
+            "ml_score":
+                ml_score,
+
+            "ml_trained":
+                self.is_model_trained,
+
+            "current_price":
+                current_price,
+
+            "stop_loss":
+                stop_loss,
+
+            "take_profit":
+                take_profit,
+
+            "trade_mode":
+                trade_mode,
+
+            # TRI
+            "tri_signal":
+                tri_setup[
+                    "tri_signal"
+                ],
+
+            "tri_touched":
+                tri_setup[
+                    "tri_touched"
+                ],
+
+            "tri_timeframe":
+                tri_setup[
+                    "tri_timeframe"
+                ],
+
+            "tri_line":
+                tri_setup[
+                    "tri_line"
+                ],
+
+            "next_tri_target":
+                tri_setup[
+                    "next_tri_target"
+                ],
+
+            "tri_stop_loss":
+                tri_setup[
+                    "tri_stop_loss"
+                ],
+
+            "tri_rr":
+                tri_setup[
+                    "tri_rr"
+                ],
+
+            "tri_reason":
+                tri_setup[
+                    "tri_reason"
+                ],
+
         }
 
         return (
-            results,
-            signal_payload,
+            features,
+            payload,
             self.dynamic_weights
         )
 
 
-# =============================================================
+# ============================================================
 # POWER TRADING RISK ENGINE
-# =============================================================
+# ============================================================
 
 class PowerTradingRiskEngine:
 
@@ -1414,7 +2362,7 @@ class PowerTradingRiskEngine:
         pass
 
     @staticmethod
-    def _safe_float(
+    def safe_float(
         value,
         default=0.0
     ):
@@ -1457,57 +2405,57 @@ class PowerTradingRiskEngine:
         )
 
         displayed_vol = max(
-            self._safe_float(
+            self.safe_float(
                 displayed_vol
             ),
             0.0
         )
 
         cancelled_vol = max(
-            self._safe_float(
+            self.safe_float(
                 cancelled_vol
             ),
             0.0
         )
 
         time_exists = max(
-            self._safe_float(
+            self.safe_float(
                 time_exists
             ),
             0.0
         )
 
         obs_window = max(
-            self._safe_float(
+            self.safe_float(
                 obs_window
             ),
             1e-8
         )
 
         open_interest = max(
-            self._safe_float(
+            self.safe_float(
                 open_interest
             ),
             0.0
         )
 
         leverage = max(
-            self._safe_float(
+            self.safe_float(
                 leverage
             ),
             0.0
         )
 
         volatility = max(
-            self._safe_float(
+            self.safe_float(
                 volatility
             ),
             0.0
         )
 
-        # =====================================================
+        # ----------------------------------------------------
         # LIQUIDATION
-        # =====================================================
+        # ----------------------------------------------------
 
         if len(
             liquidation_volumes
@@ -1542,14 +2490,14 @@ class PowerTradingRiskEngine:
         ltz_score = float(
             np.clip(
                 ltz_score,
-                0.0,
-                100.0
+                0,
+                100
             )
         )
 
-        # =====================================================
+        # ----------------------------------------------------
         # SPOOF
-        # =====================================================
+        # ----------------------------------------------------
 
         spoof_ratio = (
             cancelled_vol
@@ -1564,27 +2512,30 @@ class PowerTradingRiskEngine:
             time_exists
             /
             obs_window,
-            0.0,
-            1.0
+            0,
+            1
         )
 
         spoof_score = (
             spoof_ratio
-            * (1.0 - persistence)
+            * (
+                1
+                - persistence
+            )
             * 100.0
         )
 
         spoof_score = float(
             np.clip(
                 spoof_score,
-                0.0,
-                100.0
+                0,
+                100
             )
         )
 
-        # =====================================================
+        # ----------------------------------------------------
         # SQUEEZE
-        # =====================================================
+        # ----------------------------------------------------
 
         liquidation_intensity = (
             total_ltz
@@ -1598,14 +2549,14 @@ class PowerTradingRiskEngine:
 
         leverage_factor = np.clip(
             leverage / 20.0,
-            0.0,
-            5.0
+            0,
+            5
         )
 
         volatility_factor = np.clip(
             volatility,
-            0.0,
-            1.0
+            0,
+            1
         )
 
         squeeze_risk = (
@@ -1618,32 +2569,115 @@ class PowerTradingRiskEngine:
         squeeze_risk = float(
             np.clip(
                 squeeze_risk,
-                0.0,
-                100.0
+                0,
+                100
             )
         )
 
-        # =====================================================
-        # FINAL MARKET RISK
-        # =====================================================
+        # ----------------------------------------------------
+        # FINAL RISK
+        # ----------------------------------------------------
 
         market_risk = (
-            0.40 * ltz_score
-            + 0.25 * spoof_score
-            + 0.35 * squeeze_risk
+
+            0.40
+            * ltz_score
+
+            +
+
+            0.25
+            * spoof_score
+
+            +
+
+            0.35
+            * squeeze_risk
+
         )
 
         market_risk = float(
             np.clip(
                 market_risk,
-                0.0,
-                100.0
+                0,
+                100
             )
         )
 
         return {
-            "LTZ_Score": ltz_score,
-            "Spoof_Score": spoof_score,
-            "Squeeze_Risk": squeeze_risk,
-            "Market_Risk": market_risk,
+
+            "LTZ_Score":
+                ltz_score,
+
+            "Spoof_Score":
+                spoof_score,
+
+            "Squeeze_Risk":
+                squeeze_risk,
+
+            "Market_Risk":
+                market_risk,
+
         }
+
+
+# ============================================================
+# SIMPLE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    tri_engine = TRILineEngine(
+        symbol="BTCUSDT"
+    )
+
+    research_lab = (
+        TenPaperResearchLab(
+            tri_engine=tri_engine
+        )
+    )
+
+    risk_engine = (
+        PowerTradingRiskEngine()
+    )
+
+    print("=" * 70)
+    print("RESEARCH LAB INITIALIZED")
+    print("=" * 70)
+
+    print()
+    print("Features:")
+
+    for feature in (
+        research_lab.feature_names
+    ):
+
+        print(
+            " -",
+            feature
+        )
+
+    print()
+    print("TRI TRADE MODES:")
+
+    print(
+        "15M -> 1H + 4H"
+    )
+
+    print(
+        "1H  -> DAILY + WEEKLY"
+    )
+
+    print(
+        "4H  -> WEEKLY + MONTHLY"
+    )
+
+    print()
+    print(
+        "ML trained:",
+        research_lab.is_model_trained
+    )
+
+    print()
+    print(
+        "System ready."
+    )
