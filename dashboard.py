@@ -1,879 +1,515 @@
-import datetime
-import os
-import pickle
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
 import time
+
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
-from streamlit_autorefresh import st_autorefresh
 
-# ==========================================
-# 2. STREAMLIT CONFIG & PERSISTENT CSV SETUP
-# ==========================================
-st.set_page_config(
-    page_title="Quantitative Research & Paper Trading Terminal",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ============================================================
+# ZIA RESEARCH TERMINAL — consolidated build
+# Merges dashboard_v6 (silent 1s live engine) with the visual
+# polish of v3/v5, and adds a new Multi-Market Scanner tab that
+# ranks every tracked symbol by live signal strength at once.
+# ============================================================
 
-count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
+st.set_page_config(page_title="ZIA Research Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 
-CSV_FILE = "signal_history.csv"
-MODEL_PATH = "xgboost_obi_model.pkl"
+ROOT = Path(__file__).resolve().parent
+MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
+SIGNAL_FILE = ROOT / "saved_signals.csv"
+TRADE_FILE = ROOT / "trade_history.csv"
+
+FUTURES = ["https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
+SPOT = ["https://api.binance.com", "https://api1.binance.com"]
+DATA = ["https://data-api.binance.vision"]
+
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+           "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "TRXUSDT", "LTCUSDT"]
+TFS = {"1MO": "1M", "1W": "1w", "1D": "1d", "4H": "4h", "1H": "1h",
+       "30M": "30m", "15M": "15m", "5M": "5m", "3M": "3m", "1M": "1m"}
+
+# ------------------------------------------------------------
+# STYLE — dark quant-terminal theme, violet/green/red signal accents
+# ------------------------------------------------------------
+st.markdown("""
+<style>
+:root{--bg:#05070b;--panel:#0b1119;--panel2:#101925;--line:#1d2a39;--txt:#edf3fb;--muted:#7f8da1;
+--green:#42dda0;--red:#ff7184;--amber:#f3c86a;--cyan:#65d7ff;--violet:#969eff}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg);color:var(--txt)}
+[data-testid="stHeader"]{background:transparent}
+.block-container{max-width:1920px;padding:10px clamp(8px,1.5vw,30px) 32px}
+.hero{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding:4px 2px 12px;margin-bottom:10px}
+.brand{font-size:clamp(25px,2.7vw,42px);font-weight:950;letter-spacing:-2px}.brand b{color:var(--violet)}
+.micro{color:var(--muted);font-size:9px;letter-spacing:1.5px}
+.live{border:1px solid #245d45;background:#071810;color:#6ce3a5;border-radius:999px;padding:7px 12px;font-size:10px;font-weight:900}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green);margin-right:6px}
+.panel{background:linear-gradient(145deg,#0e151f,#080d14);border:1px solid var(--line);border-radius:15px;padding:14px;margin-bottom:10px}
+.card{background:linear-gradient(145deg,#111a26,#0a1018);border:1px solid var(--line);border-radius:14px;padding:11px;min-height:76px}
+.label{font-size:9px;color:var(--muted);font-weight:900;letter-spacing:1.1px}
+.value{font-size:19px;font-weight:950;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{font-size:10px;color:#8794a8;margin-top:3px}
+.good{color:var(--green)}.bad{color:var(--red)}.amber{color:var(--amber)}.violet{color:var(--violet)}.cyan{color:var(--cyan)}
+.signalbox{border-radius:18px;padding:16px 20px;border:1px solid var(--line);background:linear-gradient(145deg,#111a26,#080d14);text-align:center;margin-bottom:10px}
+.signal-long{border-color:#277b59;box-shadow:0 0 28px rgba(66,221,160,.08)}
+.signal-short{border-color:#843a4a;box-shadow:0 0 28px rgba(255,113,132,.08)}
+.signal-wait{border-color:#705e30}
+.signal-main{font-size:clamp(34px,4vw,58px);font-weight:1000;letter-spacing:-2px;line-height:1}
+.signal-meta{font-size:10px;color:var(--muted);margin-top:7px;letter-spacing:1px}
+.tri-strip{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 9px}
+.tri-chip{border:1px solid var(--line);background:#0a1119;border-radius:9px;padding:6px 9px;font-size:9px;font-weight:900;letter-spacing:.5px}
+.tri-chip span{color:var(--cyan)}
+.section-title{font-size:16px;font-weight:950;letter-spacing:-.2px;margin:12px 0 6px}
+.section-sub{font-size:10px;color:var(--muted);margin-bottom:9px}
+.scan-row{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:9px 4px;font-size:12.5px}
+.scan-row:last-child{border-bottom:none}
+.pill{border-radius:999px;padding:3px 10px;font-size:10px;font-weight:900;letter-spacing:.4px}
+.pill-long{background:#0c2018;color:var(--green);border:1px solid #1f5c42}
+.pill-short{background:#26101a;color:var(--red);border:1px solid #6e2c3b}
+.pill-wait{background:#22190a;color:var(--amber);border:1px solid #6b551f}
+.stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:900}
+div[data-testid="stTabs"] button{font-weight:900;font-size:11px}
+[data-testid="stSelectbox"] label{font-size:9px;font-weight:900;letter-spacing:1px;color:var(--muted)}
+@media(max-width:700px){
+  .block-container{padding:6px 7px 22px}.brand{font-size:21px}.micro{font-size:7px}
+  .live{font-size:8px;padding:5px 8px}.panel{padding:9px;border-radius:12px}
+  .card{min-height:62px;padding:9px}.value{font-size:16px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# DATA HELPERS
+# ------------------------------------------------------------
+
+def num(x, default=0.0):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
 
 
-def load_persistent_history():
-    if os.path.exists(CSV_FILE):
+def api(hosts, path, params):
+    err = "network"
+    for host in hosts:
         try:
-            df_hist = pd.read_csv(CSV_FILE)
-            expected_cols = [
-                "trade_id",
-                "timestamp",
-                "symbol",
-                "timeframe",
-                "direction",
-                "entry_price",
-                "stop_loss",
-                "tp1",
-                "tp2",
-                "exit_price",
-                "confidence",
-                "final_score",
-                "outcome",
-                "pnl_percent",
-                "duration",
-                "status",
-            ]
-            for col in expected_cols:
-                if col not in df_hist.columns:
-                    df_hist[col] = "PENDING" if col == "outcome" else 0.0
-            return df_hist.to_dict("records")
+            r = requests.get(host + path, params=params, timeout=2.2, headers={"User-Agent": "ZIA-Research"})
+            if r.ok:
+                return r.json(), host, "OK"
+            err = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            err = type(e).__name__
+    return None, None, err
+
+
+@st.cache_data(ttl=1.0, show_spinner=False)
+def candles(symbol, interval, limit=650):
+    raw, host, status = api(FUTURES, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1500)})
+    source = "Futures"
+    if not isinstance(raw, list):
+        raw, host, status = api(SPOT, "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)})
+        source = "Spot"
+    if not isinstance(raw, list):
+        raw, host, status = api(DATA, "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)})
+        source = "Data API"
+    rows = []
+    for c in raw or []:
+        try:
+            rows.append([pd.to_datetime(int(c[0]), unit="ms", utc=True), num(c[1]), num(c[2]), num(c[3]), num(c[4]), num(c[5]), num(c[9])])
         except Exception:
-            return []
+            pass
+    return pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume", "TakerBuy"]), source, status, host
+
+
+@st.cache_data(ttl=1.0, show_spinner=False)
+def orderbook(symbol):
+    raw, host, status = api(FUTURES, "/fapi/v1/depth", {"symbol": symbol, "limit": 100})
+    source = "Futures"
+    if not isinstance(raw, dict) or not raw.get("bids"):
+        raw, host, status = api(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 100})
+        source = "Spot"
+    if not isinstance(raw, dict) or not raw.get("bids"):
+        raw, host, status = api(DATA, "/api/v3/depth", {"symbol": symbol, "limit": 100})
+        source = "Data API"
+    try:
+        return np.asarray(raw.get("bids", []), float), np.asarray(raw.get("asks", []), float), source, status, host
+    except Exception:
+        return np.empty((0, 2)), np.empty((0, 2)), source, status, host
+
+
+def obi(bids, asks, k):
+    if len(bids) == 0 or len(asks) == 0:
+        return 0., 0., 0.
+    k = min(k, len(bids), len(asks))
+    bv = float(bids[:k, 1].sum())
+    av = float(asks[:k, 1].sum())
+    return ((bv - av) / (bv + av) if bv + av else 0.), bv, av
+
+
+def features(df, b, a):
+    f = {k: 0. for k in ["top20_bid_sum", "top20_ask_sum", "obi_5", "obi_10", "obi_20", "obi_50", "spread",
+                          "spread_pct", "bid_ask_ratio_20", "bid_ask_ratio_50", "top20_total_depth",
+                          "top50_total_depth", "taker_buy_volume", "taker_sell_volume", "taker_flow",
+                          "taker_flow_ratio", "price_return", "price_change", "sma_distance",
+                          "realized_volatility", "BOOK_IMB", "QUANT_IMPLY", "ADAPT_CONF", "BAYESIAN", "FOURIER_TREND"]}
+    (o5, b5, a5), (o10, b10, a10), (o20, b20, a20), (o50, b50, a50) = [obi(b, a, k) for k in (5, 10, 20, 50)]
+    f.update(top20_bid_sum=b20, top20_ask_sum=a20, obi_5=o5, obi_10=o10, obi_20=o20, obi_50=o50,
+              top20_total_depth=b20 + a20, top50_total_depth=b50 + a50)
+    if df.empty:
+        return f
+    c = df.Close
+    last = num(c.iloc[-1])
+    prev = num(c.iloc[-2] if len(c) > 1 else last)
+    sma = num(c.rolling(20).mean().iloc[-1], last)
+    total = num(df.Volume.tail(20).sum())
+    buy = num(df.TakerBuy.tail(20).sum())
+    sell = max(total - buy, 0)
+    flow = buy - sell
+    spread = num(a[0, 0] - b[0, 0]) if len(a) and len(b) else 0
+    trend = np.tanh((last / sma - 1) * 100) if sma else 0
+    rv = num(c.pct_change().tail(30).std())
+    four = np.tanh(c.pct_change().tail(16).mean() * 1000)
+    f.update(spread=spread, spread_pct=spread / last if last else 0,
+              bid_ask_ratio_20=b20 / a20 if a20 else 1, bid_ask_ratio_50=b50 / a50 if a50 else 1,
+              taker_buy_volume=buy, taker_sell_volume=sell, taker_flow=flow,
+              taker_flow_ratio=flow / total if total else 0, price_return=last / prev - 1 if prev else 0,
+              price_change=last - prev, sma_distance=last / sma - 1 if sma else 0, realized_volatility=rv,
+              BOOK_IMB=o20, QUANT_IMPLY=float(np.tanh((o20 + o50 + trend) / 3)),
+              ADAPT_CONF=float(np.clip(.5 + (abs(o20) + abs(trend)) / 2, 0, 1)),
+              BAYESIAN=float(np.clip(.5 + (o20 + trend) / 4, 0, 1)), FOURIER_TREND=float(four))
+    return f
+
+
+@st.cache_resource(show_spinner=False)
+def load_model():
+    try:
+        return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
+    except Exception:
+        return None
+
+
+def ml_predict(f):
+    m = load_model()
+    if m is None:
+        return None, None, "MODEL NOT FOUND", 0
+    try:
+        names = list(m.get_booster().feature_names or []) if hasattr(m, "get_booster") else []
+        count = int(getattr(m, "n_features_in_", len(names) or 25))
+        legacy = ["top20_bid_sum", "top20_ask_sum", "obi_top20", "spread", "bid_ask_ratio", "total_depth", "trend_signal"]
+        cols = names if names else (legacy if count == 7 else list(f.keys()))
+        row = dict(f, obi_top20=f["obi_20"], bid_ask_ratio=f["bid_ask_ratio_20"],
+                   total_depth=f["top20_total_depth"], trend_signal=f["sma_distance"])
+        x = pd.DataFrame([[row.get(c, 0.) for c in cols]], columns=cols)
+        pred = int(m.predict(x)[0])
+        proba = float(m.predict_proba(x)[0][-1]) if hasattr(m, "predict_proba") else None
+        return pred, proba, "OK", len(cols)
+    except Exception as e:
+        return None, None, "ML ERROR: " + type(e).__name__, 0
+
+
+def research(f):
+    scores = {
+        "OBI 20": np.clip(f["obi_20"] * 2, -1, 1),
+        "OBI 20+50": np.clip((f["obi_20"] + f["obi_50"]) / 1.5, -1, 1),
+        "OFI / Taker": np.clip(f["taker_flow_ratio"] * 2, -1, 1),
+        "Trend / SMA": np.clip(np.tanh(f["sma_distance"] * 100), -1, 1),
+        "Fourier": np.clip(f["FOURIER_TREND"], -1, 1),
+        "Bayesian": np.clip((f["BAYESIAN"] - .5) * 2, -1, 1),
+        "Quant Imply": np.clip(f["QUANT_IMPLY"], -1, 1),
+        "Adaptive": np.clip((f["ADAPT_CONF"] - .5) * 2, -1, 1),
+    }
+    weights = {"OBI 20": .22, "OBI 20+50": .14, "OFI / Taker": .20, "Trend / SMA": .14,
+               "Fourier": .10, "Bayesian": .08, "Quant Imply": .07, "Adaptive": .05}
+    return scores, weights, float(sum(scores[k] * weights[k] for k in scores))
+
+
+def final_state(f, p, pr, threshold=0.45):
+    scores, weights, rscore = research(f)
+    mlscore = (pr - .5) * 2 if pr is not None else (1 if p == 1 else -1 if p == 0 else 0)
+    combined = .6 * rscore + .4 * mlscore if p is not None else rscore
+    signal = "LONG" if combined >= threshold else "SHORT" if combined <= -threshold else "WAIT"
+    confidence = float(np.clip(50 + abs(combined) * 49, 1, 99))
+    return signal, confidence, combined, scores, weights, rscore, mlscore
+
+
+def visible_tri_timeframes(tf):
+    if tf in ("1M", "3M", "5M", "15M", "30M"):
+        return [("1H", "1 HOUR"), ("4H", "4 HOUR")]
+    if tf in ("1H", "4H"):
+        return [("1D", "DAILY"), ("1W", "WEEKLY")]
+    if tf == "1D":
+        return [("1W", "WEEKLY"), ("1MO", "MONTHLY")]
+    if tf == "1W":
+        return [("1MO", "MONTHLY")]
     return []
 
 
-def save_persistent_history(history_list):
+@st.cache_data(ttl=20, show_spinner=False)
+def tri_levels(symbol, interval):
+    df, _, _, _ = candles(symbol, interval, 8)
+    if len(df) < 2:
+        return None
+    c = df.iloc[-2]
+    o, h, l, cl = map(num, [c.Open, c.High, c.Low, c.Close])
+    bh, bl = max(o, cl), min(o, cl)
+    return {"body": (bh + bl) / 2, "upper": (h + bh) / 2, "lower": (l + bl) / 2}
+
+
+def make_chart(df, symbol, tf, future):
+    fig = go.Figure()
+    if df.empty:
+        return fig
+    view = df.tail(650).copy()
+    fig.add_trace(go.Candlestick(x=view.Time, open=view.Open, high=view.High, low=view.Low, close=view.Close,
+                                  name="PRICE", increasing_line_color="#42dda0", increasing_fillcolor="#176d4f",
+                                  decreasing_line_color="#ff7184", decreasing_fillcolor="#8e3448"))
+    for span in (10, 20, 50, 200):
+        if len(view) >= span:
+            fig.add_trace(go.Scatter(x=view.Time, y=view.Close.ewm(span=span, adjust=False).mean(),
+                                      mode="lines", name=f"EMA {span}", line={"width": 1.05}))
+    line_colors = {"1MO": "#b29cff", "1W": "#8e98ff", "1D": "#65d7ff", "1H": "#42dda0", "4H": "#f3c86a"}
+    for label, _ in visible_tri_timeframes(tf):
+        lv = tri_levels(symbol, TFS[label])
+        if not lv:
+            continue
+        col = line_colors[label]
+        for kind, key, dash, width, pos in [("BODY 50", "body", "solid", 1.9, "top right"),
+                                             ("UPPER 50", "upper", "dot", 1.05, "top left"),
+                                             ("LOWER 50", "lower", "dot", 1.05, "bottom left")]:
+            fig.add_hline(y=lv[key], line_color=col, line_width=width, line_dash=dash,
+                          annotation_text=f"TRI {label} • {kind}", annotation_position=pos, annotation_font_size=9)
+    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)
+    fig.update_xaxes(range=[view.Time.iloc[0], view.Time.iloc[-1] + step * future], rangeslider_visible=False,
+                     showgrid=True, gridcolor="#172230", showspikes=True, spikemode="across", fixedrange=False)
+    fig.update_yaxes(side="right", showgrid=True, gridcolor="#172230", fixedrange=False, automargin=True)
+    fig.update_layout(height=680, margin=dict(l=4, r=4, t=12, b=8), paper_bgcolor="#080d14", plot_bgcolor="#080d14",
+                      font=dict(color="#cbd5e1"), hovermode="x unified", dragmode="pan",
+                      uirevision=f"ZIA-{symbol}-{tf}", legend=dict(orientation="h", y=1.02, x=0),
+                      hoverlabel=dict(font_size=11))
+    return fig
+
+
+def cards(items):
+    cs = st.columns(len(items))
+    for c, (lab, val, sub, cl) in zip(cs, items):
+        with c:
+            st.markdown(f'<div class="card"><div class="label">{lab}</div><div class="value {cl}">{val}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
+
+
+def read_csv(path):
     try:
-        df_hist = pd.DataFrame(history_list)
-        df_hist.to_csv(CSV_FILE, index=False)
-    except Exception as e:
-        st.error(f"Error saving history to CSV: {e}")
-
-
-if "trade_history_log" not in st.session_state:
-    st.session_state.trade_history_log = load_persistent_history()
-
-# ==========================================
-# XGBOOST AUTO & MANUAL TRAINING SYSTEM
-# ==========================================
-TRAIN_INTERVAL = 20  # Har 20 trades par auto-train
-
-
-def train_xgboost_model_automatically(history_list, force=False):
-    closed_trades = [t for t in history_list if t.get("outcome") in ["WIN", "LOSS"]]
-    closed_count = len(closed_trades)
-
-    if not force and closed_count < TRAIN_INTERVAL:
-        return (
-            False,
-            f"Insufficient closed trades ({closed_count}/{TRAIN_INTERVAL})",
-        )
-
-    try:
-        X = []
-        y = []
-        # Agar closed trades kam hain lekin manual train dabaya gaya hai, toh dummy/synthetic features se train karlo taaki error na aaye
-        if len(closed_trades) == 0:
-            for _ in range(25):
-                X.append([np.random.uniform(-1, 1) for _ in range(12)])
-                y.append(np.random.choice([0, 1]))
-        else:
-            for trade in closed_trades:
-                dummy_feat = [np.random.uniform(-1, 1) for _ in range(12)]
-                label = 1 if trade["outcome"] == "WIN" else 0
-                X.append(dummy_feat)
-                y.append(label)
-
-        X = np.array(X)
-        y = np.array(y)
-
-        clf = xgb.XGBClassifier(
-            n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42
-        )
-        clf.fit(X, y)
-
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(clf, f)
-        return True, f"Model successfully trained on {len(X)} samples."
-    except Exception as e:
-        return False, str(e)
-
-
-@st.cache_resource
-def load_xgboost_model():
-    if os.path.exists(MODEL_PATH):
-        try:
-            with open(MODEL_PATH, "rb") as f:
-                model = pickle.load(f)
-            return model
-        except Exception:
-            return None
-    return None
-
-
-ml_model = load_xgboost_model()
-
-
-# ==========================================
-# 1. RESEARCH LAB & RISK ENGINE MODULES (CORE)
-# ==========================================
-class TenPaperResearchLab:
-
-    def __init__(self, target_vol=0.15):
-        self.target_vol = target_vol
-        self.scaler = StandardScaler()
-
-        self.feature_names = [
-            "HAWKES",
-            "BOOK_IMB",
-            "TAKER_FLOW",
-            "QUANT_IMPLY",
-            "BAYESIAN",
-            "QUANTILES",
-            "TARGET_INV",
-            "ADAPT_CONF",
-            "FRAC_KELLY",
-            "RMT_DOM",
-            "CONF_CROSS",
-            "REWARD_RISK",
-        ]
-        self.dynamic_weights = {
-            k: 1.0 / len(self.feature_names) for k in self.feature_names
-        }
-
-    def extract_features(self, df, bids, asks):
-        results = {}
-        if len(bids) == 0 or len(asks) == 0 or df.empty or len(df) < 15:
-            return {k: 0.0 for k in self.feature_names}
-
-        bid_vol = np.sum(bids[:, 1])
-        ask_vol = np.sum(asks[:, 1])
-        mid_price = (bids[0, 0] + asks[0, 0]) / 2
-        returns = df["Close"].pct_change().dropna()
-        realized_vol = returns.std() + 1e-8
-        returns_h = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / (
-            df["Close"].iloc[-5] + 1e-8
-        )
-        delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
-
-        vol_changes = df["Volume"].pct_change().dropna().values
-        hawkes_intensity = (
-            (np.mean(vol_changes[-3:]) / (np.mean(vol_changes[-15:]) + 1e-8))
-            if len(vol_changes) >= 15
-            else 1.0
-        )
-        results["HAWKES"] = np.clip(
-            (hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1
-        )
-
-        results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
-
-        taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
-        taker_sell = df["Volume"].iloc[-1] * (1.0 if delta_p <= 0 else 0.3)
-        results["TAKER_FLOW"] = (taker_buy - taker_sell) / (
-            taker_buy + taker_sell + 1e-8
-        )
-
-        depth_skew = (bids[0, 1] - asks[0, 1]) / (bids[0, 1] + asks[0, 1] + 1e-8)
-        results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
-
-        prior = 0.745
-        likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
-        posterior = (likelihood * prior) / (
-            (likelihood * prior) + ((1 - likelihood) * (1 - prior)) + 1e-8
-        )
-        results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
-
-        q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
-        q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
-        results["QUANTILES"] = np.clip(
-            (returns_h - q10) / (q90 - q10 + 1e-8) * 2.0 - 1.0, -1, 1
-        )
-
-        target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
-        results["TARGET_INV"] = (
-            1.0
-            if target_diff >= 0.0006
-            else (-1.0 if target_diff <= -0.0006 else 0.0)
-        )
-
-        ma_fast = df["Close"].rolling(3).mean().iloc[-1]
-        ma_slow = df["Close"].rolling(10).mean().iloc[-1]
-        results["ADAPT_CONF"] = np.clip(
-            (ma_fast - ma_slow) / (realized_vol * mid_price + 1e-8), -1, 1
-        )
-
-        win_prob = 0.55 + (0.15 * np.sign(results["BOOK_IMB"]))
-        kelly_fraction = win_prob - ((1 - win_prob) / 1.5)
-        results["FRAC_KELLY"] = np.clip(
-            kelly_fraction * 2.0 * np.sign(returns_h), -1, 1
-        )
-
-        rmt_dom = (abs(returns_h) / (realized_vol * np.sqrt(5) + 1e-8)) / 3.0
-        results["RMT_DOM"] = np.clip(rmt_dom * np.sign(returns_h), -1, 1)
-
-        conformal_spread = realized_vol * 1.96
-        upper_b = mid_price * (1 + conformal_spread)
-        lower_b = mid_price * (1 - conformal_spread)
-        results["CONF_CROSS"] = (
-            1.0
-            if mid_price > (upper_b + lower_b) / 2
-            else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
-        )
-
-        rr_ratio = abs(q90) / (abs(q10) + 1e-8)
-        results["REWARD_RISK"] = (
-            1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
-        )
-
-        return results
-
-    def calculate_all_signals(self, df, bids, asks):
-        results = self.extract_features(df, bids, asks)
-        feature_vector = np.array(
-            [results[k] for k in self.feature_names]
-        ).reshape(1, -1)
-
-        weight_vector = np.array(list(self.dynamic_weights.values()))
-        math_score = float(np.dot(feature_vector[0], weight_vector))
-
-        ml_probability = 0.5
-        if ml_model is not None:
-            try:
-                if hasattr(ml_model, "predict_proba"):
-                    ml_pred_proba = ml_model.predict_proba(feature_vector)
-                    ml_probability = float(ml_pred_proba[0][1])
-                elif hasattr(ml_model, "predict"):
-                    ml_pred = ml_model.predict(feature_vector)
-                    ml_probability = float(ml_pred[0])
-            except Exception:
-                pass
-
-        final_score = (0.7 * math_score) + (0.3 * (ml_probability - 0.5) * 2.0)
-        return results, float(np.clip(final_score, -1, 1)), self.dynamic_weights
-
-
-class PowerTradingRiskEngine:
-
-    def calculate_risk_metrics(
-        self,
-        liquidation_volumes,
-        displayed_vol,
-        cancelled_vol,
-        time_exists,
-        obs_window,
-        open_interest,
-        leverage,
-        volatility,
-    ):
-        total_ltz = (
-            np.sum(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
-        )
-        max_ltz = np.max(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
-        ltz_score = (max_ltz / (total_ltz + 1e-8)) * 100
-
-        spoof_ratio = cancelled_vol / (displayed_vol + 1e-8)
-        persistence = min(max(time_exists / (obs_window + 1e-8), 0), 1)
-        spoof_score = spoof_ratio * (1 - persistence)
-
-        squeeze_risk = total_ltz * open_interest * leverage * volatility
-        market_risk = ltz_score + spoof_score + squeeze_risk
-
-        return {
-            "LTZ_Score": ltz_score,
-            "Spoof_Score": spoof_score,
-            "Squeeze_Risk": squeeze_risk,
-            "Market_Risk": market_risk,
-        }
-
-
-# ==========================================
-# 3. PROFESSIONAL STYLING & THEME
-# ==========================================
-st.markdown(
-    """
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
-    .stApp { background-color: #080a0f; color: #e2e8f0; }
-    section[data-testid="stSidebar"] { background-color: #0d1117 !important; border-right: 1px solid #161b22; }
-    .metric-card {
-        background: #111622; border: 1px solid #1e2638; border-radius: 12px;
-        padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px;
-    }
-    .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
-    .metric-val-green { font-size: 18px; font-weight: 700; color: #00e676; }
-    .metric-val-red { font-size: 18px; font-weight: 700; color: #ff5252; }
-    .metric-val-blue { font-size: 18px; font-weight: 700; color: #38bdf8; }
-    .top-status-bar {
-        background: #111622; border: 1px solid #1e2638; border-radius: 10px;
-        padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ==========================================
-# 4. SIDEBAR CONTROLS & MANUAL TRAIN BUTTON
-# ==========================================
-COINS_LIST = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "XMRUSDT",
-    "XRPUSDT",
-    "TAOUSDT",
-]
-
-TIMEFRAME_MAP = {
-    "1m (Scalping)": ("1m", 1),
-    "15m (Medium TF)": ("15m", 15),
-    "30m (Medium TF)": ("30m", 30),
-    "1h (Intraday)": ("1h", 60),
-    "4h (Intraday)": ("4h", 240),
-}
-
-st.sidebar.markdown("### ⚡ Terminal Controls")
-selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
-selected_tf_label = st.sidebar.selectbox(
-    "Select Timeframe", list(TIMEFRAME_MAP.keys()), index=1
-)
-forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🎛️ Paper Trading Mode")
-paper_trading_mode = st.sidebar.toggle("Enable Live Paper Trading", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 ML Model Controls")
-if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
-    success, msg = train_xgboost_model_automatically(
-        st.session_state.trade_history_log, force=True
-    )
-    if success:
-        st.sidebar.success(msg)
-        st.cache_resource.clear()
-        time.sleep(1)
-        st.rerun()
-    else:
-        st.sidebar.error(f"Training failed: {msg}")
-
-api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
-
-# ==========================================
-# AUTO-TRAINING CHECK (HAR 20 TRADES KE BAAD)
-# ==========================================
-closed_trades_list = [
-    t
-    for t in st.session_state.get("trade_history_log", [])
-    if t.get("outcome") in ["WIN", "LOSS"]
-]
-closed_count = len(closed_trades_list)
-
-if closed_count >= TRAIN_INTERVAL and closed_count % TRAIN_INTERVAL == 0:
-    milestone_key = f"trained_at_{closed_count}"
-    if milestone_key not in st.session_state:
-        success, msg = train_xgboost_model_automatically(
-            st.session_state.trade_history_log, force=False
-        )
-        if success:
-            st.session_state[milestone_key] = True
-            st.sidebar.success(
-                f"🚀 Model retrained successfully at {closed_count} trades!"
-            )
-            st.cache_resource.clear()
-        else:
-            st.sidebar.error(f"Auto-training failed: {msg}")
-
-# ==========================================
-# 5. DATA FETCHING (SAFE API WITH FALLBACK)
-# ==========================================
-@st.cache_data(ttl=15)
-def fetch_klines_data(symbol, tf_key, limit=100):
-    binance_tf = (
-        "1m"
-        if "1m" in tf_key
-        else (
-            "15m"
-            if "15m" in tf_key
-            else (
-                "30m"
-                if "30m" in tf_key
-                else ("1h" if "1h" in tf_key else "4h")
-            )
-        )
-    )
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
-    try:
-        res = requests.get(url, timeout=4).json()
-        if isinstance(res, dict) or not isinstance(res, list):
-            raise ValueError("API limit or invalid format")
-        df = pd.DataFrame(
-            res,
-            columns=[
-                "Open_Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "Close_Time",
-                "QAV",
-                "NAT",
-                "TBBAV",
-                "TBQAV",
-                "Ignore",
-            ],
-        )
-        df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = df[col].astype(float)
-        df.set_index("Time", inplace=True)
-        return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
+        return pd.read_csv(path) if path.exists() else pd.DataFrame()
     except Exception:
-        dates = pd.date_range(
-            end=datetime.datetime.now(), periods=limit, freq=binance_tf
-        )
-        base_p = (
-            60000.0 if "BTC" in symbol else (3000.0 if "ETH" in symbol else 200.0)
-        )
-        closes = base_p + np.cumsum(np.random.normal(0, 5, limit))
-        return pd.DataFrame({
-            "Time": dates,
-            "Open": closes - 2,
-            "High": closes + 5,
-            "Low": closes - 5,
-            "Close": closes,
-            "Volume": np.random.uniform(50, 500, limit),
-        })
+        return pd.DataFrame()
 
 
-@st.cache_data(ttl=10)
-def fetch_order_book_depth(symbol, depth_limit=20):
-    try:
-        url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit={depth_limit}"
-        res = requests.get(url, timeout=4).json()
-        if "bids" in res and "asks" in res:
-            return np.array(res["bids"], dtype=float), np.array(
-                res["asks"], dtype=float
-            )
-    except Exception:
-        pass
-    dummy_bids = np.array([[100.0 - i * 0.1, 1.5] for i in range(20)], dtype=float)
-    dummy_asks = np.array([[100.0 + i * 0.1, 1.5] for i in range(20)], dtype=float)
-    return dummy_bids, dummy_asks
+def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
+    row = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "timeframe": tf, "price": price,
+           "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",
+           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs}
+    pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)
 
 
-df = fetch_klines_data(selected_symbol, selected_tf_label)
-bids, asks = fetch_order_book_depth(selected_symbol)
+@st.cache_data(ttl=3.0, show_spinner=False)
+def scan_symbol(symbol, tf_key, threshold=0.20):
+    """One-shot signal snapshot for the multi-market scanner."""
+    df, source, _, _ = candles(symbol, TFS[tf_key], 120)
+    bids, asks, *_ = orderbook(symbol)
+    f = features(df, bids, asks)
+    pred, prob, _, _ = ml_predict(f)
+    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold)
+    price = num(df.Close.iloc[-1]) if not df.empty else 0
+    prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
+    change = (price / prev - 1) * 100 if prev else 0
+    return {"symbol": symbol, "price": price, "change": change, "signal": signal,
+            "confidence": confidence, "combined": combined, "obi20": f["obi_20"]}
 
 
-# ==========================================
-# 6. ENGINE EXECUTION & SIGNAL GENERATION
-# ==========================================
-if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
-    lab = TenPaperResearchLab()
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(
-        df, bids, asks
-    )
+# ------------------------------------------------------------
+# STATE
+# ------------------------------------------------------------
+if "symbol" not in st.session_state:
+    st.session_state.symbol = "BTCUSDT"
+if "tf" not in st.session_state:
+    st.session_state.tf = "15M"
+if "future" not in st.session_state:
+    st.session_state.future = 30
+if "threshold" not in st.session_state:
+    st.session_state.threshold = 0.20
 
-    close_p = df["Close"].iloc[-1]
-    atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
-    if np.isnan(atr_val):
-        atr_val = close_p * 0.005
+st.markdown('<div class="hero"><div><div class="brand">ZIA <b>RESEARCH</b></div>'
+            '<div class="micro">QUANT MARKET INTELLIGENCE • LIVE ML • ORDER FLOW • MULTI-MARKET SCANNER</div></div>'
+            '<div class="live"><span class="dot"></span>LIVE • SILENT 1S</div></div>', unsafe_allow_html=True)
 
-    direction = (
-        "LONG"
-        if final_score >= 0.12
-        else ("SHORT" if final_score <= -0.12 else "NEUTRAL")
-    )
-    confidence = int(min(max(abs(final_score) * 100, 20), 99))
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1.3])
+with c1:
+    symbol = st.selectbox("MARKET", SYMBOLS, index=SYMBOLS.index(st.session_state.symbol), key="symbol")
+with c2:
+    tf = st.selectbox("TIMEFRAME", list(TFS.keys()), index=list(TFS.keys()).index(st.session_state.tf), key="tf")
+with c3:
+    future = st.selectbox("FUTURE SPACE", [12, 20, 30, 45, 60], index=2, key="future", format_func=lambda x: f"{x} bars")
+with c4:
+    threshold = st.slider("SIGNAL SENSITIVITY", min_value=0.10, max_value=0.60, step=0.05,
+                          value=st.session_state.threshold, key="threshold",
+                          help="Lower = more LONG/SHORT signals (less strict). Higher = fewer, stronger-conviction signals.")
 
-    risk_distance = 1.5 * atr_val
+visible = visible_tri_timeframes(tf)
+tri_text = " + ".join(x[0] for x in visible) if visible else "NONE"
+st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
+            f'<div class="tri-chip">CHART <span>{tf}</span></div>'
+            f'<div class="tri-chip">DISPLAY <span>{tri_text}</span></div>'
+            f'<div class="tri-chip">ZOOM <span>ON</span></div>'
+            f'<div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
 
-    if direction == "LONG":
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
-    elif direction == "SHORT":
-        sl_val = close_p + risk_distance
-        tp1_val = close_p - (2.0 * risk_distance)
-        tp2_val = close_p - (3.0 * risk_distance)
-    else:
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
 
-    lock_seconds = tf_minutes * 60
-    current_time_sec = int(time.time())
-    time_bucket = current_time_sec - (current_time_sec % lock_seconds)
-    time_remaining = lock_seconds - (current_time_sec % lock_seconds)
+@st.fragment(run_every="1s")
+def live_engine():
+    started = time.perf_counter()
+    df, source, cstat, _ = candles(symbol, TFS[tf], 650)
+    bids, asks, bsrc, bstat, _ = orderbook(symbol)
+    f = features(df, bids, asks)
+    pred, prob, mlstat, feature_count = ml_predict(f)
+    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold)
+    price = num(df.Close.iloc[-1]) if not df.empty else 0
+    prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
+    change = (price / prev - 1) * 100 if prev else 0
+    elapsed = (time.perf_counter() - started) * 1000
+    cls = "signal-long" if signal == "LONG" else "signal-short" if signal == "SHORT" else "signal-wait"
+    sigcolor = "good" if signal == "LONG" else "bad" if signal == "SHORT" else "amber"
+    mltext = f"{prob * 100:.2f}%" if prob is not None else "—"
 
-    trade_id = f"{selected_symbol}_{selected_tf_label}_{time_bucket}"
+    st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'
+                f'<div class="signal-main {sigcolor}">{signal}</div>'
+                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div></div>',
+                unsafe_allow_html=True)
 
-    if paper_trading_mode and direction != "NEUTRAL":
-        existing_trade_ids = [
-            item.get("trade_id") for item in st.session_state.trade_history_log
-        ]
-        if trade_id not in existing_trade_ids:
-            new_trade = {
-                "trade_id": trade_id,
-                "timestamp": datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "symbol": selected_symbol,
-                "timeframe": selected_tf_label,
-                "direction": direction,
-                "entry_price": round(close_p, 4),
-                "stop_loss": round(sl_val, 4),
-                "tp1": round(tp1_val, 4),
-                "tp2": round(tp2_val, 4),
-                "exit_price": round(close_p, 4),
-                "confidence": confidence,
-                "final_score": round(final_score, 3),
-                "outcome": "PENDING",
-                "pnl_percent": 0.0,
-                "duration": "Active",
-                "status": "Open",
-            }
-            st.session_state.trade_history_log.insert(0, new_trade)
-            save_persistent_history(st.session_state.trade_history_log)
+    cards([
+        ("PRICE", f"${price:,.2f}", f"{change:+.2f}% • {tf}", "good" if change >= 0 else "bad"),
+        ("SIGNAL", signal, f"strength {confidence:.1f}%", sigcolor),
+        ("ML", mltext, mlstat, "violet"),
+        ("OBI 20", f"{f['obi_20']:+.3f}", "top 20 depth", "good" if f['obi_20'] >= 0 else "bad"),
+        ("OBI 50", f"{f['obi_50']:+.3f}", "top 50 depth", "good" if f['obi_50'] >= 0 else "bad"),
+        ("DATA", source, f"book {bsrc}", "cyan"),
+    ])
 
-    for trade in st.session_state.trade_history_log:
-        if trade["outcome"] == "PENDING":
-            trade_symbol = trade["symbol"]
-            temp_df = fetch_klines_data(trade_symbol, trade["timeframe"], limit=15)
-            if not temp_df.empty:
-                entry_time_str = trade.get("timestamp")
-                for idx, row in temp_df.iterrows():
-                    candle_time = str(row["Time"])
-                    if entry_time_str and candle_time >= entry_time_str:
-                        curr_high = row["High"]
-                        curr_low = row["Low"]
+    tabs = st.tabs(["⌂ OVERVIEW", "◈ CHART", "◌ ORDER FLOW", "🧠 ML LAB", "🔬 RESEARCH LAB", "▣ SIGNALS", "⌖ SCANNER"])
 
-                        entry = trade["entry_price"]
-                        sl = trade["stop_loss"]
-                        tp = trade["tp1"]
+    with tabs[0]:
+        l, r = st.columns([2, 1])
+        with l:
+            st.markdown('<div class="panel"><b>MARKET REGIME</b>', unsafe_allow_html=True)
+            regime = "BULLISH FLOW" if combined > .25 else "BEARISH FLOW" if combined < -.25 else "BALANCED / WAIT"
+            st.markdown(f"## {regime}")
+            st.progress(min(max(confidence / 100, 0), 1), text=f"Signal strength {confidence:.1f}%")
+            st.write(f"Research **{rscore:+.3f}** • ML **{mlscore:+.3f}** • Composite **{combined:+.3f}**")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with r:
+            st.markdown('<div class="panel"><b>LIVE STATUS</b>', unsafe_allow_html=True)
+            st.write(f"Candles: `{source}`")
+            st.write(f"Order book: `{bsrc}`")
+            st.write(f"Connection: `{cstat} / {bstat}`")
+            st.write(f"Engine: `{elapsed:.0f} ms` • silent 1s cycle")
+            st.write(f"Updated: `{datetime.now().strftime('%H:%M:%S')}`")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-                        if trade["direction"] == "LONG":
-                            if curr_high >= tp:
-                                trade["outcome"] = "WIN"
-                                trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((tp - entry) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                            elif curr_low <= sl:
-                                trade["outcome"] = "LOSS"
-                                trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((sl - entry) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                        elif trade["direction"] == "SHORT":
-                            if curr_low <= tp:
-                                trade["outcome"] = "WIN"
-                                trade["exit_price"] = tp
-                                trade["pnl_percent"] = round(
-                                    ((entry - tp) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
-                            elif curr_high >= sl:
-                                trade["outcome"] = "LOSS"
-                                trade["exit_price"] = sl
-                                trade["pnl_percent"] = round(
-                                    ((entry - sl) / entry) * 100, 2
-                                )
-                                trade["status"] = "Closed"
-                                break
+    with tabs[1]:
+        st.markdown(f'<div class="panel"><b>TRADINGVIEW-STYLE MARKET CHART</b>'
+                    f'<div class="section-sub">Automatic TRI only • {tf} → {tri_text} • scroll zoom • mouse pan • crosshair • future space</div>',
+                    unsafe_allow_html=True)
+        st.plotly_chart(make_chart(df, symbol, tf, future), use_container_width=True,
+                         config={"scrollZoom": True, "displaylogo": False, "responsive": True,
+                                 "doubleClick": "reset", "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+                         key="main_market_chart")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    save_persistent_history(st.session_state.trade_history_log)
+    with tabs[2]:
+        vals = [obi(bids, asks, k) for k in (5, 10, 20, 50)]
+        cards([(f"OBI {k}", f"{v[0]:+.3f}", f"B {v[1]:,.1f} / A {v[2]:,.1f}", "good" if v[0] >= 0 else "bad")
+               for k, v in zip((5, 10, 20, 50), vals)])
+        l, r = st.columns(2)
+        l.dataframe(pd.DataFrame(bids[:20], columns=["Bid Price", "Bid Qty"]), use_container_width=True, hide_index=True)
+        r.dataframe(pd.DataFrame(asks[:20], columns=["Ask Price", "Ask Qty"]), use_container_width=True, hide_index=True)
 
-    closed_count = len(
-        [
-            t
-            for t in st.session_state.trade_history_log
-            if t["outcome"] in ["WIN", "LOSS"]
-        ]
-    )
-    # Dynamic 20-trades training target calculation
-    next_train_target = (closed_count // TRAIN_INTERVAL + 1) * TRAIN_INTERVAL
+    with tabs[3]:
+        cards([
+            ("MODEL", mlstat, "xgboost_obi_model.pkl", "violet"),
+            ("PREDICTION", "LONG" if pred == 1 else "SHORT" if pred == 0 else "—", f"class {pred}",
+             "good" if pred == 1 else "bad" if pred == 0 else "amber"),
+            ("PROBABILITY", mltext, "model probability", "violet"),
+            ("FEATURES", str(feature_count), "supplied to model", "cyan"),
+        ])
+        st.markdown('<div class="panel"><b>LIVE MODEL INPUTS</b>', unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame({
+            "Feature": ["OBI 5", "OBI 10", "OBI 20", "OBI 50", "Spread", "Taker Flow", "Trend/SMA", "Volatility"],
+            "Value": [f["obi_5"], f["obi_10"], f["obi_20"], f["obi_50"], f["spread"], f["taker_flow_ratio"], f["sma_distance"], f["realized_volatility"]],
+        }), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    risk_engine = PowerTradingRiskEngine()
-    disp_vol = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-    risk_metrics = risk_engine.calculate_risk_metrics(
-        liquidation_volumes=np.array([1000, 2500]),
-        displayed_vol=disp_vol,
-        cancelled_vol=disp_vol * 0.1,
-        time_exists=15.0,
-        obs_window=60.0,
-        open_interest=150000.0,
-        leverage=20.0,
-        volatility=df["Close"].pct_change().std() + 1e-8,
-    )
+    with tabs[4]:
+        rd = pd.DataFrame([{"Formula": k, "Live Score": round(float(v), 4), "Weight %": round(rw[k] * 100, 1),
+                             "Contribution": round(float(v * rw[k]), 4),
+                             "Direction": "BULL" if v > 0 else "BEAR" if v < 0 else "NEUTRAL"}
+                            for k, v in rs.items()]).sort_values("Contribution", ascending=False)
+        st.markdown('<div class="panel"><b>RESEARCH FORMULA SCOREBOARD</b>', unsafe_allow_html=True)
+        st.dataframe(rd, use_container_width=True, hide_index=True)
+        st.write(f"Strongest contributor: **{rd.iloc[0]['Formula'] if not rd.empty else '—'}** • Composite **{rscore:+.3f}**")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    dir_color = (
-        "#00e676"
-        if direction == "LONG"
-        else ("#ff5252" if direction == "SHORT" else "#38bdf8")
-    )
-    mins_rem, secs_rem = divmod(time_remaining, 60)
-    ml_status_text = (
-        "🟢 Active (Auto-Train)" if ml_model is not None else "🟡 Math Only"
-    )
-
-    st.markdown(
-        f"""
-    <div class="top-status-bar">
-        🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
-        ML: <b>{ml_status_text}</b> &nbsp;|&nbsp; SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-        Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
-        ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-    col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
-
-    with col_sig:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left: 4px solid {dir_color};">
-                <div class="metric-label">Signal Engine</div>
-                <div style="font-size:22px; font-weight:700; color:{dir_color};">{direction}</div>
-                <div style="font-size:11px; color:#8b949e; margin-top:4px;">Entry: ${close_p:,.4f} | SL: ${sl_val:,.4f}</div>
-                <div style="font-size:11px; color:#38bdf8;">TP1: ${tp1_val:,.4f} | TP2: ${tp2_val:,.4f}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with col_m1:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m2:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m3:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m4:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    col_chart, col_risk_panel = st.columns([2.5, 1])
-    with col_chart:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
-        time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [
-            df["Time"].iloc[-1] + (i * time_delta)
-            for i in range(1, forecast_horizon + 1)
-        ]
-        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
-
-        if direction == "LONG":
-            forecast_prices = close_p + (tp2_val - close_p) * np.sin(t_steps)
-        elif direction == "SHORT":
-            forecast_prices = close_p - (close_p - tp2_val) * np.sin(t_steps)
+    with tabs[5]:
+        if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):
+            save_signal(symbol, tf, price, signal, confidence, prob, f, rscore)
+            st.success("Signal saved")
+        h = read_csv(SIGNAL_FILE)
+        t = read_csv(TRADE_FILE)
+        if not h.empty:
+            st.dataframe(h.tail(80).iloc[::-1], use_container_width=True, hide_index=True)
+            st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)
         else:
-            forecast_prices = [close_p] * forecast_horizon
+            st.info("No saved signals yet.")
+        if not t.empty and "result" in t.columns:
+            rr = t.result.astype(str).str.upper()
+            wins = int((rr == "WIN").sum())
+            losses = int((rr == "LOSS").sum())
+            total = wins + losses
+            wr = wins / total * 100 if total else 0
+            cards([("CLOSED", str(total), "resolved trades", "cyan"), ("WINS", str(wins), "winning trades", "good"),
+                   ("LOSSES", str(losses), "losing trades", "bad"), ("WIN RATE", f"{wr:.1f}%", "closed trade rate", "violet")])
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df["Time"],
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="Candles",
-                increasing_line_color="#00e676",
-                decreasing_line_color="#ff5252",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[df["Time"].iloc[-1]] + future_times,
-                y=[close_p] + list(forecast_prices),
-                mode="lines+markers",
-                name="Trajectory",
-                line=dict(color=dir_color, width=2, dash="dot"),
-            )
-        )
-        fig.add_hline(
-            y=tp2_val,
-            line_dash="dash",
-            line_color="#00e676",
-            annotation_text=f"TP2: ${tp2_val:,.4f}",
-        )
-        fig.add_hline(
-            y=tp1_val,
-            line_dash="dash",
-            line_color="#38bdf8",
-            annotation_text=f"TP1: ${tp1_val:,.4f}",
-        )
-        fig.add_hline(
-            y=sl_val,
-            line_dash="dot",
-            line_color="#ff5252",
-            annotation_text=f"SL: ${sl_val:,.4f}",
-        )
-        fig.update_layout(
-            template="plotly_dark",
-            height=420,
-            xaxis_rangeslider_visible=False,
-            paper_bgcolor="#111622",
-            plot_bgcolor="#111622",
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_risk_panel:
-        st.subheader("Market Microstructure")
-        bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
-        ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-        obi_val = (bid_vol_sum - ask_vol_sum) / (bid_vol_sum + ask_vol_sum)
-        spread_val = (
-            abs(asks[0, 0] - bids[0, 0])
-            if len(bids) > 0 and len(asks) > 0
-            else 0.0
-        )
-
-        st.markdown(
-            f"""
-        <div class="metric-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.4f}</b></div>
-            <div style="display:flex; justify-content:space-between;"><span>Auto-Retrain</span> <b style="color:#00e676;">ACTIVE (20)</b></div>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-    st.subheader("📊 Performance Summary & Win Rate")
-
-    if st.session_state.trade_history_log:
-        df_log = pd.DataFrame(st.session_state.trade_history_log)
-
-        f_col1, f_col2, f_col3 = st.columns(3)
-        with f_col1:
-            coin_filter = st.selectbox("Filter Coin", ["ALL"] + COINS_LIST)
-        with f_col2:
-            tf_filter = st.selectbox(
-                "Filter Timeframe", ["ALL"] + list(TIMEFRAME_MAP.keys())
-            )
-        with f_col3:
-            dir_filter = st.selectbox("Filter Direction", ["ALL", "LONG", "SHORT"])
-
-        filtered_df = df_log.copy()
-        if coin_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["symbol"] == coin_filter]
-        if tf_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["timeframe"] == tf_filter]
-        if dir_filter != "ALL":
-            filtered_df = filtered_df[filtered_df["direction"] == dir_filter]
-
-        total_signals = len(filtered_df)
-        wins = len(filtered_df[filtered_df["outcome"] == "WIN"])
-        losses = len(filtered_df[filtered_df["outcome"] == "LOSS"])
-        pending = len(filtered_df[filtered_df["outcome"] == "PENDING"])
-        closed_trades = wins + losses
-        win_rate = (wins / closed_trades * 100) if closed_trades > 0 else 0.0
-
-        winning_trades_df = filtered_df[filtered_df["outcome"] == "WIN"]
-        losing_trades_df = filtered_df[filtered_df["outcome"] == "LOSS"]
-
-        gross_profit = (
-            winning_trades_df["pnl_percent"].sum()
-            if not winning_trades_df.empty
-            else 0.0
-        )
-        gross_loss = (
-            abs(losing_trades_df["pnl_percent"].sum())
-            if not losing_trades_df.empty
-            else 0.0
-        )
-        net_pnl = gross_profit - gross_loss
-
-        p1, p2, p3, p4, p5, p6 = st.columns(6)
-        with p1:
+    with tabs[6]:
+        st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
+                    f'<div class="section-sub">Every tracked symbol scored on the {tf} timeframe, refreshed every few seconds • click a row\'s symbol above to jump in</div>',
+                    unsafe_allow_html=True)
+        rows = [scan_symbol(s, tf, threshold) for s in SYMBOLS]
+        rows.sort(key=lambda r: r["combined"], reverse=True)
+        longs = sum(1 for r in rows if r["signal"] == "LONG")
+        shorts = sum(1 for r in rows if r["signal"] == "SHORT")
+        waits = sum(1 for r in rows if r["signal"] == "WAIT")
+        cards([("LONG SIGNALS", str(longs), "bullish across scan", "good"),
+               ("SHORT SIGNALS", str(shorts), "bearish across scan", "bad"),
+               ("WAITING", str(waits), "no clear edge", "amber"),
+               ("SCANNED", str(len(rows)), "symbols this cycle", "cyan")])
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        for r in rows:
+            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short" if r["signal"] == "SHORT" else "pill-wait"
+            chg_cls = "good" if r["change"] >= 0 else "bad"
             st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-val-green">{win_rate:.1f}%</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p2:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Closed</div><div class="metric-val-blue">{closed_trades}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p3:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Wins/Losses</div><div style="font-size:16px; font-weight:750; color:#00e676;">{wins}W / {losses}L</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p4:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Pending</div><div class="metric-val-blue">{pending}</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p5:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Gross PnL</div><div class="metric-val-blue">{gross_profit:.2f}%</div></div>',
-                unsafe_allow_html=True,
-            )
-        with p6:
-            net_color = "metric-val-green" if net_pnl >= 0 else "metric-val-red"
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-label">Net PnL</div><div class="{net_color}">{net_pnl:+.2f}%</div></div>',
-                unsafe_allow_html=True,
-            )
+                f'<div class="scan-row">'
+                f'<div style="width:16%;font-weight:900">{r["symbol"]}</div>'
+                f'<div style="width:16%">${r["price"]:,.4f}</div>'
+                f'<div style="width:14%" class="{chg_cls}">{r["change"]:+.2f}%</div>'
+                f'<div style="width:14%">OBI {r["obi20"]:+.3f}</div>'
+                f'<div style="width:18%">conf {r["confidence"]:.1f}%</div>'
+                f'<div style="width:12%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
+                f'</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.dataframe(filtered_df, use_container_width=True)
+    st.caption(f"ZIA Research • {symbol} • {tf} • silent live engine • {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+
+
+live_engine()
