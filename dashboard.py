@@ -1,1105 +1,3081 @@
-import datetime
+from __future__ import annotations
+
 import os
-import pickle
 import time
+import math
+import pickle
+import datetime as dt
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
+import plotly.graph_objects as go
 import streamlit as st
-import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
+
 from streamlit_autorefresh import st_autorefresh
 
-# ==========================================
-# STREAMLIT CONFIG & PERSISTENT CSV SETUP
-# ==========================================
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
 st.set_page_config(
-    page_title="Quantitative Research & Paper Trading Terminal",
+    page_title="ZIA RESEARCH LAB",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Smooth background refresh
-count = st_autorefresh(interval=5000, limit=None, key="research_lab_auto_refresh")
 
-CSV_FILE = "signal_history.csv"
-MODEL_PATH = "xgboost_obi_model.pkl"
+# ============================================================
+# CONSTANTS
+# ============================================================
 
+ROOT = Path(__file__).resolve().parent
 
-def load_persistent_history():
-    if os.path.exists(CSV_FILE):
-        try:
-            df_hist = pd.read_csv(CSV_FILE)
-            expected_cols = [
-                "trade_id",
-                "timestamp",
-                "symbol",
-                "timeframe",
-                "direction",
-                "entry_price",
-                "stop_loss",
-                "tp1",
-                "tp2",
-                "exit_price",
-                "confidence",
-                "final_score",
-                "outcome",
-                "pnl_percent",
-                "duration",
-                "status",
-            ]
-            for col in expected_cols:
-                if col not in df_hist.columns:
-                    df_hist[col] = "PENDING" if col == "outcome" else 0.0
-            return df_hist.to_dict("records")
-        except Exception:
-            return []
-    return []
+HISTORY_FILE = ROOT / "signal_history.csv"
+
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+BINANCE_DEPTH = "https://api.binance.com/api/v3/depth"
+BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/24hr"
 
 
-def save_persistent_history(history_list):
-    try:
-        df_hist = pd.DataFrame(history_list)
-        df_hist.to_csv(CSV_FILE, index=False)
-    except Exception as e:
-        st.error(f"Error saving history to CSV: {e}")
+# ============================================================
+# TRADE MODES
+# ============================================================
+
+TRADE_MODES = {
+    "SCALPING": {
+        "label": "30M SCALPING",
+        "analysis_tf": "30m",
+        "engine_mode": "SCALPING",
+        "duration_minutes": 15,
+        "duration_text": "15 MIN",
+        "max_holding": "15 minutes",
+        "reference": ["1H", "4H"],
+    },
+
+    "15M": {
+        "label": "15M",
+        "analysis_tf": "15m",
+        "engine_mode": "15M",
+        "duration_minutes": 90,
+        "duration_text": "1.5 HOURS",
+        "max_holding": "90 minutes",
+        "reference": ["1H", "4H"],
+    },
+
+    "1H": {
+        "label": "1H",
+        "analysis_tf": "1h",
+        "engine_mode": "1H",
+        "duration_minutes": 1440,
+        "duration_text": "24 HOURS",
+        "max_holding": "24 hours",
+        "reference": ["DAILY", "WEEKLY"],
+    },
+
+    "4H": {
+        "label": "4H",
+        "analysis_tf": "4h",
+        "engine_mode": "4H",
+        "duration_minutes": 1440,
+        "duration_text": "24 HOURS MAX",
+        "max_holding": "24 hours maximum",
+        "reference": ["WEEKLY", "MONTHLY"],
+    },
+}
 
 
-if "trade_history_log" not in st.session_state:
-    st.session_state.trade_history_log = load_persistent_history()
+# ============================================================
+# COINS
+# ============================================================
 
-# ==========================================
-# XGBOOST AUTO & MANUAL TRAINING SYSTEM
-# ==========================================
-TRAIN_INTERVAL = 20
-
-
-def train_xgboost_model_automatically(history_list, force=False):
-    closed_trades = [t for t in history_list if t.get("outcome") in ["WIN", "LOSS"]]
-    closed_count = len(closed_trades)
-
-    if not force and closed_count < TRAIN_INTERVAL:
-        return (
-            False,
-            f"Insufficient closed trades ({closed_count}/{TRAIN_INTERVAL})",
-        )
-
-    try:
-        X, y = [], []
-        if len(closed_trades) == 0:
-            for _ in range(25):
-                X.append([np.random.uniform(-1, 1) for _ in range(12)])
-                y.append(np.random.choice([0, 1]))
-        else:
-            for trade in closed_trades:
-                dummy_feat = [np.random.uniform(-1, 1) for _ in range(12)]
-                label = 1 if trade["outcome"] == "WIN" else 0
-                X.append(dummy_feat)
-                y.append(label)
-
-        X = np.array(X)
-        y = np.array(y)
-
-        clf = xgb.XGBClassifier(
-            n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42
-        )
-        clf.fit(X, y)
-
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(clf, f)
-        return True, f"Model successfully trained on {len(X)} samples."
-    except Exception as e:
-        return False, str(e)
-
-
-@st.cache_resource
-def load_xgboost_model():
-    if os.path.exists(MODEL_PATH):
-        try:
-            with open(MODEL_PATH, "rb") as f:
-                model = pickle.load(f)
-            return model
-        except Exception:
-            return None
-    return None
-
-
-ml_model = load_xgboost_model()
-
-
-# ==========================================
-# RESEARCH LAB & RISK ENGINE MODULES (CORE)
-# ==========================================
-class TenPaperResearchLab:
-
-    def __init__(self, target_vol=0.15):
-        self.target_vol = target_vol
-        self.scaler = StandardScaler()
-        self.feature_names = [
-            "HAWKES",
-            "BOOK_IMB",
-            "TAKER_FLOW",
-            "QUANT_IMPLY",
-            "BAYESIAN",
-            "QUANTILES",
-            "TARGET_INV",
-            "ADAPT_CONF",
-            "FRAC_KELLY",
-            "RMT_DOM",
-            "CONF_CROSS",
-            "REWARD_RISK",
-        ]
-        self.dynamic_weights = {
-            k: 1.0 / len(self.feature_names) for k in self.feature_names
-        }
-
-    def extract_features(self, df, bids, asks):
-        results = {}
-        if len(bids) == 0 or len(asks) == 0 or df.empty or len(df) < 15:
-            return {k: 0.0 for k in self.feature_names}
-
-        bid_vol = np.sum(bids[:, 1])
-        ask_vol = np.sum(asks[:, 1])
-        mid_price = (bids[0, 0] + asks[0, 0]) / 2
-        returns = df["Close"].pct_change().dropna()
-        realized_vol = returns.std() + 1e-8
-        returns_h = (df["Close"].iloc[-1] - df["Close"].iloc[-5]) / (
-            df["Close"].iloc[-5] + 1e-8
-        )
-        delta_p = df["Close"].iloc[-1] - df["Close"].iloc[-2]
-
-        vol_changes = df["Volume"].pct_change().dropna().values
-        hawkes_intensity = (
-            (np.mean(vol_changes[-3:]) / (np.mean(vol_changes[-15:]) + 1e-8))
-            if len(vol_changes) >= 15
-            else 1.0
-        )
-        results["HAWKES"] = np.clip(
-            (hawkes_intensity - 1.0) * np.sign(returns_h), -1, 1
-        )
-        results["BOOK_IMB"] = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
-
-        taker_buy = df["Volume"].iloc[-1] * (1.0 if delta_p > 0 else 0.3)
-        taker_sell = df["Volume"].iloc[-1] * (1.0 if delta_p <= 0 else 0.3)
-        results["TAKER_FLOW"] = (taker_buy - taker_sell) / (
-            taker_buy + taker_sell + 1e-8
-        )
-
-        depth_skew = (bids[0, 1] - asks[0, 1]) / (bids[0, 1] + asks[0, 1] + 1e-8)
-        results["QUANT_IMPLY"] = np.clip(depth_skew * 1.5, -1, 1)
-
-        prior = 0.745
-        likelihood = 1.0 if results["BOOK_IMB"] > 0 else 0.25
-        posterior = (likelihood * prior) / (
-            (likelihood * prior) + ((1 - likelihood) * (1 - prior)) + 1e-8
-        )
-        results["BAYESIAN"] = np.clip((posterior - 0.5) * 2.0, -1, 1)
-
-        q90 = returns.quantile(0.90) if len(returns) > 5 else 0.01
-        q10 = returns.quantile(0.10) if len(returns) > 5 else -0.01
-        results["QUANTILES"] = np.clip(
-            (returns_h - q10) / (q90 - q10 + 1e-8) * 2.0 - 1.0, -1, 1
-        )
-
-        target_diff = delta_p / (df["Close"].iloc[-1] + 1e-8)
-        results["TARGET_INV"] = (
-            1.0
-            if target_diff >= 0.0006
-            else (-1.0 if target_diff <= -0.0006 else 0.0)
-        )
-
-        ma_fast = df["Close"].rolling(3).mean().iloc[-1]
-        ma_slow = df["Close"].rolling(10).mean().iloc[-1]
-        results["ADAPT_CONF"] = np.clip(
-            (ma_fast - ma_slow) / (realized_vol * mid_price + 1e-8), -1, 1
-        )
-
-        win_prob = 0.55 + (0.15 * np.sign(results["BOOK_IMB"]))
-        kelly_fraction = win_prob - ((1 - win_prob) / 1.5)
-        results["FRAC_KELLY"] = np.clip(
-            kelly_fraction * 2.0 * np.sign(returns_h), -1, 1
-        )
-
-        rmt_dom = (abs(returns_h) / (realized_vol * np.sqrt(5) + 1e-8)) / 3.0
-        results["RMT_DOM"] = np.clip(rmt_dom * np.sign(returns_h), -1, 1)
-
-        conformal_spread = realized_vol * 1.96
-        upper_b = mid_price * (1 + conformal_spread)
-        lower_b = mid_price * (1 - conformal_spread)
-        results["CONF_CROSS"] = (
-            1.0
-            if mid_price > (upper_b + lower_b) / 2
-            else (-1.0 if mid_price < (upper_b + lower_b) / 2 else 0.0)
-        )
-
-        rr_ratio = abs(q90) / (abs(q10) + 1e-8)
-        results["REWARD_RISK"] = (
-            1.0 if rr_ratio >= 1.2 else (-1.0 if rr_ratio < 0.8 else 0.0)
-        )
-        return results
-
-    def calculate_all_signals(self, df, bids, asks):
-        results = self.extract_features(df, bids, asks)
-        feature_vector = np.array(
-            [results[k] for k in self.feature_names]
-        ).reshape(1, -1)
-        weight_vector = np.array(list(self.dynamic_weights.values()))
-        math_score = float(np.dot(feature_vector[0], weight_vector))
-
-        ml_probability = 0.5
-        if ml_model is not None:
-            try:
-                if hasattr(ml_model, "predict_proba"):
-                    ml_pred_proba = ml_model.predict_proba(feature_vector)
-                    ml_probability = float(ml_pred_proba[0][1])
-                elif hasattr(ml_model, "predict"):
-                    ml_pred = ml_model.predict(feature_vector)
-                    ml_probability = float(ml_pred[0])
-            except Exception:
-                pass
-
-        final_score = (0.7 * math_score) + (0.3 * (ml_probability - 0.5) * 2.0)
-        return results, float(np.clip(final_score, -1, 1)), self.dynamic_weights
-
-
-class PowerTradingRiskEngine:
-
-    def calculate_risk_metrics(
-        self,
-        liquidation_volumes,
-        displayed_vol,
-        cancelled_vol,
-        time_exists,
-        obs_window,
-        open_interest,
-        leverage,
-        volatility,
-    ):
-        total_ltz = (
-            np.sum(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
-        )
-        max_ltz = np.max(liquidation_volumes) if len(liquidation_volumes) > 0 else 0.0
-        ltz_score = (max_ltz / (total_ltz + 1e-8)) * 100
-        spoof_ratio = cancelled_vol / (displayed_vol + 1e-8)
-        persistence = min(max(time_exists / (obs_window + 1e-8), 0), 1)
-        spoof_score = spoof_ratio * (1 - persistence)
-        squeeze_risk = total_ltz * open_interest * leverage * volatility
-        market_risk = ltz_score + spoof_score + squeeze_risk
-        return {
-            "LTZ_Score": ltz_score,
-            "Spoof_Score": spoof_score,
-            "Squeeze_Risk": squeeze_risk,
-            "Market_Risk": market_risk,
-        }
-
-
-# ==========================================
-# PROFESSIONAL STYLING & CSS
-# ==========================================
-st.markdown(
-    """
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
-    .stApp { background-color: #080a0f; color: #e2e8f0; }
-    section[data-testid="stSidebar"] { background-color: #0d1117 !important; border-right: 1px solid #161b22; }
-    .metric-card {
-        background: #111622; border: 1px solid #1e2638; border-radius: 12px;
-        padding: 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); margin-bottom: 10px;
-    }
-    .metric-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; }
-    .top-status-bar {
-        background: #111622; border: 1px solid #1e2638; border-radius: 10px;
-        padding: 12px 18px; margin-bottom: 18px; font-weight: 600; font-size: 13px;
-    }
-    .sticky-dashboard-header {
-        position: sticky; top: 0; z-index: 999; background: #080a0f;
-        padding-top: 10px; padding-bottom: 10px; border-bottom: 1px solid #1e2638;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# ==========================================
-# SIDEBAR CONTROLS
-# ==========================================
-COINS_LIST = [
+COINS = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
-    "XMRUSDT",
     "XRPUSDT",
+    "BNBUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
     "TAOUSDT",
+    "XMRUSDT",
 ]
-TIMEFRAME_MAP = {
-    "15m (Scalping)": ("15m", 15),
-    "30m (Scalping)": ("30m", 30),
-    "1h (Intraday)": ("1h", 60),
-    "4h (Intraday)": ("4h", 240),
-}
-
-st.sidebar.markdown("### ⚡ Terminal Controls")
-selected_symbol = st.sidebar.selectbox("Select Cryptocurrency", COINS_LIST, index=0)
-selected_tf_label = st.sidebar.selectbox(
-    "Select Timeframe", list(TIMEFRAME_MAP.keys()), index=0
-)
-forecast_horizon = st.sidebar.slider("Forecast Horizon Candles", 5, 30, 15)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🎛️ Paper Trading Mode")
-paper_trading_mode = st.sidebar.toggle("Enable Live Auto-Scans", value=True)
-loop_all_coins = st.sidebar.toggle("🔄 Scan All Coins in Loop", value=False)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🛠️ Manual Trade Execution")
-with st.sidebar.form("manual_trade_form"):
-    m_coin = st.selectbox("Manual Coin", COINS_LIST)
-    m_dir = st.selectbox("Direction", ["LONG", "SHORT"])
-    m_entry = st.number_input("Entry Price", value=0.0, step=0.1)
-    m_sl = st.number_input("Stop Loss", value=0.0, step=0.1)
-    m_tp = st.number_input("Take Profit (TP1)", value=0.0, step=0.1)
-    submit_manual = st.form_submit_button("📥 Open Manual Trade")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 ML Model & History Controls")
-if st.sidebar.button("🔄 Train Model Now (Manual)", use_container_width=True):
-    success, msg = train_xgboost_model_automatically(
-        st.session_state.trade_history_log, force=True
-    )
-    if success:
-        st.sidebar.success(msg)
-        st.cache_resource.clear()
-        time.sleep(1)
-        st.rerun()
-    else:
-        st.sidebar.error(f"Training failed: {msg}")
-
-if st.sidebar.button("🗑️ Clear Trade History", use_container_width=True):
-    st.session_state.trade_history_log = []
-    if os.path.exists(CSV_FILE):
-        try:
-            os.remove(CSV_FILE)
-        except Exception:
-            pass
-    st.sidebar.success("Trade history cleared successfully!")
-    time.sleep(0.5)
-    st.rerun()
-
-api_interval, tf_minutes = TIMEFRAME_MAP[selected_tf_label]
 
 
-# ==========================================
-# DATA FETCHING FUNCTIONS
-# ==========================================
-@st.cache_data(ttl=15)
-def fetch_klines_data(symbol, tf_key, limit=100):
-    binance_tf = (
-        "15m"
-        if "15m" in tf_key
-        else (
-            "30m"
-            if "30m" in tf_key
-            else ("1h" if "1h" in tf_key else "4h")
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = []
+
+if "active_trades" not in st.session_state:
+    st.session_state.active_trades = []
+
+if "last_signals" not in st.session_state:
+    st.session_state.last_signals = {}
+
+if "scanner_message" not in st.session_state:
+    st.session_state.scanner_message = ""
+
+if "selected_symbol" not in st.session_state:
+    st.session_state.selected_symbol = "BTCUSDT"
+
+if "selected_mode" not in st.session_state:
+    st.session_state.selected_mode = "SCALPING"
+
+
+# ============================================================
+# LOAD HISTORY
+# ============================================================
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return []
+
+    try:
+        df = pd.read_csv(HISTORY_FILE)
+
+        if df.empty:
+            return []
+
+        return df.to_dict("records")
+
+    except Exception:
+        return []
+
+
+if not st.session_state.trade_history:
+    st.session_state.trade_history = load_history()
+
+
+# ============================================================
+# SAVE HISTORY
+# ============================================================
+
+def save_history():
+
+    try:
+
+        if not st.session_state.trade_history:
+            return
+
+        pd.DataFrame(
+            st.session_state.trade_history
+        ).to_csv(
+            HISTORY_FILE,
+            index=False,
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def safe_float(value, default=0.0):
+
+    try:
+
+        value = float(value)
+
+        if np.isfinite(value):
+            return value
+
+    except Exception:
+        pass
+
+    return default
+
+
+def fmt_price(price):
+
+    price = safe_float(price)
+
+    if price <= 0:
+        return "—"
+
+    if price >= 1000:
+        return f"{price:,.2f}"
+
+    if price >= 1:
+        return f"{price:,.4f}"
+
+    return f"{price:.6f}"
+
+
+def pct(value):
+
+    return f"{safe_float(value) * 100:.1f}%"
+
+
+def clamp(value, low=-1.0, high=1.0):
+
+    return float(
+        np.clip(
+            safe_float(value),
+            low,
+            high,
         )
     )
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={binance_tf}&limit={limit}"
+
+
+def now_utc():
+
+    return dt.datetime.now(
+        dt.timezone.utc
+    )
+
+
+def iso_now():
+
+    return now_utc().isoformat()
+
+
+# ============================================================
+# SIGNAL DIRECTION
+# ============================================================
+
+def direction_label(score, confidence):
+
+    score = safe_float(score)
+    confidence = safe_float(confidence)
+
+    if score >= 0.70 and confidence >= 70:
+        return "STRONG LONG"
+
+    if score >= 0.45 and confidence >= 55:
+        return "LONG"
+
+    if score <= -0.70 and confidence >= 70:
+        return "STRONG SHORT"
+
+    if score <= -0.45 and confidence >= 55:
+        return "SHORT"
+
+    return "WAIT"
+
+
+# ============================================================
+# TRADE HORIZON
+# ============================================================
+
+def get_trade_horizon(mode):
+
+    mode = str(mode).upper()
+
+    config = TRADE_MODES.get(
+        mode,
+        TRADE_MODES["SCALPING"],
+    )
+
+    return config["duration_minutes"]
+
+
+def get_horizon_text(mode):
+
+    mode = str(mode).upper()
+
+    config = TRADE_MODES.get(
+        mode,
+        TRADE_MODES["SCALPING"],
+    )
+
+    return config["duration_text"]
+
+
+# ============================================================
+# EXPIRY
+# ============================================================
+
+def calculate_expiry(created_at, mode):
+
+    minutes = get_trade_horizon(mode)
+
     try:
-        res = requests.get(url, timeout=4).json()
-        if isinstance(res, dict) or not isinstance(res, list):
-            raise ValueError("API limit")
+
+        if isinstance(
+            created_at,
+            str,
+        ):
+
+            created = dt.datetime.fromisoformat(
+                created_at.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+        else:
+
+            created = created_at
+
+        if created.tzinfo is None:
+            created = created.replace(
+                tzinfo=dt.timezone.utc
+            )
+
+        return created + dt.timedelta(
+            minutes=minutes
+        )
+
+    except Exception:
+
+        return now_utc() + dt.timedelta(
+            minutes=minutes
+        )
+
+
+def seconds_remaining(expiry):
+
+    try:
+
+        if isinstance(
+            expiry,
+            str,
+        ):
+
+            expiry = dt.datetime.fromisoformat(
+                expiry.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(
+                tzinfo=dt.timezone.utc
+            )
+
+        return max(
+            0,
+            int(
+                (
+                    expiry
+                    - now_utc()
+                ).total_seconds()
+            ),
+        )
+
+    except Exception:
+
+        return 0
+
+
+def format_remaining(seconds):
+
+    seconds = max(
+        0,
+        int(seconds),
+    )
+
+    days = seconds // 86400
+    seconds %= 86400
+
+    hours = seconds // 3600
+    seconds %= 3600
+
+    minutes = seconds // 60
+    seconds %= 60
+
+    if days > 0:
+        return (
+            f"{days}d "
+            f"{hours}h "
+            f"{minutes}m"
+        )
+
+    if hours > 0:
+        return (
+            f"{hours}h "
+            f"{minutes}m"
+        )
+
+    return (
+        f"{minutes}m "
+        f"{seconds}s"
+    )
+
+
+# ============================================================
+# BINANCE DATA
+# ============================================================
+
+@st.cache_data(
+    ttl=10,
+    show_spinner=False,
+)
+def fetch_klines(
+    symbol,
+    interval,
+    limit=200,
+):
+
+    try:
+
+        response = requests.get(
+            BINANCE_KLINES,
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
+            timeout=8,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(
+            data,
+            list,
+        ):
+            return pd.DataFrame()
+
+        columns = [
+            "Open_Time",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "Close_Time",
+            "Quote_Volume",
+            "Trades",
+            "Taker_Buy_Base",
+            "Taker_Buy_Quote",
+            "Ignore",
+        ]
+
         df = pd.DataFrame(
-            res,
-            columns=[
-                "Open_Time",
+            data,
+            columns=columns,
+        )
+
+        numeric_cols = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
+
+        for col in numeric_cols:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            )
+
+        df["Time"] = pd.to_datetime(
+            df["Open_Time"],
+            unit="ms",
+            utc=True,
+        )
+
+        return df[
+            [
+                "Time",
                 "Open",
                 "High",
                 "Low",
                 "Close",
                 "Volume",
-                "Close_Time",
-                "QAV",
-                "NAT",
-                "TBBAV",
-                "TBQAV",
-                "Ignore",
-            ],
-        )
-        df["Time"] = pd.to_datetime(df["Open_Time"], unit="ms")
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = df[col].astype(float)
-        df.set_index("Time", inplace=True)
-        return df.reset_index()[["Time", "Open", "High", "Low", "Close", "Volume"]]
+            ]
+        ].dropna()
+
     except Exception:
-        dates = pd.date_range(
-            end=datetime.datetime.now(), periods=limit, freq=binance_tf
-        )
-        base_p = (
-            60000.0 if "BTC" in symbol else (3000.0 if "ETH" in symbol else 200.0)
-        )
-        closes = base_p + np.cumsum(np.random.normal(0, 5, limit))
-        return pd.DataFrame({
-            "Time": dates,
-            "Open": closes - 2,
-            "High": closes + 5,
-            "Low": closes - 5,
-            "Close": closes,
-            "Volume": np.random.uniform(50, 500, limit),
-        })
+
+        return pd.DataFrame()
 
 
-@st.cache_data(ttl=10)
-def fetch_order_book_depth(symbol, depth_limit=20):
+# ============================================================
+# ORDER BOOK
+# ============================================================
+
+@st.cache_data(
+    ttl=3,
+    show_spinner=False,
+)
+def fetch_orderbook(
+    symbol,
+    limit=50,
+):
+
     try:
-        url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit={depth_limit}"
-        res = requests.get(url, timeout=4).json()
-        if "bids" in res and "asks" in res:
-            return np.array(res["bids"], dtype=float), np.array(
-                res["asks"], dtype=float
-            )
+
+        response = requests.get(
+            BINANCE_DEPTH,
+            params={
+                "symbol": symbol,
+                "limit": limit,
+            },
+            timeout=5,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        bids = np.array(
+            data.get(
+                "bids",
+                [],
+            ),
+            dtype=float,
+        )
+
+        asks = np.array(
+            data.get(
+                "asks",
+                [],
+            ),
+            dtype=float,
+        )
+
+        return bids, asks
+
     except Exception:
-        pass
-    dummy_bids = np.array([[100.0 - i * 0.1, 1.5] for i in range(20)], dtype=float)
-    dummy_asks = np.array([[100.0 + i * 0.1, 1.5] for i in range(20)], dtype=float)
-    return dummy_bids, dummy_asks
 
-
-# ==========================================
-# MANUAL TRADE SUBMISSION
-# ==========================================
-if submit_manual:
-    temp_df_m = fetch_klines_data(m_coin, selected_tf_label, limit=5)
-    current_m_price = temp_df_m["Close"].iloc[-1] if not temp_df_m.empty else 100.0
-    entry_p = m_entry if m_entry > 0 else current_m_price
-    atr_approx = current_m_price * 0.005
-    sl_p = (
-        m_sl
-        if m_sl > 0
-        else (
-            entry_p - 1.5 * atr_approx
-            if m_dir == "LONG"
-            else entry_p + 1.5 * atr_approx
+        return (
+            np.empty(
+                (0, 2)
+            ),
+            np.empty(
+                (0, 2)
+            ),
         )
-    )
-    tp_p = (
-        m_tp
-        if m_tp > 0
-        else (
-            entry_p + 3.0 * atr_approx
-            if m_dir == "LONG"
-            else entry_p - 3.0 * atr_approx
+
+
+# ============================================================
+# 24H TICKER
+# ============================================================
+
+@st.cache_data(
+    ttl=5,
+    show_spinner=False,
+)
+def fetch_ticker(symbol):
+
+    try:
+
+        response = requests.get(
+            BINANCE_TICKER,
+            params={
+                "symbol": symbol,
+            },
+            timeout=5,
         )
-    )
 
-    manual_trade_id = f"MANUAL_{m_coin}_{int(time.time())}"
-    manual_new_trade = {
-        "trade_id": manual_trade_id,
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": m_coin,
-        "timeframe": selected_tf_label,
-        "direction": m_dir,
-        "entry_price": round(entry_p, 4),
-        "stop_loss": round(sl_p, 4),
-        "tp1": round(tp_p, 4),
-        "tp2": round(tp_p * 1.01 if m_dir == "LONG" else tp_p * 0.99, 4),
-        "exit_price": round(entry_p, 4),
-        "confidence": 91,
-        "final_score": 1.0 if m_dir == "LONG" else -1.0,
-        "outcome": "PENDING",
-        "pnl_percent": 0.0,
-        "duration": "Active",
-        "status": "Open",
-    }
-    st.session_state.trade_history_log.insert(0, manual_new_trade)
-    save_persistent_history(st.session_state.trade_history_log)
-    st.sidebar.success(f"Manually added {m_dir} trade for {m_coin}!")
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception:
+
+        return {}
 
 
-# ==========================================
-# LOOP SCANNER WITH FLEXIBLE THRESHOLD
-# ==========================================
-symbols_to_scan = COINS_LIST if loop_all_coins else [selected_symbol]
-lab = TenPaperResearchLab()
+# ============================================================
+# OBI
+# ============================================================
 
-HOLDING_COOLDOWN_SECONDS = 120
-
-for sym in symbols_to_scan:
-    recent_symbol_trade = False
-    for existing_t in st.session_state.trade_history_log:
-        if (
-            existing_t.get("symbol") == sym
-            and existing_t.get("timeframe") == selected_tf_label
-            and existing_t.get("status") == "Open"
-        ):
-            recent_symbol_trade = True
-            break
-
-    if recent_symbol_trade:
-        continue
-
-    scan_df = fetch_klines_data(sym, selected_tf_label)
-    scan_bids, scan_asks = fetch_order_book_depth(sym)
+def calculate_obi(
+    bids,
+    asks,
+    levels=20,
+):
 
     if (
-        not scan_df.empty
-        and len(scan_df) >= 3
-        and len(scan_bids) > 0
-        and len(scan_asks) > 0
+        len(bids) == 0
+        or len(asks) == 0
     ):
-        _, s_final_score, _ = lab.calculate_all_signals(
-            scan_df, scan_bids, scan_asks
-        )
-        s_close_p = scan_df["Close"].iloc[-1]
-        s_atr = (
-            (scan_df["High"] - scan_df["Low"]).rolling(14).mean().iloc[-1]
-        )
-        if np.isnan(s_atr):
-            s_atr = s_close_p * 0.005
+        return 0.0
 
-        s_dir = (
-            "LONG"
-            if s_final_score >= 0.05
-            else ("SHORT" if s_final_score <= -0.05 else "NEUTRAL")
+    n = min(
+        levels,
+        len(bids),
+        len(asks),
+    )
+
+    bid_sum = 0.0
+    ask_sum = 0.0
+
+    for i in range(n):
+
+        weight = 1.0 / (
+            i + 1
         )
-        s_conf = int(min(max(abs(s_final_score) * 100, 20), 99))
-        s_risk_dist = 1.5 * s_atr
 
-        if s_dir == "LONG":
-            s_sl = s_close_p - s_risk_dist
-            s_tp1 = s_close_p + (2.0 * s_risk_dist)
-            s_tp2 = s_close_p + (3.0 * s_risk_dist)
-        elif s_dir == "SHORT":
-            s_sl = s_close_p + s_risk_dist
-            s_tp1 = s_close_p - (2.0 * s_risk_dist)
-            s_tp2 = s_close_p - (3.0 * s_risk_dist)
-        else:
-            continue
-
-        if paper_trading_mode and s_dir != "NEUTRAL":
-            loop_trade_id = f"{sym}_{selected_tf_label}_{int(time.time())}"
-            loop_trade = {
-                "trade_id": loop_trade_id,
-                "timestamp": datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
+        bid_sum += (
+            max(
+                0,
+                safe_float(
+                    bids[i][1]
                 ),
-                "symbol": sym,
-                "timeframe": selected_tf_label,
-                "direction": s_dir,
-                "entry_price": round(s_close_p, 4),
-                "stop_loss": round(s_sl, 4),
-                "tp1": round(s_tp1, 4),
-                "tp2": round(s_tp2, 4),
-                "exit_price": round(s_close_p, 4),
-                "confidence": s_conf,
-                "final_score": round(s_final_score, 3),
-                "outcome": "PENDING",
-                "pnl_percent": 0.0,
-                "duration": "Active",
-                "status": "Open",
-            }
-            st.session_state.trade_history_log.insert(0, loop_trade)
+            )
+            * weight
+        )
 
-save_persistent_history(st.session_state.trade_history_log)
+        ask_sum += (
+            max(
+                0,
+                safe_float(
+                    asks[i][1]
+                ),
+            )
+            * weight
+        )
 
-
-# ==========================================
-# MAIN UI RENDERING
-# ==========================================
-df = fetch_klines_data(selected_symbol, selected_tf_label)
-bids, asks = fetch_order_book_depth(selected_symbol)
-
-if not df.empty and len(df) >= 3 and len(bids) > 0 and len(asks) > 0:
-    paper_results, final_score, evolved_weights = lab.calculate_all_signals(
-        df, bids, asks
+    denominator = (
+        bid_sum
+        + ask_sum
+        + 1e-12
     )
-    close_p = df["Close"].iloc[-1]
-    atr_val = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
-    if np.isnan(atr_val):
-        atr_val = close_p * 0.005
 
-    direction = (
-        "LONG"
-        if final_score >= 0.12
-        else ("SHORT" if final_score <= -0.12 else "NEUTRAL")
+    return clamp(
+        (
+            bid_sum
+            - ask_sum
+        )
+        / denominator
     )
-    confidence = int(min(max(abs(final_score) * 100, 20), 99))
-    risk_distance = 1.5 * atr_val
 
-    if direction == "LONG":
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
-    elif direction == "SHORT":
-        sl_val = close_p + risk_distance
-        tp1_val = close_p - (2.0 * risk_distance)
-        tp2_val = close_p - (3.0 * risk_distance)
-    else:
-        sl_val = close_p - risk_distance
-        tp1_val = close_p + (2.0 * risk_distance)
-        tp2_val = close_p + (3.0 * risk_distance)
 
-    lock_seconds = tf_minutes * 60
-    current_time_sec = int(time.time())
-    time_remaining = lock_seconds - (current_time_sec % lock_seconds)
+# ============================================================
+# MULTI OBI
+# ============================================================
 
-    # Outcome & Time Duration Checker
-    for trade in st.session_state.trade_history_log:
-        if trade["outcome"] == "PENDING":
-            t_time_str = trade.get("timestamp")
-            t_tf = trade.get("timeframe", "15m")
-            max_duration_mins = (
-                30 if ("15m" in t_tf or "30m" in t_tf) else 480
+def calculate_multi_obi(
+    bids,
+    asks,
+):
+
+    configs = {
+        5: 0.10,
+        10: 0.20,
+        20: 0.40,
+        50: 0.30,
+    }
+
+    values = []
+    weights = []
+
+    for level, weight in configs.items():
+
+        if (
+            len(bids) >= level
+            and len(asks) >= level
+        ):
+
+            values.append(
+                calculate_obi(
+                    bids,
+                    asks,
+                    level,
+                )
             )
 
-            if t_time_str:
-                try:
-                    t_dt = datetime.datetime.strptime(
-                        t_time_str, "%Y-%m-%d %H:%M:%S"
-                    )
-                    elapsed_mins = (
-                        datetime.datetime.now() - t_dt
-                    ).total_seconds() / 60.0
+            weights.append(
+                weight
+            )
 
-                    trade_symbol = trade["symbol"]
-                    temp_df = fetch_klines_data(
-                        trade_symbol, trade["timeframe"], limit=15
-                    )
-                    current_price = (
-                        temp_df["Close"].iloc[-1]
-                        if not temp_df.empty
-                        else trade["entry_price"]
-                    )
+    if not values:
+        return 0.0
 
-                    if elapsed_mins >= max_duration_mins:
-                        trade["status"] = "Closed"
-                        trade["exit_price"] = current_price
-                        pnl_calc = (
-                            ((current_price - trade["entry_price"]) / trade["entry_price"])
-                            * 100
-                            if trade["direction"] == "LONG"
-                            else ((trade["entry_price"] - current_price) / trade["entry_price"])
-                            * 100
+    return clamp(
+        float(
+            np.average(
+                values,
+                weights=weights,
+            )
+        )
+    )
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(
+    df,
+    period=14,
+):
+
+    if (
+        df is None
+        or df.empty
+        or len(df) < 2
+    ):
+        return 0.0
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    previous_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (
+                high
+                - previous_close
+            ).abs(),
+            (
+                low
+                - previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = (
+        tr.ewm(
+            alpha=1.0 / period,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    value = safe_float(
+        atr.iloc[-1]
+    )
+
+    if value <= 0:
+
+        value = safe_float(
+            tr.tail(
+                period
+            ).mean()
+        )
+
+    return max(
+        0.0,
+        value,
+    )
+
+
+# ============================================================
+# LOCAL FALLBACK SIGNAL ENGINE
+# ============================================================
+
+def local_signal_engine(
+    df,
+    bids,
+    asks,
+):
+
+    if (
+        df is None
+        or df.empty
+        or len(df) < 20
+    ):
+
+        return {
+            "score": 0.0,
+            "confidence": 0.0,
+            "direction": "WAIT",
+            "ml_probability": 0.50,
+            "obi": 0.0,
+            "trend": 0.0,
+            "atr": 0.0,
+        }
+
+    close = df["Close"]
+
+    ema20 = (
+        close.ewm(
+            span=20,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    ema50 = (
+        close.ewm(
+            span=50,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    atr = calculate_atr(
+        df,
+        14,
+    )
+
+    price = safe_float(
+        close.iloc[-1]
+    )
+
+    if atr <= 0:
+        atr = price * 0.001
+
+    trend = clamp(
+        np.tanh(
+            (
+                ema20.iloc[-1]
+                - ema50.iloc[-1]
+            )
+            / (
+                atr * 2
+            )
+        )
+    )
+
+    obi = calculate_multi_obi(
+        bids,
+        asks,
+    )
+
+    returns = (
+        close
+        .pct_change()
+        .dropna()
+    )
+
+    momentum = 0.0
+
+    if len(returns) >= 5:
+
+        momentum = clamp(
+            np.tanh(
+                (
+                    (
+                        close.iloc[-1]
+                        / close.iloc[-5]
+                    )
+                    - 1
+                )
+                / 0.005
+            )
+        )
+
+    score = (
+        0.45 * obi
+        + 0.35 * trend
+        + 0.20 * momentum
+    )
+
+    score = clamp(
+        score
+    )
+
+    confidence = abs(
+        score
+    ) * 100
+
+    if score >= 0.70:
+        direction = "STRONG LONG"
+
+    elif score >= 0.45:
+        direction = "LONG"
+
+    elif score <= -0.70:
+        direction = "STRONG SHORT"
+
+    elif score <= -0.45:
+        direction = "SHORT"
+
+    else:
+        direction = "WAIT"
+
+    probability = (
+        0.50
+        + (
+            score
+            * 0.45
+        )
+    )
+
+    probability = float(
+        np.clip(
+            probability,
+            0.05,
+            0.95,
+        )
+    )
+
+    return {
+        "score": score,
+        "confidence": confidence,
+        "direction": direction,
+        "ml_probability": probability,
+        "obi": obi,
+        "trend": trend,
+        "atr": atr,
+    }
+
+
+# ============================================================
+# TRY REAL RESEARCH ENGINE
+# ============================================================
+
+@st.cache_resource(
+    show_spinner=False,
+)
+def load_research_engine():
+
+    try:
+
+        from engine import (
+            IntegratedTradingEngine,
+        )
+
+        return IntegratedTradingEngine(
+            symbol="BTCUSDT"
+        )
+
+    except Exception:
+
+        return None
+
+
+def run_engine(
+    symbol,
+    df,
+    bids,
+    asks,
+    mode,
+):
+
+    engine = load_research_engine()
+
+    if engine is None:
+
+        return local_signal_engine(
+            df,
+            bids,
+            asks,
+        )
+
+    try:
+
+        engine.symbol = symbol
+
+        if hasattr(
+            engine,
+            "tri_engine",
+        ):
+            engine.tri_engine.set_symbol(
+                symbol
+            )
+
+        result = engine.analyze(
+            df=df,
+            bids=bids.tolist()
+            if isinstance(
+                bids,
+                np.ndarray,
+            )
+            else bids,
+            asks=asks.tolist()
+            if isinstance(
+                asks,
+                np.ndarray,
+            )
+            else asks,
+            trade_mode=mode,
+        )
+
+        return result
+
+    except Exception:
+
+        return local_signal_engine(
+            df,
+            bids,
+            asks,
+        )
+
+
+# ============================================================
+# NORMALIZE ENGINE OUTPUT
+# ============================================================
+
+def normalize_signal(
+    raw,
+    df,
+    mode,
+):
+
+    price = (
+        safe_float(
+            raw.get(
+                "CURRENT_PRICE",
+                raw.get(
+                    "current_price",
+                    0,
+                ),
+            )
+        )
+    )
+
+    if price <= 0 and df is not None and not df.empty:
+
+        price = safe_float(
+            df["Close"].iloc[-1]
+        )
+
+    score = safe_float(
+        raw.get(
+            "FINAL_SCORE",
+            raw.get(
+                "final_score",
+                raw.get(
+                    "SCORE",
+                    raw.get(
+                        "score",
+                        0,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    confidence = safe_float(
+        raw.get(
+            "CONFIDENCE",
+            raw.get(
+                "confidence",
+                abs(score) * 100,
+            ),
+        )
+    )
+
+    ml_probability = safe_float(
+        raw.get(
+            "ML_PROBABILITY",
+            raw.get(
+                "ml_probability",
+                0.50,
+            ),
+        ),
+        0.50,
+    )
+
+    direction = str(
+        raw.get(
+            "SIGNAL",
+            raw.get(
+                "signal",
+                "",
+            ),
+        )
+    ).upper()
+
+    if direction in [
+        "LONG",
+        "SHORT",
+        "STRONG LONG",
+        "STRONG SHORT",
+    ]:
+
+        final_direction = direction
+
+    else:
+
+        final_direction = direction_label(
+            score,
+            confidence,
+        )
+
+    atr = calculate_atr(
+        df,
+        14,
+    )
+
+    if atr <= 0:
+        atr = price * 0.001
+
+    # ========================================================
+    # SL
+    # ========================================================
+
+    stop_loss = safe_float(
+        raw.get(
+            "STOP_LOSS",
+            raw.get(
+                "stop_loss",
+                0,
+            ),
+        )
+    )
+
+    if stop_loss <= 0:
+
+        if "LONG" in final_direction:
+
+            stop_loss = (
+                price
+                - atr
+            )
+
+        elif "SHORT" in final_direction:
+
+            stop_loss = (
+                price
+                + atr
+            )
+
+    # ========================================================
+    # TP1 1:2
+    # ========================================================
+
+    risk = abs(
+        price
+        - stop_loss
+    )
+
+    if risk <= 0:
+        risk = atr
+
+    tp1 = safe_float(
+        raw.get(
+            "TP1",
+            raw.get(
+                "tp1",
+                0,
+            ),
+        )
+    )
+
+    if tp1 <= 0:
+
+        if "LONG" in final_direction:
+
+            tp1 = (
+                price
+                + (
+                    risk
+                    * 2
+                )
+            )
+
+        elif "SHORT" in final_direction:
+
+            tp1 = (
+                price
+                - (
+                    risk
+                    * 2
+                )
+            )
+
+    # ========================================================
+    # TP2 1:3
+    # ========================================================
+
+    tp2 = safe_float(
+        raw.get(
+            "TP2",
+            raw.get(
+                "tp2",
+                0,
+            ),
+        )
+    )
+
+    if tp2 <= 0:
+
+        if "LONG" in final_direction:
+
+            tp2 = (
+                price
+                + (
+                    risk
+                    * 3
+                )
+            )
+
+        elif "SHORT" in final_direction:
+
+            tp2 = (
+                price
+                - (
+                    risk
+                    * 3
+                )
+            )
+
+    return {
+        "direction": final_direction,
+        "score": score,
+        "confidence": confidence,
+        "ml_probability": ml_probability,
+        "entry": price,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr,
+
+        "quant_score": safe_float(
+            raw.get(
+                "QUANT_SCORE",
+                raw.get(
+                    "quant_score",
+                    score,
+                ),
+            )
+        ),
+
+        "ml_score": safe_float(
+            raw.get(
+                "ML_SCORE",
+                raw.get(
+                    "ml_score",
+                    0,
+                ),
+            )
+        ),
+
+        "ml_direction": str(
+            raw.get(
+                "ML_DIRECTION",
+                raw.get(
+                    "ml_direction",
+                    "NEUTRAL",
+                ),
+            )
+        ),
+
+        "tri_signal": str(
+            raw.get(
+                "TRI_SIGNAL",
+                raw.get(
+                    "tri_signal",
+                    "NEUTRAL",
+                ),
+            )
+        ),
+
+        "tri_touched": bool(
+            raw.get(
+                "TRI_TOUCHED",
+                raw.get(
+                    "tri_touched",
+                    False,
+                ),
+            )
+        ),
+
+        "tri_timeframe": raw.get(
+            "TRI_TIMEFRAME",
+            raw.get(
+                "tri_timeframe",
+                None,
+            ),
+        ),
+
+        "tri_line": safe_float(
+            raw.get(
+                "TRI_LINE",
+                raw.get(
+                    "tri_line",
+                    0,
+                ),
+            )
+        ),
+
+        "tri_rr": safe_float(
+            raw.get(
+                "TRI_RR",
+                raw.get(
+                    "tri_rr",
+                    0,
+                ),
+            )
+        ),
+
+        "tri_reason": str(
+            raw.get(
+                "TRI_REASON",
+                raw.get(
+                    "tri_reason",
+                    "NO_SETUP",
+                ),
+            )
+        ),
+
+        "features": raw.get(
+            "FEATURES",
+            raw.get(
+                "features",
+                {},
+            ),
+        ),
+
+        "weights": raw.get(
+            "WEIGHTS",
+            raw.get(
+                "weights",
+                {},
+            ),
+        ),
+    }
+
+
+# ============================================================
+# TRADE VALIDATION
+# ============================================================
+
+def is_trade_signal(direction):
+
+    return direction in [
+        "LONG",
+        "SHORT",
+        "STRONG LONG",
+        "STRONG SHORT",
+    ]
+
+
+# ============================================================
+# CREATE TRADE
+# ============================================================
+
+def create_trade(
+    symbol,
+    mode,
+    signal,
+):
+
+    if not is_trade_signal(
+        signal["direction"]
+    ):
+        return None
+
+    created = now_utc()
+
+    expiry = calculate_expiry(
+        created,
+        mode,
+    )
+
+    trade_id = (
+        f"{symbol}_"
+        f"{mode}_"
+        f"{int(time.time())}"
+    )
+
+    direction = signal[
+        "direction"
+    ]
+
+    trade = {
+
+        "trade_id": trade_id,
+
+        "timestamp": created.isoformat(),
+
+        "symbol": symbol,
+
+        "mode": mode,
+
+        "timeframe": TRADE_MODES[
+            mode
+        ][
+            "analysis_tf"
+        ],
+
+        "direction": direction,
+
+        "entry_price": signal[
+            "entry"
+        ],
+
+        "stop_loss": signal[
+            "stop_loss"
+        ],
+
+        "tp1": signal[
+            "tp1"
+        ],
+
+        "tp2": signal[
+            "tp2"
+        ],
+
+        "confidence": signal[
+            "confidence"
+        ],
+
+        "score": signal[
+            "score"
+        ],
+
+        "ml_probability": signal[
+            "ml_probability"
+        ],
+
+        "tri_signal": signal[
+            "tri_signal"
+        ],
+
+        "tri_line": signal[
+            "tri_line"
+        ],
+
+        "tri_rr": signal[
+            "tri_rr"
+        ],
+
+        "duration_minutes":
+            get_trade_horizon(
+                mode
+            ),
+
+        "duration_text":
+            get_horizon_text(
+                mode
+            ),
+
+        "expiry_time":
+            expiry.isoformat(),
+
+        "status": "ACTIVE",
+
+        "outcome": "PENDING",
+
+        "exit_price": 0.0,
+
+        "pnl_percent": 0.0,
+
+        "closed_at": "",
+
+        "close_reason": "",
+    }
+
+    return trade
+
+
+# ============================================================
+# RESOLVE ACTIVE TRADES
+# ============================================================
+
+def resolve_active_trades():
+
+    if not st.session_state.active_trades:
+        return
+
+    changed = False
+
+    current_cache = {}
+
+    for trade in st.session_state.active_trades:
+
+        symbol = trade["symbol"]
+
+        if symbol not in current_cache:
+
+            try:
+
+                ticker = fetch_ticker(
+                    symbol
+                )
+
+                price = safe_float(
+                    ticker.get(
+                        "lastPrice",
+                        0,
+                    )
+                )
+
+            except Exception:
+
+                price = 0.0
+
+            current_cache[
+                symbol
+            ] = price
+
+        price = current_cache[
+            symbol
+        ]
+
+        if price <= 0:
+            continue
+
+        direction = str(
+            trade["direction"]
+        ).upper()
+
+        entry = safe_float(
+            trade["entry_price"]
+        )
+
+        sl = safe_float(
+            trade["stop_loss"]
+        )
+
+        tp1 = safe_float(
+            trade["tp1"]
+        )
+
+        tp2 = safe_float(
+            trade["tp2"]
+        )
+
+        expiry = trade[
+            "expiry_time"
+        ]
+
+        remaining = seconds_remaining(
+            expiry
+        )
+
+        reason = None
+        outcome = None
+
+        # ====================================================
+        # LONG
+        # ====================================================
+
+        if "LONG" in direction:
+
+            if price <= sl:
+
+                reason = "STOP LOSS"
+                outcome = "LOSS"
+
+            elif price >= tp2:
+
+                reason = "TP2"
+                outcome = "WIN"
+
+            elif price >= tp1:
+
+                # TP1 is marked but trade stays alive
+                if trade.get(
+                    "status"
+                ) == "ACTIVE":
+
+                    trade[
+                        "status"
+                    ] = "TP1 HIT"
+
+                    changed = True
+
+        # ====================================================
+        # SHORT
+        # ====================================================
+
+        elif "SHORT" in direction:
+
+            if price >= sl:
+
+                reason = "STOP LOSS"
+                outcome = "LOSS"
+
+            elif price <= tp2:
+
+                reason = "TP2"
+                outcome = "WIN"
+
+            elif price <= tp1:
+
+                if trade.get(
+                    "status"
+                ) == "ACTIVE":
+
+                    trade[
+                        "status"
+                    ] = "TP1 HIT"
+
+                    changed = True
+
+        # ====================================================
+        # EXPIRY
+        # ====================================================
+
+        if (
+            reason is None
+            and remaining <= 0
+        ):
+
+            reason = "TIME EXPIRY"
+            outcome = (
+                "WIN"
+                if (
+                    (
+                        "LONG"
+                        in direction
+                        and price > entry
+                    )
+                    or
+                    (
+                        "SHORT"
+                        in direction
+                        and price < entry
+                    )
+                )
+                else "LOSS"
+            )
+
+        # ====================================================
+        # CLOSE
+        # ====================================================
+
+        if reason is not None:
+
+            if entry > 0:
+
+                if "LONG" in direction:
+
+                    pnl = (
+                        (
+                            price
+                            - entry
                         )
-                        trade["pnl_percent"] = round(pnl_calc, 2)
-                        trade["outcome"] = "WIN" if pnl_calc >= 0 else "LOSS"
-                    else:
-                        if not temp_df.empty:
-                            for idx, row in temp_df.iterrows():
-                                candle_time = str(row["Time"])
-                                if candle_time >= t_time_str:
-                                    curr_high, curr_low = (
-                                        row["High"],
-                                        row["Low"],
-                                    )
-                                    entry = trade["entry_price"]
-                                    sl = trade["stop_loss"]
-                                    tp = trade["tp1"]
+                        / entry
+                    ) * 100
 
-                                    if trade["direction"] == "LONG":
-                                        if curr_high >= tp:
-                                            trade["outcome"] = "WIN"
-                                            trade["exit_price"] = tp
-                                            trade["pnl_percent"] = round(
-                                                ((tp - entry) / entry) * 100, 2
-                                            )
-                                            trade["status"] = "Closed"
-                                            break
-                                        elif curr_low <= sl:
-                                            trade["outcome"] = "LOSS"
-                                            trade["exit_price"] = sl
-                                            trade["pnl_percent"] = round(
-                                                ((sl - entry) / entry) * 100, 2
-                                            )
-                                            trade["status"] = "Closed"
-                                            break
-                                    elif trade["direction"] == "SHORT":
-                                        if curr_low <= tp:
-                                            trade["outcome"] = "WIN"
-                                            trade["exit_price"] = tp
-                                            trade["pnl_percent"] = round(
-                                                ((entry - tp) / entry) * 100, 2
-                                            )
-                                            trade["status"] = "Closed"
-                                            break
-                                        elif curr_high >= sl:
-                                            trade["outcome"] = "LOSS"
-                                            trade["exit_price"] = sl
-                                            trade["pnl_percent"] = round(
-                                                ((entry - sl) / entry) * 100, 2
-                                            )
-                                            trade["status"] = "Closed"
-                                            break
-                except Exception:
-                    pass
+                else:
 
-    save_persistent_history(st.session_state.trade_history_log)
+                    pnl = (
+                        (
+                            entry
+                            - price
+                        )
+                        / entry
+                    ) * 100
 
-    total_pnl_sum = sum(
-        [
-            t.get("pnl_percent", 0.0)
-            for t in st.session_state.trade_history_log
-            if t.get("outcome") in ["WIN", "LOSS"]
-        ]
-    )
-    total_wins = len(
-        [
-            t
-            for t in st.session_state.trade_history_log
-            if t.get("outcome") == "WIN"
-        ]
-    )
-    total_losses = len(
-        [
-            t
-            for t in st.session_state.trade_history_log
-            if t.get("outcome") == "LOSS"
-        ]
-    )
+            else:
 
-    closed_count = len([
+                pnl = 0.0
+
+            trade[
+                "status"
+            ] = "CLOSED"
+
+            trade[
+                "outcome"
+            ] = outcome
+
+            trade[
+                "exit_price"
+            ] = price
+
+            trade[
+                "pnl_percent"
+            ] = round(
+                pnl,
+                4,
+            )
+
+            trade[
+                "closed_at"
+            ] = iso_now()
+
+            trade[
+                "close_reason"
+            ] = reason
+
+            st.session_state.trade_history.insert(
+                0,
+                trade.copy(),
+            )
+
+            changed = True
+
+    st.session_state.active_trades = [
         t
-        for t in st.session_state.trade_history_log
-        if t["outcome"] in ["WIN", "LOSS"]
-    ])
-    next_train_target = (
-        closed_count // TRAIN_INTERVAL + 1
-    ) * TRAIN_INTERVAL
+        for t in st.session_state.active_trades
+        if t.get(
+            "status"
+        )
+        not in [
+            "CLOSED",
+        ]
+    ]
 
-    risk_engine = PowerTradingRiskEngine()
-    disp_vol = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-    risk_metrics = risk_engine.calculate_risk_metrics(
-        liquidation_volumes=np.array([1000, 2500]),
-        displayed_vol=disp_vol,
-        cancelled_vol=disp_vol * 0.1,
-        time_exists=15.0,
-        obs_window=60.0,
-        open_interest=150000.0,
-        leverage=20.0,
-        volatility=df["Close"].pct_change().std() + 1e-8,
+    if changed:
+        save_history()
+
+
+# ============================================================
+# AUTO REFRESH
+# ============================================================
+
+st_autorefresh(
+    interval=5000,
+    limit=None,
+    key="zia_research_refresh",
+)
+
+
+# ============================================================
+# RESOLVE TRADES
+# ============================================================
+
+resolve_active_trades()
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+<style>
+
+.stApp {
+    background:
+        radial-gradient(
+            circle at 20% 0%,
+            rgba(0, 255, 180, 0.04),
+            transparent 35%
+        ),
+        #07090d;
+    color: #e6edf3;
+}
+
+section[data-testid="stSidebar"] {
+    background: #0b0f15;
+    border-right: 1px solid #1b2430;
+}
+
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 3rem;
+}
+
+h1, h2, h3 {
+    letter-spacing: -0.02em;
+}
+
+.brand {
+    font-size: 29px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+}
+
+.subtitle {
+    color: #7d8a99;
+    font-size: 12px;
+    margin-top: -5px;
+}
+
+.card {
+    background: linear-gradient(
+        145deg,
+        #10151d,
+        #0c1118
+    );
+    border: 1px solid #1d2733;
+    border-radius: 14px;
+    padding: 17px;
+    margin-bottom: 12px;
+    box-shadow:
+        0 10px 35px
+        rgba(0,0,0,0.20);
+}
+
+.card-title {
+    color: #7f8b99;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+}
+
+.card-value {
+    color: #f0f6fc;
+    font-size: 25px;
+    font-weight: 800;
+}
+
+.card-small {
+    color: #9ba7b5;
+    font-size: 12px;
+}
+
+.signal-card {
+    background:
+        linear-gradient(
+            135deg,
+            #101821,
+            #0b1017
+        );
+    border: 1px solid #263241;
+    border-radius: 18px;
+    padding: 25px;
+    min-height: 260px;
+}
+
+.signal-title {
+    color: #7e8c9b;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
+
+.signal-value {
+    font-size: 42px;
+    font-weight: 900;
+    margin: 7px 0 5px 0;
+}
+
+.long {
+    color: #21d19a;
+}
+
+.short {
+    color: #ff5c72;
+}
+
+.wait {
+    color: #f5c451;
+}
+
+.white {
+    color: #f5f7fa;
+}
+
+.progress-bg {
+    background: #18212b;
+    height: 8px;
+    border-radius: 20px;
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+    border-radius: 20px;
+    background: #22d3a0;
+}
+
+.badge {
+    display: inline-block;
+    border: 1px solid #293544;
+    border-radius: 999px;
+    padding: 5px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-right: 5px;
+}
+
+.timer {
+    font-size: 30px;
+    font-weight: 800;
+}
+
+.section-title {
+    font-size: 18px;
+    font-weight: 800;
+    margin-top: 15px;
+    margin-bottom: 10px;
+}
+
+hr {
+    border-color: #1b2530;
+}
+
+[data-testid="stMetric"] {
+    background: #0e141c;
+    border: 1px solid #1d2733;
+    border-radius: 12px;
+    padding: 10px;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.markdown(
+    "## ⚡ ZIA RESEARCH"
+)
+
+st.sidebar.caption(
+    "Quantitative Market Research Terminal"
+)
+
+st.sidebar.markdown("---")
+
+
+selected_symbol = st.sidebar.selectbox(
+    "MARKET",
+    COINS,
+    index=COINS.index(
+        st.session_state.selected_symbol
+    )
+    if st.session_state.selected_symbol
+    in COINS
+    else 0,
+)
+
+selected_mode = st.sidebar.selectbox(
+    "SIGNAL MODE",
+    list(TRADE_MODES.keys()),
+    format_func=lambda x:
+        TRADE_MODES[x]["label"],
+    index=list(
+        TRADE_MODES.keys()
+    ).index(
+        st.session_state.selected_mode
+    ),
+)
+
+st.session_state.selected_symbol = (
+    selected_symbol
+)
+
+st.session_state.selected_mode = (
+    selected_mode
+)
+
+
+# ============================================================
+# MODE INFO
+# ============================================================
+
+mode_config = TRADE_MODES[
+    selected_mode
+]
+
+st.sidebar.markdown("---")
+
+st.sidebar.markdown(
+    "### TRADE HORIZON"
+)
+
+st.sidebar.info(
+    (
+        f"Analysis: **{mode_config['analysis_tf']}**\n\n"
+        f"Trade: **{mode_config['duration_text']}**\n\n"
+        f"Max holding: **{mode_config['max_holding']}**"
+    )
+)
+
+
+# ============================================================
+# SIDEBAR OPTIONS
+# ============================================================
+
+auto_scan = st.sidebar.toggle(
+    "AUTO SIGNAL SCAN",
+    value=True,
+)
+
+show_chart = st.sidebar.toggle(
+    "SHOW PRICE CHART",
+    value=True,
+)
+
+show_features = st.sidebar.toggle(
+    "SHOW RESEARCH FEATURES",
+    value=True,
+)
+
+show_orderbook = st.sidebar.toggle(
+    "SHOW ORDER BOOK",
+    value=True,
+)
+
+
+# ============================================================
+# MANUAL SIGNAL
+# ============================================================
+
+st.sidebar.markdown("---")
+
+if st.sidebar.button(
+    "🔄 REFRESH NOW",
+    use_container_width=True,
+):
+
+    st.cache_data.clear()
+    st.rerun()
+
+
+# ============================================================
+# DATA
+# ============================================================
+
+interval = mode_config[
+    "analysis_tf"
+]
+
+df = fetch_klines(
+    selected_symbol,
+    interval,
+    200,
+)
+
+bids, asks = fetch_orderbook(
+    selected_symbol,
+    50,
+)
+
+ticker = fetch_ticker(
+    selected_symbol
+)
+
+# ============================================================
+# SIGNAL
+# ============================================================
+
+if (
+    df.empty
+    or len(df) < 20
+):
+
+    st.error(
+        "Market data unavailable."
     )
 
-    dir_color = (
-        "#00e676"
-        if direction == "LONG"
-        else ("#ff5252" if direction == "SHORT" else "#38bdf8")
+    st.stop()
+
+
+raw_signal = run_engine(
+    selected_symbol,
+    df,
+    bids,
+    asks,
+    selected_mode,
+)
+
+signal = normalize_signal(
+    raw_signal,
+    df,
+    selected_mode,
+)
+
+
+# ============================================================
+# SAVE LAST SIGNAL
+# ============================================================
+
+signal_key = (
+    f"{selected_symbol}_"
+    f"{selected_mode}"
+)
+
+st.session_state.last_signals[
+    signal_key
+] = signal
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    """
+<div class="brand">
+⚡ ZIA RESEARCH LAB
+</div>
+<div class="subtitle">
+REAL-TIME QUANTITATIVE MARKET RESEARCH & PAPER SIGNAL TERMINAL
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown("")
+
+
+# ============================================================
+# TOP MARKET BAR
+# ============================================================
+
+price = signal[
+    "entry"
+]
+
+ticker_change = safe_float(
+    ticker.get(
+        "priceChangePercent",
+        0,
     )
-    mins_rem, secs_rem = divmod(time_remaining, 60)
-    pnl_total_color = "#00e676" if total_pnl_sum >= 0 else "#ff5252"
-    pnl_total_sign = "+" if total_pnl_sum >= 0 else ""
+)
+
+volume_24h = safe_float(
+    ticker.get(
+        "volume",
+        0,
+    )
+)
+
+obi = calculate_multi_obi(
+    bids,
+    asks,
+)
+
+market_change_text = (
+    f"{ticker_change:+.2f}%"
+)
+
+st.markdown(
+    f"""
+<div class="card">
+
+<div class="card-small">
+MARKET
+</div>
+
+<h2 style="margin:3px 0;">
+{selected_symbol}
+</h2>
+
+<div style="
+font-size:30px;
+font-weight:800;
+">
+{fmt_price(price)}
+</div>
+
+<div class="card-small">
+24H CHANGE:
+{market_change_text}
+&nbsp;&nbsp; | &nbsp;&nbsp;
+OBI:
+{obi:+.3f}
+&nbsp;&nbsp; | &nbsp;&nbsp;
+MODE:
+{mode_config['label']}
+</div>
+
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# MAIN SIGNAL CARD
+# ============================================================
+
+direction = signal[
+    "direction"
+]
+
+if "LONG" in direction:
+
+    direction_class = "long"
+
+elif "SHORT" in direction:
+
+    direction_class = "short"
+
+else:
+
+    direction_class = "wait"
+
+
+confidence = signal[
+    "confidence"
+]
+
+score = signal[
+    "score"
+]
+
+horizon = get_horizon_text(
+    selected_mode
+)
+
+st.markdown(
+    f"""
+<div class="signal-card">
+
+<div class="signal-title">
+CURRENT RESEARCH SIGNAL
+</div>
+
+<div class="signal-value {direction_class}">
+{direction}
+</div>
+
+<div style="
+font-size:13px;
+color:#8e9baa;
+margin-bottom:14px;
+">
+{selected_symbol}
+&nbsp; • &nbsp;
+{mode_config['label']}
+&nbsp; • &nbsp;
+TRADE HORIZON: {horizon}
+</div>
+
+<div class="card-small">
+CONFIDENCE
+</div>
+
+<div style="
+font-size:25px;
+font-weight:800;
+margin-bottom:8px;
+">
+{confidence:.1f}%
+</div>
+
+<div class="progress-bg">
+
+<div
+class="progress-fill"
+style="width:{min(100, max(0, confidence))}%">
+</div>
+
+</div>
+
+<div style="
+margin-top:16px;
+">
+
+<span class="badge">
+SCORE {score:+.3f}
+</span>
+
+<span class="badge">
+ML {signal['ml_probability'] * 100:.1f}%
+</span>
+
+<span class="badge">
+TRI {signal['tri_signal']}
+</span>
+
+</div>
+
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# TRADE PLAN
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">🎯 TRADE PLAN</div>',
+    unsafe_allow_html=True,
+)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+with c1:
+
+    st.metric(
+        "ENTRY",
+        fmt_price(
+            signal["entry"]
+        ),
+    )
+
+with c2:
+
+    st.metric(
+        "STOP LOSS",
+        fmt_price(
+            signal["stop_loss"]
+        ),
+    )
+
+with c3:
+
+    st.metric(
+        "TP1 • 1:2",
+        fmt_price(
+            signal["tp1"]
+        ),
+    )
+
+with c4:
+
+    st.metric(
+        "TP2 • 1:3",
+        fmt_price(
+            signal["tp2"]
+        ),
+    )
+
+with c5:
+
+    st.metric(
+        "HORIZON",
+        horizon,
+    )
+
+
+# ============================================================
+# RISK / RESEARCH
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">🧠 RESEARCH ENGINE</div>',
+    unsafe_allow_html=True,
+)
+
+r1, r2, r3, r4, r5, r6 = st.columns(6)
+
+with r1:
+
+    st.metric(
+        "QUANT SCORE",
+        f"{signal['quant_score']:+.3f}",
+    )
+
+with r2:
+
+    st.metric(
+        "ML SCORE",
+        f"{signal['ml_score']:+.3f}",
+    )
+
+with r3:
+
+    st.metric(
+        "ML UP",
+        pct(
+            signal[
+                "ml_probability"
+            ]
+        ),
+    )
+
+with r4:
+
+    st.metric(
+        "OBI",
+        f"{obi:+.3f}",
+    )
+
+with r5:
+
+    st.metric(
+        "TRI RR",
+        (
+            f"{signal['tri_rr']:.2f}"
+            if signal["tri_rr"] > 0
+            else "—"
+        ),
+    )
+
+with r6:
+
+    st.metric(
+        "ATR",
+        fmt_price(
+            signal["atr"]
+        ),
+    )
+
+
+# ============================================================
+# SIGNAL EXPIRY / PAPER TRADE
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">⏱️ SIGNAL / TRADE TIMER</div>',
+    unsafe_allow_html=True,
+)
+
+current_active = None
+
+for trade in st.session_state.active_trades:
+
+    if (
+        trade["symbol"]
+        == selected_symbol
+        and trade["mode"]
+        == selected_mode
+    ):
+
+        current_active = trade
+        break
+
+
+if current_active is not None:
+
+    remaining = seconds_remaining(
+        current_active[
+            "expiry_time"
+        ]
+    )
 
     st.markdown(
         f"""
-    <div class="top-status-bar" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-        <div>
-            🟢 <b>[{selected_symbol}]</b> &nbsp;|&nbsp; Price: <b>${close_p:,.4f}</b> &nbsp;|&nbsp; 
-            SIGNAL: <span style="color:{dir_color};">{direction}</span> &nbsp;|&nbsp; 
-            Score: <b>{final_score:+.3f}</b> &nbsp;|&nbsp; Conf: <b>{confidence}%</b> &nbsp;|&nbsp; 
-            ⏳ Reset: <b>{mins_rem}m {secs_rem}s</b>
-        </div>
-        <div>
-            💰 Total P&L: <b style="color:{pnl_total_color};">{pnl_total_sign}{total_pnl_sum:.2f}%</b> &nbsp;|&nbsp; 
-            🏆 Wins: <b style="color:#00e676;">{total_wins}</b> &nbsp;|&nbsp; ❌ Losses: <b style="color:#ff5252;">{total_losses}</b>
-        </div>
-    </div>
-    """,
+<div class="card">
+
+<div class="card-title">
+ACTIVE PAPER TRADE
+</div>
+
+<div class="timer">
+{format_remaining(remaining)}
+</div>
+
+<div class="card-small">
+EXPIRY:
+{current_active['expiry_time']}
+</div>
+
+<br>
+
+<div class="card-small">
+STATUS:
+<b>
+{current_active['status']}
+</b>
+&nbsp;&nbsp; | &nbsp;&nbsp;
+ENTRY:
+<b>
+{fmt_price(current_active['entry_price'])}
+</b>
+&nbsp;&nbsp; | &nbsp;&nbsp;
+DIRECTION:
+<b>
+{current_active['direction']}
+</b>
+</div>
+
+</div>
+""",
         unsafe_allow_html=True,
     )
 
-    col_sig, col_m1, col_m2, col_m3, col_m4 = st.columns([1.2, 1, 1, 1, 1])
+else:
 
-    with col_sig:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left: 4px solid {dir_color};">
-                <div class="metric-label">Signal Engine</div>
-                <div style="font-size:22px; font-weight:700; color:{dir_color};">{direction}</div>
-                <div style="font-size:11px; color:#8b949e; margin-top:4px;">Entry: ${close_p:,.4f} | SL: ${sl_val:,.4f}</div>
-                <div style="font-size:11px; color:#38bdf8;">TP1: ${tp1_val:,.4f} | TP2: ${tp2_val:,.4f}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with col_m1:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP1 Target (1:2)</div><div class="metric-val-blue">${tp1_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">TP2 Target (1:3)</div><div class="metric-val-blue">${tp2_val:,.4f}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m2:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Closed Count</div><div class="metric-val-blue">{closed_count} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Next Train At</div><div class="metric-val-green">{next_train_target} Trades</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m3:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">LTZ Score</div><div class="metric-val-blue">{risk_metrics["LTZ_Score"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Spoof Score</div><div class="metric-val-red">{risk_metrics["Spoof_Score"]:.3f}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col_m4:
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Squeeze Risk</div><div class="metric-val-red">{risk_metrics["Squeeze_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card"><div class="metric-label">Market Risk</div><div class="metric-val-red">{risk_metrics["Market_Risk"]:.2f}</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    col_chart, col_risk_panel = st.columns([2.5, 1])
-    with col_chart:
-        st.subheader(f"Price Trajectory & Levels ({selected_symbol})")
-        time_delta = pd.Timedelta(minutes=tf_minutes)
-        future_times = [
-            df["Time"].iloc[-1] + (i * time_delta)
-            for i in range(1, forecast_horizon + 1)
-        ]
-        t_steps = np.linspace(0, np.pi / 2, forecast_horizon)
-
-        if direction == "LONG":
-            forecast_prices = close_p + (tp2_val - close_p) * np.sin(t_steps)
-        elif direction == "SHORT":
-            forecast_prices = close_p - (close_p - tp2_val) * np.sin(t_steps)
-        else:
-            forecast_prices = [close_p] * forecast_horizon
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df["Time"],
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="Candles",
-                increasing_line_color="#00e676",
-                decreasing_line_color="#ff5252",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[df["Time"].iloc[-1]] + future_times,
-                y=[close_p] + list(forecast_prices),
-                mode="lines+markers",
-                name="Trajectory",
-                line=dict(color=dir_color, width=2, dash="dot"),
-            )
-        )
-        fig.add_hline(
-            y=tp2_val,
-            line_dash="dash",
-            line_color="#00e676",
-            annotation_text=f"TP2: ${tp2_val:,.4f}",
-        )
-        fig.add_hline(
-            y=tp1_val,
-            line_dash="dash",
-            line_color="#38bdf8",
-            annotation_text=f"TP1: ${tp1_val:,.4f}",
-        )
-        fig.add_hline(
-            y=sl_val,
-            line_dash="dot",
-            line_color="#ff5252",
-            annotation_text=f"SL: ${sl_val:,.4f}",
-        )
-        fig.update_layout(
-            template="plotly_dark",
-            height=420,
-            xaxis_rangeslider_visible=False,
-            paper_bgcolor="#111622",
-            plot_bgcolor="#111622",
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_risk_panel:
-        st.subheader("Market Microstructure")
-        bid_vol_sum = np.sum(bids[:, 1]) if len(bids) > 0 else 1.0
-        ask_vol_sum = np.sum(asks[:, 1]) if len(asks) > 0 else 1.0
-        obi_val = (bid_vol_sum - ask_vol_sum) / (
-            bid_vol_sum + ask_vol_sum + 1e-8
-        )
-        spread_val = (
-            abs(asks[0, 0] - bids[0, 0])
-            if len(bids) > 0 and len(asks) > 0
-            else 0.0
-        )
+    if is_trade_signal(
+        direction
+    ):
 
         st.markdown(
             f"""
-        <div class="metric-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Bid Volume</span> <b style="color:#00e676;">{bid_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Ask Volume</span> <b style="color:#ff5252;">{ask_vol_sum:,.2f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>OBI</span> <b style="color:#38bdf8;">{obi_val:+.3f}</b></div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;"><span>Spread</span> <b>${spread_val:.4f}</b></div>
-            <div style="display:flex; justify-content:space-between;"><span>Loop Scan</span> <b style="color:#00e676;">{"ACTIVE" if loop_all_coins else "SINGLE"}</b></div>
-        </div>
-        """,
+<div class="card">
+
+<div class="card-title">
+SIGNAL READY
+</div>
+
+<div style="
+font-size:21px;
+font-weight:800;
+">
+{direction}
+</div>
+
+<div class="card-small">
+If opened now, maximum trade duration:
+<b>{horizon}</b>
+</div>
+
+</div>
+""",
             unsafe_allow_html=True,
         )
 
-    st.markdown("---")
+        if st.button(
+            "🚀 OPEN PAPER TRADE",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            new_trade = create_trade(
+                selected_symbol,
+                selected_mode,
+                signal,
+            )
+
+            if new_trade:
+
+                st.session_state.active_trades.append(
+                    new_trade
+                )
+
+                st.success(
+                    (
+                        f"{direction} paper trade opened. "
+                        f"Expiry: {horizon}."
+                    )
+                )
+
+                st.rerun()
+
+    else:
+
+        st.info(
+            "No valid trade signal. "
+            "Waiting for confirmation."
+        )
+
+
+# ============================================================
+# CHART
+# ============================================================
+
+if show_chart:
 
     st.markdown(
-        """
-    <div class="sticky-dashboard-header">
-        <h3 style="margin: 0; font-size: 18px; color: #f0f6fc; font-weight: 700;">📊 Active & Closed Trades Dashboard (Scalping: 15m/30m | Intraday: 1h/4h)</h3>
-    </div>
-    """,
+        '<div class="section-title">📈 PRICE ACTION</div>',
         unsafe_allow_html=True,
     )
 
-    tab_scalping, tab_intraday = st.tabs(
-        ["⚡ Scalping (15m / 30m)", "📊 Intraday (1h / 4h)"]
+    chart = go.Figure()
+
+    chart.add_trace(
+        go.Candlestick(
+            x=df["Time"],
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Price",
+        )
     )
 
-    if st.session_state.trade_history_log:
-        scalping_trades = []
-        intraday_trades = []
+    chart.add_hline(
+        y=signal["entry"],
+        line_dash="solid",
+        annotation_text="ENTRY",
+    )
 
-        for t in st.session_state.trade_history_log:
-            tf_str = str(t.get("timeframe", ""))
-            if "15m" in tf_str or "30m" in tf_str:
-                scalping_trades.append(t)
-            elif "1h" in tf_str or "4h" in tf_str or ("15m" not in tf_str and "30m" not in tf_str):
-                intraday_trades.append(t)
+    if signal["stop_loss"] > 0:
 
-        def get_coin_icon(symbol):
-            if "BTC" in symbol:
-                return "₿"
-            elif "ETH" in symbol:
-                return "Ξ"
-            elif "SOL" in symbol:
-                return "🟣"
-            elif "XRP" in symbol:
-                return "✕"
-            elif "XMR" in symbol:
-                return "🅜"
-            elif "TAO" in symbol:
-                return "τ"
-            else:
-                return "🪙"
+        chart.add_hline(
+            y=signal["stop_loss"],
+            line_dash="dot",
+            annotation_text="SL",
+        )
 
-        def render_trade_cards(trades_subset):
-            if not trades_subset:
-                st.info("No trades found for this category.")
-                return
-            for t in trades_subset:
-                t_dir = t.get("direction", "LONG")
-                raw_sym = t.get("symbol", "BTCUSDT")
-                t_sym = raw_sym.replace("USDT", "/USDT")
-                coin_icon = get_coin_icon(raw_sym)
+    if signal["tp1"] > 0:
 
-                t_entry = t.get("entry_price", 0.0)
-                t_sl = t.get("stop_loss", 0.0)
-                t_tp1 = t.get("tp1", 0.0)
-                t_tp2 = t.get("tp2", 0.0)
-                t_conf = t.get("confidence", 90)
-                t_pnl = t.get("pnl_percent", 0.0)
-                t_status = t.get("status", "Open")
-                t_exit = t.get("exit_price", t_entry)
-                t_time = t.get("timestamp", "")
-                t_tf = t.get("timeframe", "15m")
-                t_outcome = t.get("outcome", "PENDING")
+        chart.add_hline(
+            y=signal["tp1"],
+            line_dash="dot",
+            annotation_text="TP1 1:2",
+        )
 
-                max_duration_mins = (
-                    30 if ("15m" in t_tf or "30m" in t_tf) else 480
+    if signal["tp2"] > 0:
+
+        chart.add_hline(
+            y=signal["tp2"],
+            line_dash="dot",
+            annotation_text="TP2 1:3",
+        )
+
+    if signal["tri_line"] > 0:
+
+        chart.add_hline(
+            y=signal["tri_line"],
+            line_dash="dash",
+            annotation_text=(
+                f"TRI {signal['tri_timeframe']}"
+            ),
+        )
+
+    chart.update_layout(
+        height=570,
+        template="plotly_dark",
+        paper_bgcolor="#07090d",
+        plot_bgcolor="#07090d",
+        xaxis_rangeslider_visible=False,
+        margin=dict(
+            l=10,
+            r=10,
+            t=20,
+            b=10,
+        ),
+        legend=dict(
+            orientation="h",
+        ),
+    )
+
+    st.plotly_chart(
+        chart,
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# ORDER BOOK
+# ============================================================
+
+if show_orderbook:
+
+    st.markdown(
+        '<div class="section-title">📚 ORDER BOOK IMBALANCE</div>',
+        unsafe_allow_html=True,
+    )
+
+    ob1, ob2 = st.columns(2)
+
+    with ob1:
+
+        bid_total = (
+            float(
+                np.sum(
+                    bids[:20, 1]
                 )
-                time_display_str = "Completed"
-                if t_status == "Open" and t_time:
-                    try:
-                        t_dt = datetime.datetime.strptime(
-                            t_time, "%Y-%m-%d %H:%M:%S"
+            )
+            if len(bids) >= 20
+            else 0
+        )
+
+        ask_total = (
+            float(
+                np.sum(
+                    asks[:20, 1]
+                )
+            )
+            if len(asks) >= 20
+            else 0
+        )
+
+        st.markdown(
+            f"""
+<div class="card">
+
+<div class="card-title">
+TOP 20 DEPTH
+</div>
+
+<div style="
+font-size:24px;
+font-weight:800;
+">
+BIDS {bid_total:.2f}
+</div>
+
+<div style="
+font-size:24px;
+font-weight:800;
+">
+ASKS {ask_total:.2f}
+</div>
+
+<div class="card-small">
+OBI: {calculate_obi(bids, asks, 20):+.4f}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    with ob2:
+
+        bid_total50 = (
+            float(
+                np.sum(
+                    bids[:50, 1]
+                )
+            )
+            if len(bids) >= 50
+            else 0
+        )
+
+        ask_total50 = (
+            float(
+                np.sum(
+                    asks[:50, 1]
+                )
+            )
+            if len(asks) >= 50
+            else 0
+        )
+
+        st.markdown(
+            f"""
+<div class="card">
+
+<div class="card-title">
+TOP 50 DEPTH
+</div>
+
+<div style="
+font-size:24px;
+font-weight:800;
+">
+BIDS {bid_total50:.2f}
+</div>
+
+<div style="
+font-size:24px;
+font-weight:800;
+">
+ASKS {ask_total50:.2f}
+</div>
+
+<div class="card-small">
+OBI: {calculate_obi(bids, asks, 50):+.4f}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
+# ============================================================
+# RESEARCH FEATURES
+# ============================================================
+
+if show_features:
+
+    features = signal.get(
+        "features",
+        {},
+    )
+
+    if isinstance(
+        features,
+        dict,
+    ) and features:
+
+        st.markdown(
+            '<div class="section-title">🔬 RESEARCH FEATURES</div>',
+            unsafe_allow_html=True,
+        )
+
+        feature_df = pd.DataFrame(
+            [
+                {
+                    "FEATURE": key,
+                    "VALUE": safe_float(
+                        value
+                    ),
+                }
+                for key, value
+                in features.items()
+            ]
+        )
+
+        if not feature_df.empty:
+
+            st.dataframe(
+                feature_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+# ============================================================
+# ACTIVE TRADES
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">🔥 ACTIVE TRADES</div>',
+    unsafe_allow_html=True,
+)
+
+if st.session_state.active_trades:
+
+    active_rows = []
+
+    for trade in st.session_state.active_trades:
+
+        active_rows.append(
+            {
+                "Symbol":
+                    trade["symbol"],
+
+                "Mode":
+                    trade["mode"],
+
+                "Direction":
+                    trade["direction"],
+
+                "Entry":
+                    fmt_price(
+                        trade[
+                            "entry_price"
+                        ]
+                    ),
+
+                "SL":
+                    fmt_price(
+                        trade[
+                            "stop_loss"
+                        ]
+                    ),
+
+                "TP1":
+                    fmt_price(
+                        trade[
+                            "tp1"
+                        ]
+                    ),
+
+                "TP2":
+                    fmt_price(
+                        trade[
+                            "tp2"
+                        ]
+                    ),
+
+                "Horizon":
+                    trade[
+                        "duration_text"
+                    ],
+
+                "Remaining":
+                    format_remaining(
+                        seconds_remaining(
+                            trade[
+                                "expiry_time"
+                            ]
                         )
-                        elapsed_seconds = (
-                            datetime.datetime.now() - t_dt
-                        ).total_seconds()
-                        
-                        hold_m = int(elapsed_seconds // 60)
-                        hold_s = int(elapsed_seconds % 60)
-                        hold_str = f"{hold_m}m {hold_s}s"
+                    ),
 
-                        total_allowed_seconds = max_duration_mins * 60
-                        rem_sec = total_allowed_seconds - elapsed_seconds
-                        if rem_sec > 0:
-                            rem_m = int(rem_sec // 60)
-                            rem_s = int(rem_sec % 60)
-                            time_display_str = f"⏳ <b>Hold:</b> {hold_str} / Left: {rem_m}m {rem_s}s"
-                        else:
-                            time_display_str = f"⏳ <b>Hold:</b> {hold_str} / ⌛ Expiring..."
-                    except Exception:
-                        time_display_str = "Active"
-                else:
-                    time_display_str = "🔒 Completed"
+                "Status":
+                    trade["status"],
+            }
+        )
 
-                c_color = "#00e676" if t_dir == "LONG" else "#ff5252"
+    st.dataframe(
+        pd.DataFrame(
+            active_rows
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-                if t_status == "Open":
-                    run_status_bg = "rgba(0, 230, 118, 0.1)"
-                    run_status_fg = "#00e676"
-                    run_status_text = "🟢 RUNNING"
-                else:
-                    if t_outcome == "WIN":
-                        run_status_bg = "rgba(0, 230, 118, 0.1)"
-                        run_status_fg = "#00e676"
-                        run_status_text = "🟢 PROFIT (WIN)"
-                    else:
-                        run_status_bg = "rgba(255, 82, 82, 0.1)"
-                        run_status_fg = "#ff5252"
-                        run_status_text = "🔴 LOSS"
+else:
 
-                pnl_color = "#00e676" if t_pnl >= 0 else "#ff5252"
-                pnl_sign = "+" if t_pnl >= 0 else ""
+    st.info(
+        "No active paper trades."
+    )
 
-                card_html = (
-                    '<div style="background: #111622; border: 1px solid #1e2638; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">'
-                    f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">'
-                    f'<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">'
-                    f'<span style="background: {c_color}; color: #080a0f; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">{t_dir}</span>'
-                    f'<span style="font-size: 15px; font-weight: 700; color: #ffffff;">{coin_icon} {t_sym}</span>'
-                    f'<span style="font-size: 11px; color: #8b949e;">({t_tf}) • {t_time}</span>'
-                    f"</div>"
-                    f'<div style="display: flex; align-items: center; gap: 8px;">'
-                    f'<span style="background: #1f293d; color: #38bdf8; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;">{time_display_str}</span>'
-                    f'<div style="background: {run_status_bg}; border: 1px solid {run_status_fg}; color: {run_status_fg}; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600;">{run_status_text}</div>'
-                    f"</div>"
-                    f"</div>"
-                    f'<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; background: #0d1117; padding: 10px; border-radius: 8px;">'
-                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Entry Price</div><div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${t_entry:,.2f}</div></div>'
-                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Current / Exit</div><div style="font-size: 14px; font-weight: 700; color: {c_color};">${t_exit:,.2f}</div></div>'
-                    f'<div><div style="font-size: 10px; color: #8b949e; text-transform: uppercase;">Position Size</div><div style="font-size: 14px; font-weight: 700; color: #38bdf8;">$2.00</div></div>'
-                    f"</div>"
-                    f'<div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; text-align: center;">'
-                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">SL</div><div style="font-size: 11px; font-weight: 700; color: #ff5252;">${t_sl:,.2f}</div></div>'
-                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP1</div><div style="font-size: 11px; font-weight: 700; color: #00e676;">${t_tp1:,.2f}</div></div>'
-                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">TP2</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">${t_tp2:,.2f}</div></div>'
-                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">CONF</div><div style="font-size: 11px; font-weight: 700; color: #38bdf8;">{t_conf}%</div></div>'
-                    f'<div style="background: #161b22; padding: 6px; border-radius: 6px;"><div style="font-size: 9px; color: #8b949e;">P&L</div><div style="font-size: 11px; font-weight: 700; color: {pnl_color};">{pnl_sign}{t_pnl:.2f}%</div></div>'
-                    f"</div>"
-                    f"</div>"
-                )
-                st.markdown(card_html, unsafe_allow_html=True)
 
-        with tab_scalping:
-            render_trade_cards(scalping_trades)
+# ============================================================
+# HISTORY
+# ============================================================
 
-        with tab_intraday:
-            render_trade_cards(intraday_trades)
-    else:
-        with tab_scalping:
-            st.info("No trade history available yet.")
-        with tab_intraday:
-            st.info("No trade history available yet.")
+st.markdown(
+    '<div class="section-title">📊 TRADE HISTORY</div>',
+    unsafe_allow_html=True,
+)
+
+history = st.session_state.trade_history
+
+if history:
+
+    hist_df = pd.DataFrame(
+        history
+    )
+
+    total = len(
+        hist_df
+    )
+
+    wins = len(
+        hist_df[
+            hist_df[
+                "outcome"
+            ].astype(str).str.upper()
+            == "WIN"
+        ]
+    )
+
+    losses = len(
+        hist_df[
+            hist_df[
+                "outcome"
+            ].astype(str).str.upper()
+            == "LOSS"
+        ]
+    )
+
+    win_rate = (
+        wins
+        / max(
+            1,
+            wins + losses,
+        )
+    ) * 100
+
+    pnl = (
+        pd.to_numeric(
+            hist_df.get(
+                "pnl_percent",
+                pd.Series(
+                    [0] * total
+                ),
+            ),
+            errors="coerce",
+        )
+        .fillna(0)
+        .sum()
+    )
+
+    h1, h2, h3, h4 = st.columns(4)
+
+    with h1:
+        st.metric(
+            "TOTAL TRADES",
+            total,
+        )
+
+    with h2:
+        st.metric(
+            "WINS",
+            wins,
+        )
+
+    with h3:
+        st.metric(
+            "WIN RATE",
+            f"{win_rate:.1f}%",
+        )
+
+    with h4:
+        st.metric(
+            "TOTAL PNL",
+            f"{pnl:+.2f}%",
+        )
+
+    display_cols = [
+        "timestamp",
+        "symbol",
+        "mode",
+        "direction",
+        "entry_price",
+        "stop_loss",
+        "tp1",
+        "tp2",
+        "confidence",
+        "outcome",
+        "pnl_percent",
+        "close_reason",
+    ]
+
+    available = [
+        col
+        for col in display_cols
+        if col in hist_df.columns
+    ]
+
+    display_df = hist_df[
+        available
+    ].copy()
+
+    rename = {
+        "timestamp": "TIME",
+        "symbol": "SYMBOL",
+        "mode": "MODE",
+        "direction": "DIRECTION",
+        "entry_price": "ENTRY",
+        "stop_loss": "SL",
+        "tp1": "TP1",
+        "tp2": "TP2",
+        "confidence": "CONFIDENCE",
+        "outcome": "OUTCOME",
+        "pnl_percent": "PNL %",
+        "close_reason": "REASON",
+    }
+
+    display_df = display_df.rename(
+        columns=rename
+    )
+
+    st.dataframe(
+        display_df.head(100),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+else:
+
+    st.info(
+        "No closed trades yet."
+    )
+
+
+# ============================================================
+# CLEAR HISTORY
+# ============================================================
+
+with st.expander(
+    "⚙️ HISTORY MANAGEMENT"
+):
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+
+        if st.button(
+            "DELETE HISTORY",
+            use_container_width=True,
+        ):
+
+            st.session_state.trade_history = []
+
+            try:
+
+                if HISTORY_FILE.exists():
+                    HISTORY_FILE.unlink()
+
+            except Exception:
+                pass
+
+            st.success(
+                "Trade history deleted."
+            )
+
+            st.rerun()
+
+    with col_b:
+
+        if history:
+
+            csv_data = pd.DataFrame(
+                history
+            ).to_csv(
+                index=False
+            )
+
+            st.download_button(
+                "DOWNLOAD CSV",
+                csv_data,
+                file_name=(
+                    "zia_research_trade_history.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.markdown(
+    """
+<div style="
+text-align:center;
+color:#596675;
+font-size:11px;
+padding:15px;
+">
+ZIA RESEARCH LAB • QUANTITATIVE PAPER SIGNAL TERMINAL
+<br>
+Signal horizons are configured as:
+30M SCALPING → 15 MIN |
+15M → 90 MIN |
+1H → 24 HOURS |
+4H → 24 HOURS MAX
+</div>
+""",
+    unsafe_allow_html=True,
+)
