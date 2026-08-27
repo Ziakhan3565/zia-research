@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,13 @@ SPOT = "https://api.binance.com"
 MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
 META_FILE = ROOT / "ml_model_metadata.json"
 RESEARCH_META = ROOT / "src" / "research_lab_ml_meta.json"
+LOCK_FILE = ROOT / ".signal_locks.json"
 
 SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","SUIUSDT","TRXUSDT","LTCUSDT","BCHUSDT","DOTUSDT","XLMUSDT","NEARUSDT","UNIUSDT","APTUSDT","TAOUSDT","XMRUSDT"]
 TF = {"5M":"5m","15M":"15m","30M":"30m","1H":"1h","4H":"4h","1D":"1d","1W":"1w"}
 FEATURES = ["top20_bid_sum","top20_ask_sum","obi_5","obi_10","obi_20","obi_50","spread","spread_pct","bid_ask_ratio_20","bid_ask_ratio_50","top20_total_depth","top50_total_depth","taker_buy_volume","taker_sell_volume","taker_flow","taker_flow_ratio","price_return","price_change","sma_distance","realized_volatility","BOOK_IMB","QUANT_IMPLY","ADAPT_CONF","BAYESIAN","FOURIER_TREND"]
 OLD_FEATURES = ["top20_bid_sum","top20_ask_sum","obi_top20","spread","bid_ask_ratio","total_depth","trend_signal"]
+LOCK_MINUTES_15M = 20
 
 st.markdown("""
 <style>
@@ -40,7 +43,8 @@ html,body,[data-testid="stAppViewContainer"]{background:#070b12;color:#e7edf7}
 .card{background:linear-gradient(145deg,#101824,#0b1119);border:1px solid #202d3e;border-radius:13px;padding:12px;min-height:82px}.label{font-size:9px;color:#78879b;font-weight:850;letter-spacing:1px}.value{font-size:20px;font-weight:900;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sub{font-size:10px;color:#8492a5;margin-top:3px}
 .sigbox{border:1px solid #26364a;border-radius:15px;padding:15px 18px;background:linear-gradient(135deg,#111c2b,#0a1018)}.sigbox.long{border-color:#247f5b}.sigbox.short{border-color:#a03e52}.sig{font-size:36px;font-weight:950;line-height:1}.section{font-size:14px;font-weight:900;margin:14px 0 7px}.panel{background:#0b1119;border:1px solid #1e2a3a;border-radius:14px;padding:9px}
 .stPlotlyChart{border-radius:14px;overflow:hidden}.hint{font-size:10px;color:#65748a;text-align:center;margin-top:-3px}.pill{display:inline-block;border:1px solid #27374a;border-radius:999px;padding:4px 8px;font-size:10px;margin-right:5px}
-@media(max-width:700px){.block-container{padding:6px 7px 55px}.hero{padding-bottom:8px}.tiny{font-size:8px}.card{padding:9px;min-height:70px}.value{font-size:16px}.sub{font-size:9px}.sig{font-size:29px}.section{margin-top:10px}.stPlotlyChart{margin-left:-3px;margin-right:-3px}.live{padding:5px 7px}.mobile-hide{display:none}}
+.live-trade{border:1px solid #26364a;border-radius:14px;padding:12px;background:linear-gradient(145deg,#0f1824,#0a1017);margin-bottom:9px}.live-trade.long{border-color:#247f5b}.live-trade.short{border-color:#a03e52}.trade-head{display:flex;justify-content:space-between;align-items:center}.trade-symbol{font-size:15px;font-weight:950}.trade-side{font-size:18px;font-weight:950}.trade-side.long{color:#4be0a2}.trade-side.short{color:#ff7182}.trade-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:9px}.trade-metric{background:#101925;border-radius:8px;padding:7px}.trade-label{font-size:8px;color:#78879b;font-weight:850}.trade-value{font-size:12px;font-weight:900;margin-top:2px}.lockbar{font-size:10px;color:#65d7ff;font-weight:900;margin-top:8px}
+@media(max-width:700px){.block-container{padding:6px 7px 55px}.hero{padding-bottom:8px}.tiny{font-size:8px}.card{padding:9px;min-height:70px}.value{font-size:16px}.sub{font-size:9px}.sig{font-size:29px}.section{margin-top:10px}.stPlotlyChart{margin-left:-3px;margin-right:-3px}.live{padding:5px 7px}.mobile-hide{display:none}.trade-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -148,6 +152,61 @@ def card(label,value,sub):
     return f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>'
 
 
+def _read_locks():
+    try:
+        if LOCK_FILE.exists():
+            data=json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data,dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _write_locks(data):
+    try:
+        tmp=LOCK_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data,indent=2),encoding="utf-8")
+        tmp.replace(LOCK_FILE)
+    except Exception:
+        pass
+
+
+def _fresh_signal(symbol):
+    df=get_klines(symbol,"15m",250); bids,asks=get_book(symbol)
+    if df.empty or len(df)<25:return None
+    f=build_features(df,bids,asks); pred,prob,nfeat=ml_predict(f); sig,score,conf,research=composite(f,pred,prob)
+    if sig not in ("LONG","SHORT"):return None
+    price=num(df.Close.iloc[-1]); atr=num((df.High-df.Low).tail(14).mean())
+    if atr<=0:return None
+    if sig=="LONG": tp1,tp2,sl=price+atr,price+2*atr,price-.75*atr
+    else: tp1,tp2,sl=price-atr,price-2*atr,price+.75*atr
+    now=datetime.now(timezone.utc); until=now+timedelta(minutes=LOCK_MINUTES_15M)
+    return {"symbol":symbol,"tf":"15M","direction":sig,"confidence":conf,"ml":prob,"score":score,"research":research,"entry":price,"tp1":tp1,"tp2":tp2,"sl":sl,"created":now.isoformat(),"until":until.isoformat(),"features":nfeat}
+
+
+def locked_15m(symbol):
+    locks=_read_locks(); key=f"15M:{symbol}"; now=datetime.now(timezone.utc); old=locks.get(key)
+    if old:
+        try:
+            until=datetime.fromisoformat(old["until"])
+            if now < until:
+                old["remaining"]=max(0,int((until-now).total_seconds()))
+                locks[key]=old; _write_locks(locks); return old
+        except Exception:
+            pass
+        locks.pop(key,None); _write_locks(locks)
+    fresh=_fresh_signal(symbol)
+    if fresh:
+        fresh["remaining"]=LOCK_MINUTES_15M*60; locks[key]=fresh; _write_locks(locks)
+    return fresh
+
+
+def render_live_trade(s):
+    side=s["direction"]; cls="long" if side=="LONG" else "short"; rem=max(0,int(s.get("remaining",0))); mm,ss=divmod(rem,60)
+    ml="—" if s.get("ml") is None else f"{num(s['ml'])*100:.1f}%"; lock=f"LOCKED · {mm:02d}:{ss:02d} remaining"
+    st.markdown(f'''<div class="live-trade {cls}"><div class="trade-head"><div><span class="trade-symbol">{s["symbol"]}</span> <span class="pill">15M</span></div><div class="trade-side {cls}">{side}</div></div><div class="trade-grid"><div class="trade-metric"><div class="trade-label">ENTRY / RATE</div><div class="trade-value">{fmt_price(s["entry"])}</div></div><div class="trade-metric"><div class="trade-label">TP1</div><div class="trade-value">{fmt_price(s["tp1"])}</div></div><div class="trade-metric"><div class="trade-label">TP2</div><div class="trade-value">{fmt_price(s["tp2"])}</div></div><div class="trade-metric"><div class="trade-label">STOP LOSS</div><div class="trade-value">{fmt_price(s["sl"])}</div></div><div class="trade-metric"><div class="trade-label">CONFIDENCE / ML</div><div class="trade-value">{s["confidence"]:.1f}% / {ml}</div></div></div><div class="lockbar">🔒 {lock}</div></div>''',unsafe_allow_html=True)
+
+
 if "symbol" not in st.session_state: st.session_state.symbol="BTCUSDT"
 if "interval" not in st.session_state: st.session_state.interval="5m"
 if "refresh" not in st.session_state: st.session_state.refresh=5
@@ -165,21 +224,24 @@ with st.sidebar:
     st.caption("Mobile layout is responsive automatically. Refresh updates live data without a full browser reload.")
 
 st.markdown('<div class="hero"><div><div class="logo">ZIA <b>RESEARCH TERMINAL</b></div><div class="tiny">ORDER FLOW · XGBOOST · RESEARCH LAB · PRICE ACTION</div></div><div class="live"><span class="dot"></span>LIVE</div></div>',unsafe_allow_html=True)
-
-# Explicit responsive mode control; CSS handles the actual layout.
 st.session_state.mobile=False
 
-# Data is fetched together so all panels use the same market snapshot.
 df=get_klines(st.session_state.symbol,st.session_state.interval,candles_n)
 bids,asks=get_book(st.session_state.symbol)
 features=build_features(df,bids,asks)
 pred,prob,nfeat=ml_predict(features)
 sig,score,conf,research=composite(features,pred,prob)
+
+# Only the 15M actionable signal is locked. All other timeframes keep the original behavior.
+if st.session_state.interval=="15m":
+    locked=locked_15m(st.session_state.symbol)
+    if locked:
+        sig=locked["direction"]; score=locked["score"]; conf=locked["confidence"]; prob=locked.get("ml")
 price=num(df.Close.iloc[-1]) if not df.empty else 0; prev=num(df.Close.iloc[-2]) if len(df)>1 else price; change=(price/prev-1)*100 if prev else 0
 bias="BULLISH" if features["obi_20"]>.15 else "BEARISH" if features["obi_20"]<-.15 else "NEUTRAL"
 
 c=st.columns(6)
-items=[("PRICE",fmt_price(price),f"{change:+.2f}%"),("OBI TOP 20",f"{features['obi_20']:+.3f}",bias),("OBI TOP 50",f"{features['obi_50']:+.3f}","Depth imbalance"),("SPREAD",fmt_price(features['spread']),f"{features['spread_pct']*100:.3f}%"),("XGBOOST",("LONG" if pred==1 else "SHORT")+f" · {prob*100:.1f}%" if pred is not None else "OFFLINE",f"{nfeat} features" if nfeat else "model missing"),("CONFIDENCE",f"{conf:.1f}%",sig)]
+items=[("PRICE",fmt_price(price),f"{change:+.2f}%"),("OBI TOP 20",f"{features['obi_20']:+.3f}",bias),("OBI TOP 50",f"{features['obi_50']:+.3f}","Depth imbalance"),("SPREAD",fmt_price(features['spread']),f"{features['spread_pct']*100:.3f}%"),("XGBOOST",("LONG" if pred==1 else "SHORT")+f" · {prob*100:.1f}%" if pred is not None and prob is not None else "OFFLINE",f"{nfeat} features" if nfeat else "model missing"),("CONFIDENCE",f"{conf:.1f}%",sig)]
 for col,(a,b,d) in zip(c,items): col.markdown(card(a,b,d),unsafe_allow_html=True)
 
 left,right=st.columns([2.6,1])
@@ -198,6 +260,21 @@ st.markdown('<div class="section">ORDER FLOW SNAPSHOT</div>',unsafe_allow_html=T
 q=st.columns(4)
 for col,(lab,val,sub) in zip(q,[("TOP 20 BID",f"{features['top20_bid_sum']:,.2f}","bid liquidity"),("TOP 20 ASK",f"{features['top20_ask_sum']:,.2f}","ask liquidity"),("TOP 50 DEPTH",f"{features['top50_total_depth']:,.2f}","total size"),("TAKER FLOW",f"{features['taker_flow_ratio']:+.2%}","buy vs sell")]): col.markdown(card(lab,val,sub),unsafe_allow_html=True)
 
+# NEW: additive live-trades section. Existing dashboard remains above unchanged.
+st.markdown('<div class="section">LIVE TRADES</div>',unsafe_allow_html=True)
+st.markdown('<div class="sub" style="margin-bottom:8px">Active 15M LONG/SHORT signals only. Once opened, each signal is frozen for 20 minutes; no new 15M signal can replace it during the lock.</div>',unsafe_allow_html=True)
+active=[]
+for sym in SYMBOLS:
+    try:
+        item=locked_15m(sym)
+        if item and int(item.get("remaining",0))>0: active.append(item)
+    except Exception:
+        continue
+if active:
+    for item in active: render_live_trade(item)
+else:
+    st.info("No active 15M LONG/SHORT trades right now. The scanner will keep checking automatically.")
+
 st.markdown('<div class="section">MODEL / ENGINE STATUS</div>',unsafe_allow_html=True)
 status=st.columns(4)
 meta={}
@@ -209,7 +286,6 @@ for col,(lab,val,sub) in zip(status,[("XGBOOST FILE","READY" if MODEL_FILE.exist
 st.markdown('<div class="section">LIVE DATA</div>',unsafe_allow_html=True)
 st.caption(f"{st.session_state.symbol} · {st.session_state.interval} · {len(df)} candles · last candle {df.Time.iloc[-1] if not df.empty else '—'} · auto refresh {'ON' if st.session_state.auto else 'OFF'}")
 
-# Fragment refresh: only this small function reruns, preventing a visible full-page refresh.
 if st.session_state.auto:
     try:
         from streamlit.runtime.fragment import fragment
@@ -218,6 +294,8 @@ if st.session_state.auto:
             st.empty().markdown(f'<div class="tiny" style="text-align:right">Live sync · {time.strftime("%H:%M:%S UTC")}</div>',unsafe_allow_html=True)
         _refresh_clock()
     except Exception:
-        # Old Streamlit fallback; the dashboard remains functional.
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=st.session_state.refresh*1000,key="zia_fallback_refresh")
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=st.session_state.refresh*1000,key="zia_fallback_refresh")
+        except Exception:
+            pass
