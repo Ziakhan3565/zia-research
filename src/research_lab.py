@@ -5,7 +5,7 @@ import json
 import pickle
 import warnings
 from dataclasses import dataclass
-from typing import Dict, Optional, Any, List, Tuple
+from typing import Dict, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -32,10 +32,8 @@ SCALER_FILE = "research_lab_scaler.pkl"
 ML_META_FILE = "research_lab_ml_meta.json"
 
 MIN_TRAIN_SAMPLES = 50
-MIN_RETRAIN_SAMPLES = 30
 
-MODEL_VERSION = "RESEARCH_LAB_ML_V2"
-
+MODEL_VERSION = "RESEARCH_LAB_ML_V3"
 
 SUPPORTED_TIMEFRAMES = {
     "MONTHLY": "1M",
@@ -85,7 +83,7 @@ class TRILineEngine:
         timeout: int = 10,
     ):
 
-        self.symbol = symbol.upper()
+        self.symbol = str(symbol).upper().strip()
         self.timeout = timeout
 
         self.enabled = {
@@ -101,17 +99,17 @@ class TRILineEngine:
         if enabled_timeframes:
             self.enabled.update(enabled_timeframes)
 
-    # --------------------------------------------------------
+    # ========================================================
     # SYMBOL
-    # --------------------------------------------------------
+    # ========================================================
 
     def set_symbol(self, symbol: str):
 
         self.symbol = str(symbol).upper().strip()
 
-    # --------------------------------------------------------
+    # ========================================================
     # GET KLINES
-    # --------------------------------------------------------
+    # ========================================================
 
     def get_klines(
         self,
@@ -122,7 +120,7 @@ class TRILineEngine:
         params = {
             "symbol": self.symbol,
             "interval": interval,
-            "limit": limit,
+            "limit": int(limit),
         }
 
         response = requests.get(
@@ -142,9 +140,42 @@ class TRILineEngine:
 
         return data
 
-    # --------------------------------------------------------
+    # ========================================================
+    # KLINES -> DATAFRAME
+    # ========================================================
+
+    def get_dataframe(
+        self,
+        interval: str,
+        limit: int = 200,
+    ):
+
+        data = self.get_klines(
+            interval,
+            limit,
+        )
+
+        rows = []
+
+        for candle in data:
+
+            if len(candle) < 6:
+                continue
+
+            rows.append({
+                "Time": int(candle[0]),
+                "Open": float(candle[1]),
+                "High": float(candle[2]),
+                "Low": float(candle[3]),
+                "Close": float(candle[4]),
+                "Volume": float(candle[5]),
+            })
+
+        return pd.DataFrame(rows)
+
+    # ========================================================
     # PREVIOUS COMPLETED CANDLE
-    # --------------------------------------------------------
+    # ========================================================
 
     def get_previous_candle(
         self,
@@ -172,9 +203,9 @@ class TRILineEngine:
             "volume": float(candle[5]),
         }
 
-    # --------------------------------------------------------
+    # ========================================================
     # TRI FORMULAS
-    # --------------------------------------------------------
+    # ========================================================
 
     def calculate_levels(
         self,
@@ -190,7 +221,9 @@ class TRILineEngine:
 
         interval = SUPPORTED_TIMEFRAMES[timeframe]
 
-        candle = self.get_previous_candle(interval)
+        candle = self.get_previous_candle(
+            interval
+        )
 
         o = candle["open"]
         h = candle["high"]
@@ -200,19 +233,23 @@ class TRILineEngine:
         body_high = max(o, c)
         body_low = min(o, c)
 
+        # 50% BODY
         body_50 = (
             body_high + body_low
         ) / 2.0
 
+        # 50% UPPER WICK
         upper_50 = (
             h + body_high
         ) / 2.0
 
+        # 50% LOWER WICK
         lower_50 = (
             l + body_low
         ) / 2.0
 
         return TRILineLevels(
+
             timeframe=timeframe,
 
             open=o,
@@ -230,18 +267,22 @@ class TRILineEngine:
             candle_time=candle["time"],
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CURRENT PRICE
-    # --------------------------------------------------------
+    # ========================================================
 
     def get_current_price(
         self,
         timeframe="15M",
     ):
 
-        timeframe = str(timeframe).upper()
+        timeframe = str(
+            timeframe
+        ).upper()
 
-        interval = SUPPORTED_TIMEFRAMES[timeframe]
+        interval = SUPPORTED_TIMEFRAMES[
+            timeframe
+        ]
 
         candles = self.get_klines(
             interval,
@@ -253,11 +294,13 @@ class TRILineEngine:
                 "No price data"
             )
 
-        return float(candles[0][4])
+        return float(
+            candles[0][4]
+        )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ALL TRI LEVELS
-    # --------------------------------------------------------
+    # ========================================================
 
     def calculate_all(self):
 
@@ -303,7 +346,9 @@ class TenPaperResearchLab:
         meta_file=ML_META_FILE,
     ):
 
-        self.target_vol = float(target_vol)
+        self.target_vol = float(
+            target_vol
+        )
 
         self.tri_engine = (
             tri_engine
@@ -347,35 +392,50 @@ class TenPaperResearchLab:
         }
 
         # ====================================================
-        # TRI
+        # TRI SETTINGS
         # ====================================================
 
         self.tri_touch_tolerance = 0.0015
 
+        self.minimum_tri_rr = 2.0
+
         # ====================================================
-        # ML
+        # FEATURES
         # ====================================================
 
         self.feature_names = [
 
             "BOOK_IMB",
+
             "TAKER_FLOW",
+
             "QUANT_IMPLY",
+
             "ADAPT_CONF",
+
             "BAYESIAN",
+
             "FOURIER_TREND",
         ]
 
+        # ====================================================
+        # ML
+        # ====================================================
+
         self.scaler = StandardScaler()
 
-        self.base_model = self._create_model()
+        self.base_model = (
+            self._create_model()
+        )
 
         self.ml_model = None
 
         self.is_model_trained = False
 
         self.ml_accuracy = 0.0
+
         self.ml_logloss = 0.0
+
         self.ml_samples = 0
 
         self.last_training_time = None
@@ -404,16 +464,39 @@ class TenPaperResearchLab:
         # ====================================================
 
         self.quant_weight = 0.65
+
         self.ml_weight = 0.35
 
+        # ====================================================
+        # SIGNAL THRESHOLDS
+        # ====================================================
+
         self.long_threshold = 0.45
+
         self.short_threshold = -0.45
+
+        self.strong_long_threshold = 0.70
+
+        self.strong_short_threshold = -0.70
+
+        # ====================================================
+        # ML DIRECTION THRESHOLDS
+        # ====================================================
+
+        self.ml_long_probability = 0.55
+
+        self.ml_strong_long_probability = 0.70
+
+        self.ml_short_probability = 0.45
+
+        self.ml_strong_short_probability = 0.30
 
         # ====================================================
         # HYSTERESIS
         # ====================================================
 
-        self.last_signal = "NEUTRAL"
+        self.last_signal = "WAIT"
+
         self.cooldown_counter = 0
 
         # ====================================================
@@ -423,19 +506,26 @@ class TenPaperResearchLab:
         self.load_ml_model()
 
     # ========================================================
-    # CREATE ML MODEL
+    # CREATE MODEL
     # ========================================================
 
     @staticmethod
     def _create_model():
 
         return SGDClassifier(
+
             loss="log_loss",
+
             penalty="l2",
+
             alpha=0.0001,
+
             max_iter=2000,
+
             tol=1e-4,
+
             random_state=42,
+
             class_weight="balanced",
         )
 
@@ -481,6 +571,67 @@ class TenPaperResearchLab:
         )
 
     # ========================================================
+    # NORMALIZE OHLC DATA
+    # ========================================================
+
+    @staticmethod
+    def normalize_dataframe(df):
+
+        if df is None:
+            return None
+
+        if not isinstance(
+            df,
+            pd.DataFrame,
+        ):
+            return None
+
+        if df.empty:
+            return df
+
+        rename_map = {}
+
+        for col in df.columns:
+
+            lower = str(col).lower()
+
+            if lower == "open":
+                rename_map[col] = "Open"
+
+            elif lower == "high":
+                rename_map[col] = "High"
+
+            elif lower == "low":
+                rename_map[col] = "Low"
+
+            elif lower == "close":
+                rename_map[col] = "Close"
+
+            elif lower == "volume":
+                rename_map[col] = "Volume"
+
+        result = df.rename(
+            columns=rename_map
+        ).copy()
+
+        for column in [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]:
+
+            if column in result.columns:
+
+                result[column] = pd.to_numeric(
+                    result[column],
+                    errors="coerce",
+                )
+
+        return result
+
+    # ========================================================
     # ATR
     # ========================================================
 
@@ -490,29 +641,34 @@ class TenPaperResearchLab:
         period=14,
     ):
 
+        df = self.normalize_dataframe(df)
+
         if df is None or df.empty:
             return 0.0
 
-        required = [
-            "High",
-            "Low",
-            "Close",
-        ]
+        if "Close" not in df.columns:
+            return 0.0
 
         if not all(
-            col in df.columns
-            for col in required
+            x in df.columns
+            for x in [
+                "High",
+                "Low",
+                "Close",
+            ]
         ):
-
-            if "Close" not in df.columns:
-                return 0.0
 
             close = pd.to_numeric(
                 df["Close"],
                 errors="coerce",
             )
 
-            vol = (
+            close = close.dropna()
+
+            if close.empty:
+                return 0.0
+
+            volatility = (
                 close
                 .pct_change()
                 .rolling(period)
@@ -525,7 +681,9 @@ class TenPaperResearchLab:
             )
 
             return max(
-                self.safe_float(vol) * price,
+                self.safe_float(
+                    volatility
+                ) * price,
                 price * 0.001,
             )
 
@@ -549,8 +707,14 @@ class TenPaperResearchLab:
         tr = pd.concat(
             [
                 high - low,
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
+
+                (
+                    high - prev_close
+                ).abs(),
+
+                (
+                    low - prev_close
+                ).abs(),
             ],
             axis=1,
         ).max(axis=1)
@@ -591,10 +755,7 @@ class TenPaperResearchLab:
         levels,
     ):
 
-        if (
-            not bids
-            or not asks
-        ):
+        if not bids or not asks:
             return 0.0
 
         n = min(
@@ -607,11 +768,13 @@ class TenPaperResearchLab:
             return 0.0
 
         bid_sum = 0.0
+
         ask_sum = 0.0
 
         for i in range(n):
 
             try:
+
                 bid_size = max(
                     self.safe_float(
                         bids[i][1]
@@ -656,7 +819,7 @@ class TenPaperResearchLab:
         )
 
     # ========================================================
-    # MULTI LEVEL OBI
+    # OBI MULTI LEVEL
     # ========================================================
 
     def calculate_multi_level_obi(
@@ -666,13 +829,18 @@ class TenPaperResearchLab:
     ):
 
         levels = {
+
             5: 0.10,
+
             10: 0.20,
+
             20: 0.40,
+
             50: 0.30,
         }
 
         values = {}
+
         weights = {}
 
         for level, weight in levels.items():
@@ -702,10 +870,12 @@ class TenPaperResearchLab:
             if available <= 0:
                 return 0.0
 
-            return self.calculate_obi_level(
-                bids,
-                asks,
-                available,
+            return (
+                self.calculate_obi_level(
+                    bids,
+                    asks,
+                    available,
+                )
             )
 
         total_weight = sum(
@@ -725,6 +895,58 @@ class TenPaperResearchLab:
         return self.clip(final)
 
     # ========================================================
+    # OBI DETAILS
+    # ========================================================
+
+    def calculate_obi_details(
+        self,
+        bids,
+        asks,
+    ):
+
+        result = {
+
+            "OBI_TOP5": 0.0,
+
+            "OBI_TOP10": 0.0,
+
+            "OBI_TOP20": 0.0,
+
+            "OBI_TOP50": 0.0,
+
+            "OBI_FINAL": 0.0,
+        }
+
+        if not bids or not asks:
+            return result
+
+        for level in [
+            5,
+            10,
+            20,
+            50,
+        ]:
+
+            result[
+                f"OBI_TOP{level}"
+            ] = (
+                self.calculate_obi_level(
+                    bids,
+                    asks,
+                    level,
+                )
+            )
+
+        result["OBI_FINAL"] = (
+            self.calculate_multi_level_obi(
+                bids,
+                asks,
+            )
+        )
+
+        return result
+
+    # ========================================================
     # TAKER FLOW
     # ========================================================
 
@@ -737,6 +959,7 @@ class TenPaperResearchLab:
             return 0.0
 
         buy_volume = 0.0
+
         sell_volume = 0.0
 
         try:
@@ -750,6 +973,7 @@ class TenPaperResearchLab:
                     return 0.0
 
                 side_col = None
+
                 qty_col = None
 
                 for col in [
@@ -786,7 +1010,7 @@ class TenPaperResearchLab:
 
                     side = str(
                         row[side_col]
-                    ).lower()
+                    ).lower().strip()
 
                     qty = max(
                         self.safe_float(
@@ -897,10 +1121,7 @@ class TenPaperResearchLab:
         asks,
     ):
 
-        if (
-            not bids
-            or not asks
-        ):
+        if not bids or not asks:
             return 0.0
 
         try:
@@ -989,7 +1210,9 @@ class TenPaperResearchLab:
                     "label",
                 ]:
 
-                    if candidate in performance_history.columns:
+                    if candidate in (
+                        performance_history.columns
+                    ):
 
                         col = candidate
                         break
@@ -1045,8 +1268,7 @@ class TenPaperResearchLab:
             likelihood = 1.0 - strength
 
         numerator = (
-            likelihood
-            * prior
+            likelihood * prior
         )
 
         denominator = (
@@ -1131,6 +1353,7 @@ class TenPaperResearchLab:
         )
 
         mask[:keep] = True
+
         mask[-keep:] = True
 
         filtered = np.where(
@@ -1164,6 +1387,65 @@ class TenPaperResearchLab:
         )
 
     # ========================================================
+    # MOMENTUM
+    # ========================================================
+
+    def calculate_momentum(
+        self,
+        close,
+    ):
+
+        try:
+
+            close = pd.Series(
+                close,
+                dtype=float,
+            ).dropna()
+
+            if len(close) < 10:
+                return 0.0
+
+            fast = (
+                close
+                .ewm(
+                    span=5,
+                    adjust=False,
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            slow = (
+                close
+                .ewm(
+                    span=13,
+                    adjust=False,
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            denominator = max(
+                abs(slow),
+                1e-12,
+            )
+
+            return self.clip(
+                np.tanh(
+                    (
+                        fast
+                        - slow
+                    )
+                    / denominator
+                    * 100
+                )
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ========================================================
     # FEATURE EXTRACTION
     # ========================================================
 
@@ -1181,10 +1463,14 @@ class TenPaperResearchLab:
             for feature in self.feature_names
         }
 
+        df = self.normalize_dataframe(
+            df
+        )
+
         if (
             df is None
             or df.empty
-            or len(df) < 15
+            or "Close" not in df.columns
             or not bids
             or not asks
         ):
@@ -1216,9 +1502,9 @@ class TenPaperResearchLab:
                 1e-12,
             )
 
-            # =================================================
+            # ------------------------------------------------
             # BOOK IMBALANCE
-            # =================================================
+            # ------------------------------------------------
 
             results["BOOK_IMB"] = (
                 self.calculate_multi_level_obi(
@@ -1227,9 +1513,9 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # TAKER FLOW
-            # =================================================
+            # ------------------------------------------------
 
             results["TAKER_FLOW"] = (
                 self.calculate_taker_flow(
@@ -1237,9 +1523,9 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # MICROPRICE
-            # =================================================
+            # ------------------------------------------------
 
             results["QUANT_IMPLY"] = (
                 self.calculate_microprice(
@@ -1248,9 +1534,9 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # ADAPTIVE TREND
-            # =================================================
+            # ------------------------------------------------
 
             ema20 = (
                 close
@@ -1283,9 +1569,9 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # BAYESIAN
-            # =================================================
+            # ------------------------------------------------
 
             results["BAYESIAN"] = (
                 self.calculate_bayesian(
@@ -1294,9 +1580,9 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # FOURIER
-            # =================================================
+            # ------------------------------------------------
 
             results["FOURIER_TREND"] = (
                 self.calculate_fourier(
@@ -1305,11 +1591,17 @@ class TenPaperResearchLab:
                 )
             )
 
+            # ------------------------------------------------
+            # CLEAN
+            # ------------------------------------------------
+
             for feature in self.feature_names:
 
-                results[feature] = self.clip(
-                    self.safe_float(
-                        results[feature]
+                results[feature] = (
+                    self.clip(
+                        self.safe_float(
+                            results[feature]
+                        )
                     )
                 )
 
@@ -1338,6 +1630,7 @@ class TenPaperResearchLab:
         for feature in self.feature_names:
 
             if feature not in X.columns:
+
                 X[feature] = 0.0
 
         X = X[
@@ -1399,7 +1692,11 @@ class TenPaperResearchLab:
             valid = y.notna()
 
             X = X.loc[valid]
-            y = y.loc[valid].astype(int)
+
+            y = (
+                y.loc[valid]
+                .astype(int)
+            )
 
             if len(X) < MIN_TRAIN_SAMPLES:
                 return False
@@ -1407,9 +1704,9 @@ class TenPaperResearchLab:
             if y.nunique() < 2:
                 return False
 
-            # =================================================
+            # ------------------------------------------------
             # CHRONOLOGICAL SPLIT
-            # =================================================
+            # ------------------------------------------------
 
             split = int(
                 len(X) * 0.80
@@ -1418,21 +1715,32 @@ class TenPaperResearchLab:
             if split < 30:
                 return False
 
-            X_train = X.iloc[:split]
-            y_train = y.iloc[:split]
+            X_train = X.iloc[
+                :split
+            ]
 
-            X_test = X.iloc[split:]
-            y_test = y.iloc[split:]
+            y_train = y.iloc[
+                :split
+            ]
+
+            X_test = X.iloc[
+                split:
+            ]
+
+            y_test = y.iloc[
+                split:
+            ]
 
             if (
                 y_train.nunique() < 2
                 or y_test.nunique() < 2
             ):
+
                 return False
 
-            # =================================================
-            # SCALE
-            # =================================================
+            # ------------------------------------------------
+            # SCALER
+            # ------------------------------------------------
 
             scaler = StandardScaler()
 
@@ -1448,20 +1756,24 @@ class TenPaperResearchLab:
                 )
             )
 
-            # =================================================
+            # ------------------------------------------------
             # MODEL
-            # =================================================
+            # ------------------------------------------------
 
-            model = self._create_model()
+            model = (
+                self._create_model()
+            )
 
             model.fit(
                 X_train_scaled,
                 y_train,
             )
 
-            # =================================================
+            # ------------------------------------------------
             # CALIBRATION
-            # =================================================
+            # ------------------------------------------------
+
+            final_model = model
 
             try:
 
@@ -1484,9 +1796,9 @@ class TenPaperResearchLab:
 
                 final_model = model
 
-            # =================================================
+            # ------------------------------------------------
             # TEST
-            # =================================================
+            # ------------------------------------------------
 
             predictions = (
                 final_model.predict(
@@ -1517,12 +1829,14 @@ class TenPaperResearchLab:
 
                 loss_value = 0.0
 
-            # =================================================
-            # ACCEPT MODEL
-            # =================================================
+            # ------------------------------------------------
+            # ACCEPT
+            # ------------------------------------------------
 
             self.scaler = scaler
+
             self.base_model = model
+
             self.ml_model = final_model
 
             self.is_model_trained = True
@@ -1545,6 +1859,7 @@ class TenPaperResearchLab:
             )
 
             if save:
+
                 self.save_ml_model()
 
             return True
@@ -1558,7 +1873,7 @@ class TenPaperResearchLab:
             return False
 
     # ========================================================
-    # TRAIN FROM DATAFRAME
+    # TRAIN DATAFRAME
     # ========================================================
 
     def train_from_dataframe(
@@ -1582,7 +1897,9 @@ class TenPaperResearchLab:
             ]
         ].copy()
 
-        labels = df[label_column]
+        labels = df[
+            label_column
+        ]
 
         return self.train_ml(
             feature_data,
@@ -1605,10 +1922,17 @@ class TenPaperResearchLab:
         ):
 
             return {
+
                 "probability_up": 0.50,
+
                 "probability_down": 0.50,
+
                 "score": 0.0,
+
                 "direction": "NEUTRAL",
+
+                "strength": "NONE",
+
                 "trained": False,
             }
 
@@ -1667,7 +1991,9 @@ class TenPaperResearchLab:
                 )
 
                 probability_up = float(
-                    probabilities[up_index]
+                    probabilities[
+                        up_index
+                    ]
                 )
 
             else:
@@ -1696,17 +2022,47 @@ class TenPaperResearchLab:
                 ml_score
             )
 
-            if ml_score >= 0.10:
+            if (
+                probability_up
+                >= self.ml_strong_long_probability
+            ):
 
                 direction = "LONG"
 
-            elif ml_score <= -0.10:
+                strength = "STRONG"
+
+            elif (
+                probability_up
+                >= self.ml_long_probability
+            ):
+
+                direction = "LONG"
+
+                strength = "NORMAL"
+
+            elif (
+                probability_up
+                <= self.ml_strong_short_probability
+            ):
 
                 direction = "SHORT"
+
+                strength = "STRONG"
+
+            elif (
+                probability_up
+                <= self.ml_short_probability
+            ):
+
+                direction = "SHORT"
+
+                strength = "NORMAL"
 
             else:
 
                 direction = "NEUTRAL"
+
+                strength = "NONE"
 
             return {
 
@@ -1722,6 +2078,9 @@ class TenPaperResearchLab:
                 "direction":
                     direction,
 
+                "strength":
+                    strength,
+
                 "trained":
                     True,
             }
@@ -1730,24 +2089,21 @@ class TenPaperResearchLab:
 
             return {
 
-                "probability_up":
-                    0.50,
+                "probability_up": 0.50,
 
-                "probability_down":
-                    0.50,
+                "probability_down": 0.50,
 
-                "score":
-                    0.0,
+                "score": 0.0,
 
-                "direction":
-                    "NEUTRAL",
+                "direction": "NEUTRAL",
 
-                "trained":
-                    False,
+                "strength": "NONE",
+
+                "trained": False,
             }
 
     # ========================================================
-    # SAVE ML MODEL
+    # SAVE ML
     # ========================================================
 
     def save_ml_model(
@@ -1758,15 +2114,24 @@ class TenPaperResearchLab:
             not self.is_model_trained
             or self.ml_model is None
         ):
+
             return False
 
         try:
 
             payload = {
-                "model": self.ml_model,
-                "base_model": self.base_model,
-                "features": self.feature_names,
-                "version": MODEL_VERSION,
+
+                "model":
+                    self.ml_model,
+
+                "base_model":
+                    self.base_model,
+
+                "features":
+                    self.feature_names,
+
+                "version":
+                    MODEL_VERSION,
             }
 
             with open(
@@ -1836,7 +2201,7 @@ class TenPaperResearchLab:
             return False
 
     # ========================================================
-    # LOAD ML MODEL
+    # LOAD ML
     # ========================================================
 
     def load_ml_model(
@@ -1846,11 +2211,13 @@ class TenPaperResearchLab:
         if not os.path.exists(
             self.model_file
         ):
+
             return False
 
         if not os.path.exists(
             self.scaler_file
         ):
+
             return False
 
         try:
@@ -1877,6 +2244,7 @@ class TenPaperResearchLab:
                 payload,
                 dict,
             ):
+
                 return False
 
             saved_features = payload.get(
@@ -1884,18 +2252,25 @@ class TenPaperResearchLab:
                 [],
             )
 
-            if list(saved_features) != list(
+            if list(
+                saved_features
+            ) != list(
                 self.feature_names
             ):
+
                 return False
 
-            self.ml_model = payload.get(
-                "model"
+            self.ml_model = (
+                payload.get(
+                    "model"
+                )
             )
 
-            self.base_model = payload.get(
-                "base_model",
-                self._create_model(),
+            self.base_model = (
+                payload.get(
+                    "base_model",
+                    self._create_model(),
+                )
             )
 
             self.scaler = scaler
@@ -1920,17 +2295,21 @@ class TenPaperResearchLab:
                             file
                         )
 
-                    self.ml_accuracy = self.safe_float(
-                        metadata.get(
-                            "accuracy",
-                            0.0,
+                    self.ml_accuracy = (
+                        self.safe_float(
+                            metadata.get(
+                                "accuracy",
+                                0.0,
+                            )
                         )
                     )
 
-                    self.ml_logloss = self.safe_float(
-                        metadata.get(
-                            "logloss",
-                            0.0,
+                    self.ml_logloss = (
+                        self.safe_float(
+                            metadata.get(
+                                "logloss",
+                                0.0,
+                            )
                         )
                     )
 
@@ -1959,12 +2338,13 @@ class TenPaperResearchLab:
             )
 
             self.ml_model = None
+
             self.is_model_trained = False
 
             return False
 
     # ========================================================
-    # FEEDBACK LABEL
+    # OUTCOME LABEL
     # ========================================================
 
     @staticmethod
@@ -1988,6 +2368,7 @@ class TenPaperResearchLab:
             "1",
             "TRUE",
         ]:
+
             return 1
 
         if text in [
@@ -2000,12 +2381,13 @@ class TenPaperResearchLab:
             "0",
             "FALSE",
         ]:
+
             return 0
 
         return None
 
     # ========================================================
-    # TRAIN FROM HISTORICAL FEEDBACK
+    # TRAIN FROM FEEDBACK
     # ========================================================
 
     def train_from_feedback(
@@ -2022,7 +2404,10 @@ class TenPaperResearchLab:
             str,
         ):
 
-            if not os.path.exists(history):
+            if not os.path.exists(
+                history
+            ):
+
                 return False
 
             try:
@@ -2055,6 +2440,7 @@ class TenPaperResearchLab:
             return False
 
         feature_rows = []
+
         labels = []
 
         for _, row in history.iterrows():
@@ -2067,18 +2453,16 @@ class TenPaperResearchLab:
                 ),
             )
 
-            label = self.outcome_to_label(
-                outcome
+            label = (
+                self.outcome_to_label(
+                    outcome
+                )
             )
 
             if label is None:
                 continue
 
             features = {}
-
-            # -----------------------------------------------
-            # Direct feature columns
-            # -----------------------------------------------
 
             for feature in self.feature_names:
 
@@ -2153,7 +2537,7 @@ class TenPaperResearchLab:
         return result
 
     # ========================================================
-    # ALL LINE PRICES
+    # ALL TRI LINE PRICES
     # ========================================================
 
     def get_line_prices(
@@ -2176,9 +2560,17 @@ class TenPaperResearchLab:
 
             prices.extend(
                 [
-                    float(data.body_50),
-                    float(data.upper_50),
-                    float(data.lower_50),
+                    float(
+                        data.body_50
+                    ),
+
+                    float(
+                        data.upper_50
+                    ),
+
+                    float(
+                        data.lower_50
+                    ),
                 ]
             )
 
@@ -2191,7 +2583,35 @@ class TenPaperResearchLab:
         )
 
     # ========================================================
-    # LINE TOUCH
+    # TRI LINE DISTANCE
+    # ========================================================
+
+    def line_distance(
+        self,
+        price,
+        line,
+    ):
+
+        price = self.safe_float(
+            price
+        )
+
+        line = self.safe_float(
+            line
+        )
+
+        if line <= 0:
+            return 999.0
+
+        return (
+            abs(
+                price - line
+            )
+            / line
+        )
+
+    # ========================================================
+    # TRI TOUCH
     # ========================================================
 
     def line_touch(
@@ -2200,26 +2620,100 @@ class TenPaperResearchLab:
         line,
     ):
 
-        price = self.safe_float(price)
-        line = self.safe_float(line)
-
-        if line <= 0:
-            return False
-
-        distance = (
-            abs(
-                price - line
-            )
-            / line
-        )
-
         return (
-            distance
+            self.line_distance(
+                price,
+                line,
+            )
             <= self.tri_touch_tolerance
         )
 
     # ========================================================
-    # NEXT TRI LINE
+    # FIND CLOSEST TRI LINE
+    # ========================================================
+
+    def find_closest_tri_line(
+        self,
+        price,
+        levels,
+    ):
+
+        closest = None
+
+        closest_distance = float(
+            "inf"
+        )
+
+        for timeframe, data in levels.items():
+
+            if data is None:
+                continue
+
+            if isinstance(
+                data,
+                dict,
+            ):
+                continue
+
+            line_map = {
+
+                "BODY_50":
+                    data.body_50,
+
+                "UPPER_50":
+                    data.upper_50,
+
+                "LOWER_50":
+                    data.lower_50,
+            }
+
+            for line_name, line_price in (
+                line_map.items()
+            ):
+
+                line_price = (
+                    self.safe_float(
+                        line_price
+                    )
+                )
+
+                if line_price <= 0:
+                    continue
+
+                distance = (
+                    self.line_distance(
+                        price,
+                        line_price,
+                    )
+                )
+
+                if distance < closest_distance:
+
+                    closest_distance = distance
+
+                    closest = {
+
+                        "timeframe":
+                            timeframe,
+
+                        "line_name":
+                            line_name,
+
+                        "price":
+                            line_price,
+
+                        "distance":
+                            distance,
+
+                        "touched":
+                            distance
+                            <= self.tri_touch_tolerance,
+                    }
+
+        return closest
+
+    # ========================================================
+    # NEXT TRI TARGET
     # ========================================================
 
     def next_tri_line(
@@ -2229,8 +2723,10 @@ class TenPaperResearchLab:
         levels,
     ):
 
-        lines = self.get_line_prices(
-            levels
+        lines = (
+            self.get_line_prices(
+                levels
+            )
         )
 
         if direction == "LONG":
@@ -2254,6 +2750,52 @@ class TenPaperResearchLab:
 
             if lower:
                 return max(lower)
+
+        return None
+
+    # ========================================================
+    # SECOND TRI TARGET
+    # ========================================================
+
+    def second_tri_target(
+        self,
+        price,
+        direction,
+        levels,
+    ):
+
+        lines = (
+            self.get_line_prices(
+                levels
+            )
+        )
+
+        if direction == "LONG":
+
+            higher = sorted(
+                [
+                    x
+                    for x in lines
+                    if x > price
+                ]
+            )
+
+            if len(higher) >= 2:
+                return higher[1]
+
+        elif direction == "SHORT":
+
+            lower = sorted(
+                [
+                    x
+                    for x in lines
+                if x < price
+                ],
+                reverse=True,
+            )
+
+            if len(lower) >= 2:
+                return lower[1]
 
         return None
 
@@ -2287,7 +2829,13 @@ class TenPaperResearchLab:
             "tri_line":
                 None,
 
+            "tri_line_name":
+                None,
+
             "next_tri_target":
+                None,
+
+            "second_tri_target":
                 None,
 
             "tri_stop_loss":
@@ -2300,7 +2848,11 @@ class TenPaperResearchLab:
                 "NO_SETUP",
         }
 
-        if trade_mode not in self.trade_modes:
+        if (
+            trade_mode
+            not in self.trade_modes
+        ):
+
             return result
 
         references = (
@@ -2309,60 +2861,18 @@ class TenPaperResearchLab:
             ]["reference"]
         )
 
-        levels = self.get_tri_levels(
-            references
+        levels = (
+            self.get_tri_levels(
+                references
+            )
         )
 
-        closest = None
-        closest_distance = float(
-            "inf"
+        closest = (
+            self.find_closest_tri_line(
+                current_price,
+                levels,
+            )
         )
-
-        for timeframe, data in levels.items():
-
-            if data is None:
-                continue
-
-            if isinstance(
-                data,
-                dict,
-            ):
-                continue
-
-            line_map = {
-
-                "BODY_50":
-                    data.body_50,
-
-                "UPPER_50":
-                    data.upper_50,
-
-                "LOWER_50":
-                    data.lower_50,
-            }
-
-            for line_name, line_price in line_map.items():
-
-                if line_price <= 0:
-                    continue
-
-                distance = (
-                    abs(
-                        current_price
-                        - line_price
-                    )
-                    / line_price
-                )
-
-                if distance < closest_distance:
-
-                    closest_distance = distance
-
-                    closest = (
-                        timeframe,
-                        line_name,
-                        line_price,
-                    )
 
         if closest is None:
 
@@ -2372,42 +2882,74 @@ class TenPaperResearchLab:
 
             return result
 
-        (
-            timeframe,
-            line_name,
-            line_price,
-        ) = closest
+        timeframe = (
+            closest["timeframe"]
+        )
 
-        if not self.line_touch(
-            current_price,
-            line_price,
-        ):
+        line_name = (
+            closest["line_name"]
+        )
+
+        line_price = (
+            closest["price"]
+        )
+
+        touched = (
+            closest["touched"]
+        )
+
+        result[
+            "tri_timeframe"
+        ] = timeframe
+
+        result[
+            "tri_line"
+        ] = float(
+            line_price
+        )
+
+        result[
+            "tri_line_name"
+        ] = line_name
+
+        result[
+            "tri_touched"
+        ] = bool(
+            touched
+        )
+
+        if not touched:
 
             result[
                 "tri_reason"
             ] = (
                 "WAITING_FOR_"
                 + timeframe
-                + "_LINE"
+                + "_"
+                + line_name
             )
 
             return result
 
-        # =====================================================
+        # ====================================================
         # CONFIRMATION
-        # =====================================================
+        # ====================================================
 
-        if (
-            confirmation_score >= 0.25
-            and ml_probability >= 0.55
-        ):
+        long_confirmation = (
+            confirmation_score >= 0.20
+            and ml_probability >= 0.52
+        )
+
+        short_confirmation = (
+            confirmation_score <= -0.20
+            and ml_probability <= 0.48
+        )
+
+        if long_confirmation:
 
             direction = "LONG"
 
-        elif (
-            confirmation_score <= -0.25
-            and ml_probability <= 0.45
-        ):
+        elif short_confirmation:
 
             direction = "SHORT"
 
@@ -2415,18 +2957,20 @@ class TenPaperResearchLab:
 
             result[
                 "tri_reason"
-            ] = "CONFIRMATION_FAILED"
+            ] = "TRI_TOUCHED_BUT_CONFIRMATION_FAILED"
 
             return result
 
-        # =====================================================
+        # ====================================================
         # TARGET
-        # =====================================================
+        # ====================================================
 
-        target = self.next_tri_line(
-            current_price,
-            direction,
-            levels,
+        target = (
+            self.next_tri_line(
+                current_price,
+                direction,
+                levels,
+            )
         )
 
         if target is None:
@@ -2437,9 +2981,17 @@ class TenPaperResearchLab:
 
             return result
 
-        # =====================================================
+        second_target = (
+            self.second_tri_target(
+                current_price,
+                direction,
+                levels,
+            )
+        )
+
+        # ====================================================
         # ATR STOP
-        # =====================================================
+        # ====================================================
 
         atr = max(
             self.calculate_atr(
@@ -2449,11 +3001,20 @@ class TenPaperResearchLab:
             current_price * 0.0005,
         )
 
+        max_risk = (
+            current_price * 0.006
+        )
+
+        risk_distance = min(
+            atr,
+            max_risk,
+        )
+
         if direction == "LONG":
 
             stop = (
                 current_price
-                - atr
+                - risk_distance
             )
 
             reward = (
@@ -2470,7 +3031,7 @@ class TenPaperResearchLab:
 
             stop = (
                 current_price
-                + atr
+                + risk_distance
             )
 
             reward = (
@@ -2484,11 +3045,22 @@ class TenPaperResearchLab:
             )
 
         if risk <= 0:
+
+            result[
+                "tri_reason"
+            ] = "INVALID_RISK"
+
             return result
 
-        rr = reward / risk
+        rr = (
+            reward / risk
+        )
 
-        if rr < 2.0:
+        result[
+            "tri_rr"
+        ] = float(rr)
+
+        if rr < self.minimum_tri_rr:
 
             result[
                 "tri_reason"
@@ -2510,8 +3082,18 @@ class TenPaperResearchLab:
             "tri_line":
                 float(line_price),
 
+            "tri_line_name":
+                line_name,
+
             "next_tri_target":
                 float(target),
+
+            "second_tri_target":
+                (
+                    float(second_target)
+                    if second_target is not None
+                    else None
+                ),
 
             "tri_stop_loss":
                 float(stop),
@@ -2526,7 +3108,7 @@ class TenPaperResearchLab:
         return result
 
     # ========================================================
-    # SL / TP
+    # SL TP
     # ========================================================
 
     def calculate_sl_tp(
@@ -2555,6 +3137,23 @@ class TenPaperResearchLab:
             max_risk,
         )
 
+        if direction not in [
+            "LONG",
+            "SHORT",
+        ]:
+
+            return (
+                round(
+                    current_price - risk,
+                    4,
+                ),
+
+                round(
+                    current_price + risk * 2,
+                    4,
+                ),
+            )
+
         if (
             tri_setup
             and tri_setup.get(
@@ -2566,15 +3165,15 @@ class TenPaperResearchLab:
         ):
 
             stop = self.safe_float(
-                tri_setup[
+                tri_setup.get(
                     "tri_stop_loss"
-                ]
+                )
             )
 
             target = self.safe_float(
-                tri_setup[
+                tri_setup.get(
                     "next_tri_target"
-                ]
+                )
             )
 
             if direction == "LONG":
@@ -2585,7 +3184,7 @@ class TenPaperResearchLab:
                     - max_risk,
                 )
 
-            elif direction == "SHORT":
+            else:
 
                 stop = min(
                     stop,
@@ -2594,10 +3193,12 @@ class TenPaperResearchLab:
                 )
 
             return (
+
                 round(
                     float(stop),
                     4,
                 ),
+
                 round(
                     float(target),
                     4,
@@ -2616,7 +3217,7 @@ class TenPaperResearchLab:
                 + 2.0 * risk
             )
 
-        elif direction == "SHORT":
+        else:
 
             stop = (
                 current_price
@@ -2628,23 +3229,13 @@ class TenPaperResearchLab:
                 - 2.0 * risk
             )
 
-        else:
-
-            stop = (
-                current_price
-                - risk
-            )
-
-            target = (
-                current_price
-                + 2.0 * risk
-            )
-
         return (
+
             round(
                 float(stop),
                 4,
             ),
+
             round(
                 float(target),
                 4,
@@ -2652,7 +3243,152 @@ class TenPaperResearchLab:
         )
 
     # ========================================================
-    # FINAL SIGNAL ENGINE
+    # SIGNAL CLASSIFICATION
+    # ========================================================
+
+    def classify_signal(
+        self,
+        final_score,
+        tri_signal,
+        ml_probability,
+    ):
+
+        final_score = self.safe_float(
+            final_score
+        )
+
+        ml_probability = self.safe_float(
+            ml_probability,
+            0.50,
+        )
+
+        # ----------------------------------------------------
+        # STRONG LONG
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            >= self.strong_long_threshold
+            and ml_probability
+            >= self.ml_strong_long_probability
+        ):
+
+            return "STRONG LONG"
+
+        # ----------------------------------------------------
+        # STRONG SHORT
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            <= self.strong_short_threshold
+            and ml_probability
+            <= self.ml_strong_short_probability
+        ):
+
+            return "STRONG SHORT"
+
+        # ----------------------------------------------------
+        # TRI CONFIRMED LONG
+        # ----------------------------------------------------
+
+        if (
+            tri_signal == "LONG"
+            and final_score >= 0.20
+        ):
+
+            return "LONG"
+
+        # ----------------------------------------------------
+        # TRI CONFIRMED SHORT
+        # ----------------------------------------------------
+
+        if (
+            tri_signal == "SHORT"
+            and final_score <= -0.20
+        ):
+
+            return "SHORT"
+
+        # ----------------------------------------------------
+        # NORMAL LONG
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            >= self.long_threshold
+        ):
+
+            return "LONG"
+
+        # ----------------------------------------------------
+        # NORMAL SHORT
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            <= self.short_threshold
+        ):
+
+            return "SHORT"
+
+        return "WAIT"
+
+    # ========================================================
+    # HYSTERESIS
+    # ========================================================
+
+    def apply_hysteresis(
+        self,
+        signal,
+    ):
+
+        # Do not block first useful signal
+        if self.last_signal in [
+            "WAIT",
+            "NEUTRAL",
+        ]:
+
+            self.last_signal = signal
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Strong signals immediately pass
+        if signal in [
+            "STRONG LONG",
+            "STRONG SHORT",
+        ]:
+
+            self.last_signal = signal
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Same signal
+        if signal == self.last_signal:
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Counter
+        if self.cooldown_counter > 0:
+
+            self.cooldown_counter -= 1
+
+            return self.last_signal
+
+        self.last_signal = signal
+
+        self.cooldown_counter = 2
+
+        return signal
+
+    # ========================================================
+    # MAIN SIGNAL ENGINE
     # ========================================================
 
     def calculate_all_signals(
@@ -2670,24 +3406,34 @@ class TenPaperResearchLab:
             trade_mode
         ).upper()
 
-        if trade_mode not in self.trade_modes:
+        if (
+            trade_mode
+            not in self.trade_modes
+        ):
+
             trade_mode = "15M"
 
-        # =====================================================
-        # FEATURES
-        # =====================================================
-
-        features = self.extract_features(
-            df,
-            bids,
-            asks,
-            trades,
-            performance_history,
+        df = self.normalize_dataframe(
+            df
         )
 
-        # =====================================================
+        # ====================================================
+        # FEATURES
+        # ====================================================
+
+        features = (
+            self.extract_features(
+                df,
+                bids,
+                asks,
+                trades,
+                performance_history,
+            )
+        )
+
+        # ====================================================
         # QUANT SCORE
-        # =====================================================
+        # ====================================================
 
         vector = np.array(
             [
@@ -2716,9 +3462,9 @@ class TenPaperResearchLab:
             quant_score
         )
 
-        # =====================================================
+        # ====================================================
         # ML
-        # =====================================================
+        # ====================================================
 
         ml = self.predict_ml(
             features
@@ -2736,9 +3482,9 @@ class TenPaperResearchLab:
             ml["direction"]
         )
 
-        # =====================================================
-        # QUANT + ML
-        # =====================================================
+        # ====================================================
+        # FINAL SCORE
+        # ====================================================
 
         if self.is_model_trained:
 
@@ -2758,31 +3504,9 @@ class TenPaperResearchLab:
             final_score
         )
 
-        # =====================================================
-        # BASE DIRECTION
-        # =====================================================
-
-        if (
-            final_score
-            >= self.long_threshold
-        ):
-
-            intent = "LONG"
-
-        elif (
-            final_score
-            <= self.short_threshold
-        ):
-
-            intent = "SHORT"
-
-        else:
-
-            intent = "NEUTRAL"
-
-        # =====================================================
-        # CURRENT PRICE
-        # =====================================================
+        # ====================================================
+        # PRICE
+        # ====================================================
 
         current_price = 0.0
 
@@ -2792,13 +3516,15 @@ class TenPaperResearchLab:
             and "Close" in df.columns
         ):
 
-            current_price = self.safe_float(
-                df["Close"].iloc[-1]
+            current_price = (
+                self.safe_float(
+                    df["Close"].iloc[-1]
+                )
             )
 
-        # =====================================================
-        # TRI
-        # =====================================================
+        # ====================================================
+        # TRI SETUP
+        # ====================================================
 
         tri_setup = (
             self.calculate_tri_setup(
@@ -2810,74 +3536,134 @@ class TenPaperResearchLab:
             )
         )
 
-        # =====================================================
-        # TRI CONFIRMATION
-        # =====================================================
+        # ====================================================
+        # CLASSIFY
+        # ====================================================
 
-        if tri_setup[
-            "tri_signal"
-        ] in [
+        raw_signal = (
+            self.classify_signal(
+                final_score,
+                tri_setup[
+                    "tri_signal"
+                ],
+                ml_probability,
+            )
+        )
+
+        # ====================================================
+        # TRI DIRECTION FILTER
+        # ====================================================
+
+        tri_signal = (
+            tri_setup[
+                "tri_signal"
+            ]
+        )
+
+        if tri_signal in [
             "LONG",
             "SHORT",
         ]:
 
-            tri_direction = (
-                tri_setup[
-                    "tri_signal"
-                ]
-            )
+            if raw_signal in [
+                "LONG",
+                "STRONG LONG",
+            ]:
 
-            if intent == "NEUTRAL":
+                if tri_signal != "LONG":
 
-                intent = tri_direction
+                    raw_signal = "WAIT"
 
-            elif intent != tri_direction:
+            elif raw_signal in [
+                "SHORT",
+                "STRONG SHORT",
+            ]:
 
-                intent = "NEUTRAL"
+                if tri_signal != "SHORT":
 
-        # =====================================================
+                    raw_signal = "WAIT"
+
+            elif raw_signal == "WAIT":
+
+                if (
+                    abs(final_score)
+                    >= 0.20
+                ):
+
+                    raw_signal = (
+                        tri_signal
+                    )
+
+        # ====================================================
         # HYSTERESIS
-        # =====================================================
+        # ====================================================
 
-        if intent != self.last_signal:
+        signal = (
+            self.apply_hysteresis(
+                raw_signal
+            )
+        )
 
-            if self.cooldown_counter > 0:
+        # ====================================================
+        # DIRECTION
+        # ====================================================
 
-                self.cooldown_counter -= 1
+        if signal in [
+            "LONG",
+            "STRONG LONG",
+        ]:
 
-                intent = self.last_signal
+            direction = "LONG"
 
-            else:
+        elif signal in [
+            "SHORT",
+            "STRONG SHORT",
+        ]:
 
-                self.cooldown_counter = 3
-
-                self.last_signal = intent
+            direction = "SHORT"
 
         else:
 
-            self.cooldown_counter = 3
+            direction = "NEUTRAL"
 
-        # =====================================================
+        # ====================================================
         # SL / TP
-        # =====================================================
+        # ====================================================
 
         stop_loss, take_profit = (
             self.calculate_sl_tp(
                 df,
                 current_price,
-                intent,
+                direction,
                 tri_setup,
             )
         )
 
-        # =====================================================
+        # ====================================================
         # CONFIDENCE
-        # =====================================================
+        # ====================================================
 
         confidence = (
             abs(final_score)
             * 100.0
         )
+
+        # ML confidence contribution
+        if self.is_model_trained:
+
+            ml_confidence = (
+                abs(
+                    ml_probability
+                    - 0.50
+                )
+                * 200.0
+            )
+
+            confidence = (
+                confidence * 0.70
+                +
+                ml_confidence * 0.30
+            )
 
         confidence = float(
             np.clip(
@@ -2887,9 +3673,80 @@ class TenPaperResearchLab:
             )
         )
 
-        # =====================================================
+        # ====================================================
+        # SIGNAL QUALITY
+        # ====================================================
+
+        if signal in [
+            "STRONG LONG",
+            "STRONG SHORT",
+        ]:
+
+            signal_quality = "A"
+
+        elif signal in [
+            "LONG",
+            "SHORT",
+        ]:
+
+            signal_quality = "B"
+
+        else:
+
+            signal_quality = "WAIT"
+
+        # ====================================================
+        # RISK/REWARD
+        # ====================================================
+
+        rr = 0.0
+
+        if direction == "LONG":
+
+            risk = (
+                current_price
+                - stop_loss
+            )
+
+            reward = (
+                take_profit
+                - current_price
+            )
+
+            if risk > 0:
+
+                rr = reward / risk
+
+        elif direction == "SHORT":
+
+            risk = (
+                stop_loss
+                - current_price
+            )
+
+            reward = (
+                current_price
+                - take_profit
+            )
+
+            if risk > 0:
+
+                rr = reward / risk
+
+        # ====================================================
+        # OBI DETAILS
+        # ====================================================
+
+        obi_details = (
+            self.calculate_obi_details(
+                bids,
+                asks,
+            )
+        )
+
+        # ====================================================
         # ML STATUS
-        # =====================================================
+        # ====================================================
 
         if self.is_model_trained:
 
@@ -2899,28 +3756,68 @@ class TenPaperResearchLab:
 
             ml_status = "NOT_TRAINED"
 
-        # =====================================================
+        # ====================================================
+        # REASON
+        # ====================================================
+
+        if signal in [
+            "STRONG LONG",
+            "LONG",
+        ]:
+
+            reason = (
+                "BULLISH_RESEARCH_CONFIRMATION"
+            )
+
+        elif signal in [
+            "STRONG SHORT",
+            "SHORT",
+        ]:
+
+            reason = (
+                "BEARISH_RESEARCH_CONFIRMATION"
+            )
+
+        else:
+
+            reason = (
+                tri_setup.get(
+                    "tri_reason",
+                    "WAITING_FOR_CONFIRMATION",
+                )
+            )
+
+        # ====================================================
         # RETURN
-        # =====================================================
+        # ====================================================
 
         payload = {
 
-            # -------------------------------
+            # -----------------------------------------------
             # SIGNAL
-            # -------------------------------
+            # -----------------------------------------------
 
             "intent":
-                intent,
+                signal,
 
             "direction":
-                intent,
+                direction,
 
             "signal":
-                intent,
+                signal,
 
-            # -------------------------------
+            "raw_signal":
+                raw_signal,
+
+            "signal_quality":
+                signal_quality,
+
+            "reason":
+                reason,
+
+            # -----------------------------------------------
             # SCORES
-            # -------------------------------
+            # -----------------------------------------------
 
             "score":
                 final_score,
@@ -2931,9 +3828,9 @@ class TenPaperResearchLab:
             "quant_score":
                 quant_score,
 
-            # -------------------------------
+            # -----------------------------------------------
             # ML
-            # -------------------------------
+            # -----------------------------------------------
 
             "ml_probability":
                 ml_probability,
@@ -2952,6 +3849,12 @@ class TenPaperResearchLab:
             "ml_direction":
                 ml_direction,
 
+            "ml_strength":
+                ml.get(
+                    "strength",
+                    "NONE",
+                ),
+
             "ml_trained":
                 self.is_model_trained,
 
@@ -2961,21 +3864,27 @@ class TenPaperResearchLab:
             "ml_accuracy":
                 self.ml_accuracy,
 
+            "ml_logloss":
+                self.ml_logloss,
+
             "ml_samples":
                 self.ml_samples,
 
-            # -------------------------------
+            # -----------------------------------------------
             # CONFIDENCE
-            # -------------------------------
+            # -----------------------------------------------
 
             "confidence":
                 confidence,
 
-            # -------------------------------
+            # -----------------------------------------------
             # PRICE
-            # -------------------------------
+            # -----------------------------------------------
 
             "current_price":
+                current_price,
+
+            "entry":
                 current_price,
 
             "stop_loss":
@@ -2984,16 +3893,27 @@ class TenPaperResearchLab:
             "take_profit":
                 take_profit,
 
-            # -------------------------------
+            "tp1":
+                take_profit,
+
+            "tp2":
+                tri_setup.get(
+                    "second_tri_target"
+                ),
+
+            "risk_reward":
+                float(rr),
+
+            # -----------------------------------------------
             # MODE
-            # -------------------------------
+            # -----------------------------------------------
 
             "trade_mode":
                 trade_mode,
 
-            # -------------------------------
+            # -----------------------------------------------
             # TRI
-            # -------------------------------
+            # -----------------------------------------------
 
             "tri_signal":
                 tri_setup[
@@ -3015,9 +3935,19 @@ class TenPaperResearchLab:
                     "tri_line"
                 ],
 
+            "tri_line_name":
+                tri_setup[
+                    "tri_line_name"
+                ],
+
             "next_tri_target":
                 tri_setup[
                     "next_tri_target"
+                ],
+
+            "second_tri_target":
+                tri_setup[
+                    "second_tri_target"
                 ],
 
             "tri_stop_loss":
@@ -3035,9 +3965,38 @@ class TenPaperResearchLab:
                     "tri_reason"
                 ],
 
-            # -------------------------------
-            # ML / QUANT WEIGHTS
-            # -------------------------------
+            # -----------------------------------------------
+            # OBI
+            # -----------------------------------------------
+
+            "obi_top5":
+                obi_details[
+                    "OBI_TOP5"
+                ],
+
+            "obi_top10":
+                obi_details[
+                    "OBI_TOP10"
+                ],
+
+            "obi_top20":
+                obi_details[
+                    "OBI_TOP20"
+                ],
+
+            "obi_top50":
+                obi_details[
+                    "OBI_TOP50"
+                ],
+
+            "obi_final":
+                obi_details[
+                    "OBI_FINAL"
+                ],
+
+            # -----------------------------------------------
+            # WEIGHTS
+            # -----------------------------------------------
 
             "quant_weight":
                 self.quant_weight,
@@ -3045,12 +4004,25 @@ class TenPaperResearchLab:
             "ml_weight":
                 self.ml_weight,
 
-            # -------------------------------
-            # FEATURE DATA
-            # -------------------------------
+            # -----------------------------------------------
+            # FEATURES
+            # -----------------------------------------------
 
             "features":
                 features,
+
+            "feature_data":
+                features,
+
+            "weights":
+                self.dynamic_weights,
+
+            # -----------------------------------------------
+            # INVENTORY
+            # -----------------------------------------------
+
+            "current_inventory":
+                current_inventory,
         }
 
         return (
@@ -3086,6 +4058,10 @@ class PowerTradingRiskEngine:
             pass
 
         return default
+
+    # ========================================================
+    # RISK METRICS
+    # ========================================================
 
     def calculate_risk_metrics(
         self,
@@ -3161,9 +4137,9 @@ class PowerTradingRiskEngine:
             0.0,
         )
 
-        # =====================================================
+        # ====================================================
         # LIQUIDATION
-        # =====================================================
+        # ====================================================
 
         if len(
             liquidation_volumes
@@ -3184,6 +4160,7 @@ class PowerTradingRiskEngine:
         else:
 
             total_ltz = 0.0
+
             max_ltz = 0.0
 
         ltz_score = (
@@ -3203,9 +4180,9 @@ class PowerTradingRiskEngine:
             )
         )
 
-        # =====================================================
+        # ====================================================
         # SPOOF
-        # =====================================================
+        # ====================================================
 
         spoof_ratio = (
             cancelled_vol
@@ -3226,8 +4203,10 @@ class PowerTradingRiskEngine:
 
         spoof_score = (
             spoof_ratio
-            * (
-                1 - persistence
+            *
+            (
+                1
+                - persistence
             )
             * 100.0
         )
@@ -3240,9 +4219,9 @@ class PowerTradingRiskEngine:
             )
         )
 
-        # =====================================================
+        # ====================================================
         # SQUEEZE
-        # =====================================================
+        # ====================================================
 
         liquidation_intensity = (
             total_ltz
@@ -3281,9 +4260,9 @@ class PowerTradingRiskEngine:
             )
         )
 
-        # =====================================================
+        # ====================================================
         # FINAL RISK
-        # =====================================================
+        # ====================================================
 
         market_risk = (
 
@@ -3375,9 +4354,9 @@ class IntegratedTradingEngine:
             PowerTradingRiskEngine()
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ANALYZE
-    # --------------------------------------------------------
+    # ========================================================
 
     def analyze(
         self,
@@ -3404,14 +4383,22 @@ class IntegratedTradingEngine:
 
             trades=trades,
 
-            performance_history=performance_history,
+            performance_history=(
+                performance_history
+            ),
 
             trade_mode=trade_mode,
 
-            current_inventory=current_inventory,
+            current_inventory=(
+                current_inventory
+            ),
         )
 
         return {
+
+            # =================================================
+            # SIGNAL
+            # =================================================
 
             "SIGNAL":
                 signal["signal"],
@@ -3420,7 +4407,17 @@ class IntegratedTradingEngine:
                 signal["direction"],
 
             "RAW_SIGNAL":
-                signal["intent"],
+                signal["raw_signal"],
+
+            "SIGNAL_QUALITY":
+                signal["signal_quality"],
+
+            "REASON":
+                signal["reason"],
+
+            # =================================================
+            # SCORES
+            # =================================================
 
             "SCORE":
                 signal["score"],
@@ -3431,8 +4428,16 @@ class IntegratedTradingEngine:
             "QUANT_SCORE":
                 signal["quant_score"],
 
+            # =================================================
+            # CONFIDENCE
+            # =================================================
+
             "CONFIDENCE":
                 signal["confidence"],
+
+            # =================================================
+            # ML
+            # =================================================
 
             "ML_PROBABILITY":
                 signal["ml_probability"],
@@ -3453,6 +4458,9 @@ class IntegratedTradingEngine:
             "ML_DIRECTION":
                 signal["ml_direction"],
 
+            "ML_STRENGTH":
+                signal["ml_strength"],
+
             "ML_TRAINED":
                 signal["ml_trained"],
 
@@ -3462,8 +4470,21 @@ class IntegratedTradingEngine:
             "ML_ACCURACY":
                 signal["ml_accuracy"],
 
+            "ML_LOGLOSS":
+                signal["ml_logloss"],
+
+            "ML_SAMPLES":
+                signal["ml_samples"],
+
+            # =================================================
+            # PRICE
+            # =================================================
+
             "CURRENT_PRICE":
                 signal["current_price"],
+
+            "ENTRY":
+                signal["entry"],
 
             "STOP_LOSS":
                 signal["stop_loss"],
@@ -3471,8 +4492,25 @@ class IntegratedTradingEngine:
             "TAKE_PROFIT":
                 signal["take_profit"],
 
+            "TP1":
+                signal["tp1"],
+
+            "TP2":
+                signal["tp2"],
+
+            "RISK_REWARD":
+                signal["risk_reward"],
+
+            # =================================================
+            # MODE
+            # =================================================
+
             "TRADE_MODE":
                 signal["trade_mode"],
+
+            # =================================================
+            # TRI
+            # =================================================
 
             "TRI_SIGNAL":
                 signal["tri_signal"],
@@ -3486,8 +4524,14 @@ class IntegratedTradingEngine:
             "TRI_LINE":
                 signal["tri_line"],
 
+            "TRI_LINE_NAME":
+                signal["tri_line_name"],
+
             "NEXT_TRI_TARGET":
                 signal["next_tri_target"],
+
+            "SECOND_TRI_TARGET":
+                signal["second_tri_target"],
 
             "TRI_STOP_LOSS":
                 signal["tri_stop_loss"],
@@ -3498,26 +4542,68 @@ class IntegratedTradingEngine:
             "TRI_REASON":
                 signal["tri_reason"],
 
+            # =================================================
+            # OBI
+            # =================================================
+
+            "OBI_TOP5":
+                signal["obi_top5"],
+
+            "OBI_TOP10":
+                signal["obi_top10"],
+
+            "OBI_TOP20":
+                signal["obi_top20"],
+
+            "OBI_TOP50":
+                signal["obi_top50"],
+
+            "OBI_FINAL":
+                signal["obi_final"],
+
+            # =================================================
+            # FEATURES
+            # =================================================
+
             "FEATURES":
                 features,
 
+            "FEATURE_DATA":
+                signal["feature_data"],
+
+            # =================================================
+            # WEIGHTS
+            # =================================================
+
             "WEIGHTS":
                 weights,
+
+            "QUANT_WEIGHT":
+                signal["quant_weight"],
+
+            "ML_WEIGHT":
+                signal["ml_weight"],
         }
 
 
 # ============================================================
-# SIMPLE TEST
+# TEST
 # ============================================================
 
 if __name__ == "__main__":
 
-    print("=" * 75)
-    print("RESEARCH LAB - ML INTEGRATED ENGINE")
-    print("=" * 75)
+    print("=" * 80)
 
-    tri_engine = TRILineEngine(
-        symbol="BTCUSDT"
+    print(
+        "RESEARCH LAB - ML + TRI + OBI ENGINE V3"
+    )
+
+    print("=" * 80)
+
+    tri_engine = (
+        TRILineEngine(
+            symbol="BTCUSDT"
+        )
     )
 
     research_lab = (
@@ -3537,9 +4623,21 @@ if __name__ == "__main__":
     )
 
     print()
-    print("Research Features:")
 
-    for feature in research_lab.feature_names:
+    print(
+        "Symbol:",
+        integrated.symbol
+    )
+
+    print()
+
+    print(
+        "Research Features:"
+    )
+
+    for feature in (
+        research_lab.feature_names
+    ):
 
         print(
             "  -",
@@ -3547,7 +4645,10 @@ if __name__ == "__main__":
         )
 
     print()
-    print("TRI Trade Modes:")
+
+    print(
+        "TRI Trade Modes:"
+    )
 
     print(
         "  15M -> 1H + 4H"
@@ -3562,65 +4663,128 @@ if __name__ == "__main__":
     )
 
     print()
-    print("ML Model:")
+
     print(
-        "  Trained:",
+        "TRI Lines:"
+    )
+
+    print(
+        "  BODY_50"
+    )
+
+    print(
+        "  UPPER_50"
+    )
+
+    print(
+        "  LOWER_50"
+    )
+
+    print()
+
+    print(
+        "Signal Types:"
+    )
+
+    print(
+        "  STRONG LONG"
+    )
+
+    print(
+        "  LONG"
+    )
+
+    print(
+        "  WAIT"
+    )
+
+    print(
+        "  SHORT"
+    )
+
+    print(
+        "  STRONG SHORT"
+    )
+
+    print()
+
+    print(
+        "ML Trained:",
         research_lab.is_model_trained
     )
 
     print(
-        "  Accuracy:",
+        "ML Accuracy:",
         round(
-            research_lab.ml_accuracy * 100,
+            research_lab.ml_accuracy
+            * 100,
             2,
         ),
         "%"
     )
 
     print(
-        "  Samples:",
+        "ML Samples:",
         research_lab.ml_samples
     )
 
     print()
-    print("Weights:")
 
     print(
-        "  Quant:",
+        "Quant Weight:",
         research_lab.quant_weight
     )
 
     print(
-        "  ML:",
+        "ML Weight:",
         research_lab.ml_weight
     )
 
     print()
-    print("Signal thresholds:")
 
     print(
-        "  LONG :",
+        "LONG Threshold:",
         research_lab.long_threshold
     )
 
     print(
-        "  SHORT:",
+        "STRONG LONG Threshold:",
+        research_lab.strong_long_threshold
+    )
+
+    print(
+        "SHORT Threshold:",
         research_lab.short_threshold
     )
 
+    print(
+        "STRONG SHORT Threshold:",
+        research_lab.strong_short_threshold
+    )
+
     print()
-    print("Model files:")
 
     print(
-        " ",
+        "Minimum TRI RR:",
+        research_lab.minimum_tri_rr
+    )
+
+    print()
+
+    print(
+        "Model:",
         research_lab.model_file
     )
 
     print(
-        " ",
+        "Scaler:",
         research_lab.scaler_file
     )
 
     print()
-    print("Research Lab ready.")
-    print("=" * 75)
+
+    print(
+        "Research Lab ready."
+    )
+
+    print("=" * 80)
