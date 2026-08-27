@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import time
 import math
-import pickle
+import joblib
 import datetime as dt
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
-# PAGE CONFIG
+# ZIA RESEARCH LAB
+# BINANCE USDⓈ-M FUTURES RESEARCH DASHBOARD
 # ============================================================
 
 st.set_page_config(
@@ -30,16 +31,52 @@ st.set_page_config(
 
 
 # ============================================================
-# CONSTANTS
+# CONFIG
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
 
 HISTORY_FILE = ROOT / "signal_history.csv"
+MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-BINANCE_DEPTH = "https://api.binance.com/api/v3/depth"
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/24hr"
+# IMPORTANT:
+# Futures endpoints — NOT Spot endpoints
+BINANCE_BASE = "https://fapi.binance.com"
+
+BINANCE_KLINES = f"{BINANCE_BASE}/fapi/v1/klines"
+BINANCE_DEPTH = f"{BINANCE_BASE}/fapi/v1/depth"
+BINANCE_TICKER = f"{BINANCE_BASE}/fapi/v1/ticker/24hr"
+BINANCE_AGG_TRADES = f"{BINANCE_BASE}/fapi/v1/aggTrades"
+
+REQUEST_TIMEOUT = 8
+
+
+# ============================================================
+# COINS
+# ============================================================
+
+COINS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "SUIUSDT",
+    "TRXUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "DOTUSDT",
+    "XLMUSDT",
+    "NEARUSDT",
+    "UNIUSDT",
+    "APTUSDT",
+    "TAOUSDT",
+    "XMRUSDT",
+]
 
 
 # ============================================================
@@ -50,514 +87,386 @@ TRADE_MODES = {
     "SCALPING": {
         "label": "30M SCALPING",
         "analysis_tf": "30m",
-        "engine_mode": "SCALPING",
         "duration_minutes": 15,
-        "duration_text": "15 MIN",
         "max_holding": "15 minutes",
-        "reference": ["1H", "4H"],
+        "reference": ["1h", "4h"],
     },
 
     "15M": {
         "label": "15M",
         "analysis_tf": "15m",
-        "engine_mode": "15M",
         "duration_minutes": 90,
-        "duration_text": "1.5 HOURS",
         "max_holding": "90 minutes",
-        "reference": ["1H", "4H"],
+        "reference": ["1h", "4h"],
     },
 
     "1H": {
         "label": "1H",
         "analysis_tf": "1h",
-        "engine_mode": "1H",
         "duration_minutes": 1440,
-        "duration_text": "24 HOURS",
         "max_holding": "24 hours",
-        "reference": ["DAILY", "WEEKLY"],
+        "reference": ["1d", "1w"],
     },
 
     "4H": {
         "label": "4H",
         "analysis_tf": "4h",
-        "engine_mode": "4H",
         "duration_minutes": 1440,
-        "duration_text": "24 HOURS MAX",
-        "max_holding": "24 hours maximum",
-        "reference": ["WEEKLY", "MONTHLY"],
+        "max_holding": "24 hours max",
+        "reference": ["1w", "1M"],
     },
 }
-
-
-# ============================================================
-# COINS
-# ============================================================
-
-COINS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "BNBUSDT",
-    "ADAUSDT",
-    "DOGEUSDT",
-    "AVAXUSDT",
-    "LINKUSDT",
-    "TAOUSDT",
-    "XMRUSDT",
-]
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
+DEFAULT_STATE = {
+    "selected_symbol": "BTCUSDT",
+    "selected_mode": "SCALPING",
+    "auto_scan": True,
+    "show_chart": True,
+    "last_signal": {},
+    "signal_history": [],
+}
 
-if "active_trades" not in st.session_state:
-    st.session_state.active_trades = []
-
-if "last_signals" not in st.session_state:
-    st.session_state.last_signals = {}
-
-if "scanner_message" not in st.session_state:
-    st.session_state.scanner_message = ""
-
-if "selected_symbol" not in st.session_state:
-    st.session_state.selected_symbol = "BTCUSDT"
-
-if "selected_mode" not in st.session_state:
-    st.session_state.selected_mode = "SCALPING"
+for key, value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
-# LOAD HISTORY
+# CSS
 # ============================================================
 
-def load_history():
-    if not HISTORY_FILE.exists():
-        return []
+st.markdown(
+    """
+<style>
 
-    try:
-        df = pd.read_csv(HISTORY_FILE)
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+    max-width: 1600px;
+}
 
-        if df.empty:
-            return []
+[data-testid="stSidebar"] {
+    background: #080c12;
+}
 
-        return df.to_dict("records")
+[data-testid="stSidebar"] * {
+    color: #e8edf5;
+}
 
-    except Exception:
-        return []
+.main-title {
+    font-size: 30px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+}
 
+.sub-title {
+    color: #8f9bad;
+    font-size: 14px;
+    margin-top: -8px;
+}
 
-if not st.session_state.trade_history:
-    st.session_state.trade_history = load_history()
+.signal-card {
+    padding: 25px;
+    border-radius: 16px;
+    background: linear-gradient(
+        135deg,
+        #101722,
+        #0b1018
+    );
+    border: 1px solid #1f2b3a;
+    margin-bottom: 18px;
+}
+
+.signal-long {
+    border: 1px solid #1f9d68;
+    box-shadow: 0 0 25px rgba(31,157,104,.10);
+}
+
+.signal-short {
+    border: 1px solid #d64a5c;
+    box-shadow: 0 0 25px rgba(214,74,92,.10);
+}
+
+.signal-wait {
+    border: 1px solid #526070;
+}
+
+.signal-title {
+    font-size: 14px;
+    color: #8995a6;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.signal-value {
+    font-size: 38px;
+    font-weight: 900;
+    margin-top: 5px;
+}
+
+.price-value {
+    font-size: 27px;
+    font-weight: 800;
+}
+
+.metric-card {
+    padding: 18px;
+    border-radius: 12px;
+    background: #0d131c;
+    border: 1px solid #1c2735;
+}
+
+.metric-label {
+    color: #8d99aa;
+    font-size: 12px;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    font-size: 21px;
+    font-weight: 800;
+    margin-top: 4px;
+}
+
+.section-title {
+    font-size: 18px;
+    font-weight: 800;
+    margin-top: 12px;
+    margin-bottom: 12px;
+}
+
+.info-box {
+    padding: 15px;
+    border-radius: 10px;
+    background: #0c141e;
+    border: 1px solid #203044;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
-# SAVE HISTORY
-# ============================================================
-
-def save_history():
-
-    try:
-
-        if not st.session_state.trade_history:
-            return
-
-        pd.DataFrame(
-            st.session_state.trade_history
-        ).to_csv(
-            HISTORY_FILE,
-            index=False,
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# UTILS
+# HELPERS
 # ============================================================
 
 def safe_float(value, default=0.0):
-
     try:
-
         value = float(value)
-
         if np.isfinite(value):
             return value
-
     except Exception:
         pass
 
     return default
 
 
-def fmt_price(price):
-
-    price = safe_float(price)
-
-    if price <= 0:
-        return "—"
-
-    if price >= 1000:
-        return f"{price:,.2f}"
-
-    if price >= 1:
-        return f"{price:,.4f}"
-
-    return f"{price:.6f}"
-
-
-def pct(value):
-
-    return f"{safe_float(value) * 100:.1f}%"
-
-
 def clamp(value, low=-1.0, high=1.0):
-
-    return float(
-        np.clip(
-            safe_float(value),
-            low,
-            high,
-        )
-    )
+    return float(np.clip(safe_float(value), low, high))
 
 
 def now_utc():
-
-    return dt.datetime.now(
-        dt.timezone.utc
-    )
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def iso_now():
-
     return now_utc().isoformat()
 
 
-# ============================================================
-# SIGNAL DIRECTION
-# ============================================================
+def fmt_price(value):
+    value = safe_float(value)
 
-def direction_label(score, confidence):
+    if value <= 0:
+        return "—"
 
-    score = safe_float(score)
-    confidence = safe_float(confidence)
+    if value >= 1000:
+        return f"{value:,.2f}"
 
-    if score >= 0.70 and confidence >= 70:
-        return "STRONG LONG"
+    if value >= 1:
+        return f"{value:,.4f}"
 
-    if score >= 0.45 and confidence >= 55:
-        return "LONG"
-
-    if score <= -0.70 and confidence >= 70:
-        return "STRONG SHORT"
-
-    if score <= -0.45 and confidence >= 55:
-        return "SHORT"
-
-    return "WAIT"
+    return f"{value:.6f}"
 
 
-# ============================================================
-# TRADE HORIZON
-# ============================================================
-
-def get_trade_horizon(mode):
-
-    mode = str(mode).upper()
-
-    config = TRADE_MODES.get(
-        mode,
-        TRADE_MODES["SCALPING"],
-    )
-
-    return config["duration_minutes"]
+def fmt_pct(value):
+    return f"{safe_float(value):.2f}%"
 
 
-def get_horizon_text(mode):
+def normalize_confidence(value):
+    value = safe_float(value)
 
-    mode = str(mode).upper()
+    if value <= 1.0:
+        value *= 100.0
 
-    config = TRADE_MODES.get(
-        mode,
-        TRADE_MODES["SCALPING"],
-    )
+    return float(np.clip(value, 0, 100))
 
-    return config["duration_text"]
+
+def direction_class(direction):
+    direction = str(direction).upper()
+
+    if "LONG" in direction:
+        return "signal-long"
+
+    if "SHORT" in direction:
+        return "signal-short"
+
+    return "signal-wait"
 
 
 # ============================================================
-# EXPIRY
+# HTTP
 # ============================================================
 
-def calculate_expiry(created_at, mode):
-
-    minutes = get_trade_horizon(mode)
+def binance_get(endpoint, params=None):
 
     try:
-
-        if isinstance(
-            created_at,
-            str,
-        ):
-
-            created = dt.datetime.fromisoformat(
-                created_at.replace(
-                    "Z",
-                    "+00:00",
-                )
-            )
-
-        else:
-
-            created = created_at
-
-        if created.tzinfo is None:
-            created = created.replace(
-                tzinfo=dt.timezone.utc
-            )
-
-        return created + dt.timedelta(
-            minutes=minutes
+        response = requests.get(
+            endpoint,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": "ZIA-RESEARCH-LAB/2.0"
+            },
         )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        return data
 
     except Exception:
-
-        return now_utc() + dt.timedelta(
-            minutes=minutes
-        )
-
-
-def seconds_remaining(expiry):
-
-    try:
-
-        if isinstance(
-            expiry,
-            str,
-        ):
-
-            expiry = dt.datetime.fromisoformat(
-                expiry.replace(
-                    "Z",
-                    "+00:00",
-                )
-            )
-
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(
-                tzinfo=dt.timezone.utc
-            )
-
-        return max(
-            0,
-            int(
-                (
-                    expiry
-                    - now_utc()
-                ).total_seconds()
-            ),
-        )
-
-    except Exception:
-
-        return 0
-
-
-def format_remaining(seconds):
-
-    seconds = max(
-        0,
-        int(seconds),
-    )
-
-    days = seconds // 86400
-    seconds %= 86400
-
-    hours = seconds // 3600
-    seconds %= 3600
-
-    minutes = seconds // 60
-    seconds %= 60
-
-    if days > 0:
-        return (
-            f"{days}d "
-            f"{hours}h "
-            f"{minutes}m"
-        )
-
-    if hours > 0:
-        return (
-            f"{hours}h "
-            f"{minutes}m"
-        )
-
-    return (
-        f"{minutes}m "
-        f"{seconds}s"
-    )
+        return None
 
 
 # ============================================================
-# BINANCE DATA
+# FUTURES KLINES
 # ============================================================
 
 @st.cache_data(
-    ttl=10,
+    ttl=8,
     show_spinner=False,
 )
 def fetch_klines(
-    symbol,
-    interval,
-    limit=200,
+    symbol: str,
+    interval: str,
+    limit: int = 250,
 ):
 
-    try:
+    data = binance_get(
+        BINANCE_KLINES,
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        },
+    )
 
-        response = requests.get(
-            BINANCE_KLINES,
-            params={
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit,
-            },
-            timeout=8,
-        )
+    if not isinstance(data, list):
+        return pd.DataFrame()
 
-        response.raise_for_status()
+    rows = []
 
-        data = response.json()
+    for candle in data:
 
-        if not isinstance(
-            data,
-            list,
-        ):
-            return pd.DataFrame()
+        if len(candle) < 12:
+            continue
 
-        columns = [
-            "Open_Time",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Close_Time",
-            "Quote_Volume",
-            "Trades",
-            "Taker_Buy_Base",
-            "Taker_Buy_Quote",
-            "Ignore",
-        ]
+        try:
 
-        df = pd.DataFrame(
-            data,
-            columns=columns,
-        )
-
-        numeric_cols = [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]
-
-        for col in numeric_cols:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce",
+            rows.append(
+                {
+                    "Time": pd.to_datetime(
+                        int(candle[0]),
+                        unit="ms",
+                        utc=True,
+                    ),
+                    "Open": float(candle[1]),
+                    "High": float(candle[2]),
+                    "Low": float(candle[3]),
+                    "Close": float(candle[4]),
+                    "Volume": float(candle[5]),
+                    "Trades": int(candle[8]),
+                    "Taker_Buy_Base": float(candle[9]),
+                    "Taker_Buy_Quote": float(candle[10]),
+                }
             )
 
-        df["Time"] = pd.to_datetime(
-            df["Open_Time"],
-            unit="ms",
-            utc=True,
-        )
+        except Exception:
+            continue
 
-        return df[
-            [
-                "Time",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-            ]
-        ].dropna()
-
-    except Exception:
-
+    if not rows:
         return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    return df.dropna().reset_index(drop=True)
 
 
 # ============================================================
-# ORDER BOOK
+# FUTURES ORDER BOOK
 # ============================================================
 
 @st.cache_data(
-    ttl=3,
+    ttl=2,
     show_spinner=False,
 )
 def fetch_orderbook(
-    symbol,
-    limit=50,
+    symbol: str,
+    limit: int = 100,
 ):
+
+    data = binance_get(
+        BINANCE_DEPTH,
+        {
+            "symbol": symbol,
+            "limit": limit,
+        },
+    )
+
+    if not isinstance(data, dict):
+        return (
+            np.empty((0, 2)),
+            np.empty((0, 2)),
+        )
 
     try:
 
-        response = requests.get(
-            BINANCE_DEPTH,
-            params={
-                "symbol": symbol,
-                "limit": limit,
-            },
-            timeout=5,
+        bids = np.asarray(
+            data.get("bids", []),
+            dtype=np.float64,
         )
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        bids = np.array(
-            data.get(
-                "bids",
-                [],
-            ),
-            dtype=float,
+        asks = np.asarray(
+            data.get("asks", []),
+            dtype=np.float64,
         )
 
-        asks = np.array(
-            data.get(
-                "asks",
-                [],
-            ),
-            dtype=float,
-        )
+        if bids.ndim != 2:
+            bids = np.empty((0, 2))
+
+        if asks.ndim != 2:
+            asks = np.empty((0, 2))
 
         return bids, asks
 
     except Exception:
 
         return (
-            np.empty(
-                (0, 2)
-            ),
-            np.empty(
-                (0, 2)
-            ),
+            np.empty((0, 2)),
+            np.empty((0, 2)),
         )
 
 
 # ============================================================
-# 24H TICKER
+# FUTURES TICKER
 # ============================================================
 
 @st.cache_data(
@@ -566,23 +475,38 @@ def fetch_orderbook(
 )
 def fetch_ticker(symbol):
 
-    try:
+    data = binance_get(
+        BINANCE_TICKER,
+        {
+            "symbol": symbol,
+        },
+    )
 
-        response = requests.get(
-            BINANCE_TICKER,
-            params={
-                "symbol": symbol,
-            },
-            timeout=5,
-        )
+    return data if isinstance(data, dict) else {}
 
-        response.raise_for_status()
 
-        return response.json()
+# ============================================================
+# FUTURES AGG TRADES
+# ============================================================
 
-    except Exception:
+@st.cache_data(
+    ttl=3,
+    show_spinner=False,
+)
+def fetch_agg_trades(
+    symbol,
+    limit=1000,
+):
 
-        return {}
+    data = binance_get(
+        BINANCE_AGG_TRADES,
+        {
+            "symbol": symbol,
+            "limit": limit,
+        },
+    )
+
+    return data if isinstance(data, list) else []
 
 
 # ============================================================
@@ -595,10 +519,7 @@ def calculate_obi(
     levels=20,
 ):
 
-    if (
-        len(bids) == 0
-        or len(asks) == 0
-    ):
+    if len(bids) == 0 or len(asks) == 0:
         return 0.0
 
     n = min(
@@ -607,99 +528,174 @@ def calculate_obi(
         len(asks),
     )
 
-    bid_sum = 0.0
-    ask_sum = 0.0
-
-    for i in range(n):
-
-        weight = 1.0 / (
-            i + 1
+    bid_volume = np.sum(
+        np.maximum(
+            bids[:n, 1],
+            0,
         )
-
-        bid_sum += (
-            max(
-                0,
-                safe_float(
-                    bids[i][1]
-                ),
-            )
-            * weight
-        )
-
-        ask_sum += (
-            max(
-                0,
-                safe_float(
-                    asks[i][1]
-                ),
-            )
-            * weight
-        )
-
-    denominator = (
-        bid_sum
-        + ask_sum
-        + 1e-12
     )
+
+    ask_volume = np.sum(
+        np.maximum(
+            asks[:n, 1],
+            0,
+        )
+    )
+
+    total = bid_volume + ask_volume
+
+    if total <= 0:
+        return 0.0
 
     return clamp(
-        (
-            bid_sum
-            - ask_sum
-        )
-        / denominator
+        (bid_volume - ask_volume)
+        / total
     )
 
 
-# ============================================================
-# MULTI OBI
-# ============================================================
+def calculate_weighted_obi(
+    bids,
+    asks,
+    levels=20,
+):
+
+    if len(bids) == 0 or len(asks) == 0:
+        return 0.0
+
+    n = min(
+        levels,
+        len(bids),
+        len(asks),
+    )
+
+    weights = 1.0 / (
+        np.arange(n) + 1.0
+    )
+
+    bid_volume = np.sum(
+        bids[:n, 1] * weights
+    )
+
+    ask_volume = np.sum(
+        asks[:n, 1] * weights
+    )
+
+    total = bid_volume + ask_volume
+
+    if total <= 0:
+        return 0.0
+
+    return clamp(
+        (bid_volume - ask_volume)
+        / total
+    )
+
 
 def calculate_multi_obi(
     bids,
     asks,
 ):
 
-    configs = {
-        5: 0.10,
-        10: 0.20,
-        20: 0.40,
-        50: 0.30,
+    values = {
+        5: calculate_obi(bids, asks, 5),
+        10: calculate_obi(bids, asks, 10),
+        20: calculate_obi(bids, asks, 20),
+        50: calculate_obi(bids, asks, 50),
     }
 
-    values = []
-    weights = []
+    # Stronger weight on top 20 / 50
+    score = (
+        values[5] * 0.15
+        + values[10] * 0.20
+        + values[20] * 0.35
+        + values[50] * 0.30
+    )
 
-    for level, weight in configs.items():
+    return clamp(score)
 
-        if (
-            len(bids) >= level
-            and len(asks) >= level
-        ):
 
-            values.append(
-                calculate_obi(
-                    bids,
-                    asks,
-                    level,
-                )
-            )
+# ============================================================
+# DEPTH
+# ============================================================
 
-            weights.append(
-                weight
-            )
+def depth_volume(
+    bids,
+    asks,
+    levels,
+):
 
-    if not values:
-        return 0.0
+    if len(bids) < levels or len(asks) < levels:
+        return 0.0, 0.0
 
-    return clamp(
-        float(
-            np.average(
-                values,
-                weights=weights,
-            )
+    bid_sum = float(
+        np.sum(
+            bids[:levels, 1]
         )
     )
+
+    ask_sum = float(
+        np.sum(
+            asks[:levels, 1]
+        )
+    )
+
+    return bid_sum, ask_sum
+
+
+# ============================================================
+# TAKER FLOW
+# ============================================================
+
+def calculate_taker_flow(trades):
+
+    buy_volume = 0.0
+    sell_volume = 0.0
+
+    buy_notional = 0.0
+    sell_notional = 0.0
+
+    count = 0
+
+    for trade in trades:
+
+        try:
+
+            price = float(trade["p"])
+            qty = float(trade["q"])
+            maker = bool(trade["m"])
+
+            notional = price * qty
+
+            if maker:
+                sell_volume += qty
+                sell_notional += notional
+            else:
+                buy_volume += qty
+                buy_notional += notional
+
+            count += 1
+
+        except Exception:
+            continue
+
+    total = buy_volume + sell_volume
+
+    if total <= 0:
+        ratio = 0.0
+    else:
+        ratio = (
+            buy_volume - sell_volume
+        ) / total
+
+    return {
+        "buy_volume": buy_volume,
+        "sell_volume": sell_volume,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "flow": buy_volume - sell_volume,
+        "ratio": clamp(ratio),
+        "count": count,
+    }
 
 
 # ============================================================
@@ -711,1827 +707,766 @@ def calculate_atr(
     period=14,
 ):
 
-    if (
-        df is None
-        or df.empty
-        or len(df) < 2
-    ):
+    if df is None or len(df) < 2:
         return 0.0
 
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    previous_close = close.shift(1)
+    previous_close = df["Close"].shift(1)
 
     tr = pd.concat(
         [
-            high - low,
+            df["High"] - df["Low"],
             (
-                high
+                df["High"]
                 - previous_close
             ).abs(),
             (
-                low
+                df["Low"]
                 - previous_close
             ).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr = (
-        tr.ewm(
-            alpha=1.0 / period,
-            adjust=False,
-        )
-        .mean()
-    )
-
-    value = safe_float(
-        atr.iloc[-1]
-    )
-
-    if value <= 0:
-
-        value = safe_float(
-            tr.tail(
-                period
-            ).mean()
-        )
+    atr = tr.ewm(
+        alpha=1.0 / period,
+        adjust=False,
+    ).mean()
 
     return max(
         0.0,
-        value,
+        safe_float(
+            atr.iloc[-1]
+        ),
     )
 
 
 # ============================================================
-# LOCAL FALLBACK SIGNAL ENGINE
+# TECHNICAL FEATURES
 # ============================================================
 
-def local_signal_engine(
-    df,
-    bids,
-    asks,
-):
+def technical_features(df):
 
-    if (
-        df is None
-        or df.empty
-        or len(df) < 20
-    ):
-
-        return {
-            "score": 0.0,
-            "confidence": 0.0,
-            "direction": "WAIT",
-            "ml_probability": 0.50,
-            "obi": 0.0,
-            "trend": 0.0,
-            "atr": 0.0,
-        }
+    if df.empty:
+        return {}
 
     close = df["Close"]
 
-    ema20 = (
-        close.ewm(
-            span=20,
-            adjust=False,
-        )
-        .mean()
+    ema20 = close.ewm(
+        span=20,
+        adjust=False,
+    ).mean()
+
+    ema50 = close.ewm(
+        span=50,
+        adjust=False,
+    ).mean()
+
+    ema200 = close.ewm(
+        span=200,
+        adjust=False,
+    ).mean()
+
+    sma20 = close.rolling(
+        20,
+        min_periods=5,
+    ).mean()
+
+    returns = close.pct_change()
+
+    volatility = (
+        returns
+        .rolling(20)
+        .std()
+        .iloc[-1]
     )
 
-    ema50 = (
-        close.ewm(
-            span=50,
-            adjust=False,
-        )
-        .mean()
+    momentum_5 = (
+        close.iloc[-1]
+        / close.iloc[-6]
+        - 1
+        if len(close) >= 6
+        else 0
     )
 
-    atr = calculate_atr(
-        df,
-        14,
+    momentum_20 = (
+        close.iloc[-1]
+        / close.iloc[-21]
+        - 1
+        if len(close) >= 21
+        else 0
     )
 
     price = safe_float(
         close.iloc[-1]
     )
 
-    if atr <= 0:
-        atr = price * 0.001
+    trend_score = 0.0
 
-    trend = clamp(
-        np.tanh(
-            (
-                ema20.iloc[-1]
-                - ema50.iloc[-1]
-            )
-            / (
-                atr * 2
-            )
-        )
-    )
-
-    obi = calculate_multi_obi(
-        bids,
-        asks,
-    )
-
-    returns = (
-        close
-        .pct_change()
-        .dropna()
-    )
-
-    momentum = 0.0
-
-    if len(returns) >= 5:
-
-        momentum = clamp(
-            np.tanh(
-                (
-                    (
-                        close.iloc[-1]
-                        / close.iloc[-5]
-                    )
-                    - 1
-                )
-                / 0.005
-            )
-        )
-
-    score = (
-        0.45 * obi
-        + 0.35 * trend
-        + 0.20 * momentum
-    )
-
-    score = clamp(
-        score
-    )
-
-    confidence = abs(
-        score
-    ) * 100
-
-    if score >= 0.70:
-        direction = "STRONG LONG"
-
-    elif score >= 0.45:
-        direction = "LONG"
-
-    elif score <= -0.70:
-        direction = "STRONG SHORT"
-
-    elif score <= -0.45:
-        direction = "SHORT"
-
+    if price > safe_float(ema20.iloc[-1]):
+        trend_score += 0.30
     else:
-        direction = "WAIT"
+        trend_score -= 0.30
 
-    probability = (
-        0.50
-        + (
-            score
-            * 0.45
-        )
-    )
+    if price > safe_float(ema50.iloc[-1]):
+        trend_score += 0.25
+    else:
+        trend_score -= 0.25
 
-    probability = float(
-        np.clip(
-            probability,
-            0.05,
-            0.95,
-        )
+    if price > safe_float(ema200.iloc[-1]):
+        trend_score += 0.20
+    else:
+        trend_score -= 0.20
+
+    trend_score += clamp(
+        momentum_20 * 20,
+        -0.25,
+        0.25,
     )
 
     return {
-        "score": score,
-        "confidence": confidence,
-        "direction": direction,
-        "ml_probability": probability,
-        "obi": obi,
-        "trend": trend,
-        "atr": atr,
+        "price": price,
+        "ema20": safe_float(
+            ema20.iloc[-1]
+        ),
+        "ema50": safe_float(
+            ema50.iloc[-1]
+        ),
+        "ema200": safe_float(
+            ema200.iloc[-1]
+        ),
+        "sma20": safe_float(
+            sma20.iloc[-1]
+        ),
+        "volatility": safe_float(
+            volatility
+        ),
+        "momentum_5": safe_float(
+            momentum_5
+        ),
+        "momentum_20": safe_float(
+            momentum_20
+        ),
+        "trend_score": clamp(
+            trend_score
+        ),
     }
 
 
 # ============================================================
-# TRY REAL RESEARCH ENGINE
+# HIGHER TIMEFRAME CONFIRMATION
+# ============================================================
+
+@st.cache_data(
+    ttl=10,
+    show_spinner=False,
+)
+def higher_timeframe_bias(symbol):
+
+    timeframes = [
+        "1h",
+        "4h",
+        "1d",
+    ]
+
+    result = {}
+
+    for tf in timeframes:
+
+        df = fetch_klines(
+            symbol,
+            tf,
+            100,
+        )
+
+        if df.empty:
+            result[tf] = 0.0
+            continue
+
+        close = df["Close"]
+
+        ema20 = close.ewm(
+            span=20,
+            adjust=False,
+        ).mean()
+
+        ema50 = close.ewm(
+            span=50,
+            adjust=False,
+        ).mean()
+
+        price = safe_float(
+            close.iloc[-1]
+        )
+
+        score = 0.0
+
+        if price > safe_float(
+            ema20.iloc[-1]
+        ):
+            score += 0.5
+        else:
+            score -= 0.5
+
+        if price > safe_float(
+            ema50.iloc[-1]
+        ):
+            score += 0.5
+        else:
+            score -= 0.5
+
+        result[tf] = clamp(score)
+
+    return result
+
+
+# ============================================================
+# XGBOOST
 # ============================================================
 
 @st.cache_resource(
     show_spinner=False,
 )
-def load_research_engine():
+def load_model():
+
+    if not MODEL_FILE.exists():
+        return None
 
     try:
-
-        from engine import (
-            IntegratedTradingEngine,
+        return joblib.load(
+            MODEL_FILE
         )
-
-        return IntegratedTradingEngine(
-            symbol="BTCUSDT"
-        )
-
     except Exception:
-
         return None
 
 
-def run_engine(
-    symbol,
-    df,
-    bids,
-    asks,
-    mode,
+def model_signal(
+    model,
+    features,
 ):
 
-    engine = load_research_engine()
-
-    if engine is None:
-
-        return local_signal_engine(
-            df,
-            bids,
-            asks,
-        )
+    if model is None:
+        return None
 
     try:
 
-        engine.symbol = symbol
+        expected = getattr(
+            model,
+            "n_features_in_",
+            None,
+        )
+
+        if expected is not None:
+
+            if expected != len(features):
+                return None
+
+        X = np.asarray(
+            [features],
+            dtype=float,
+        )
+
+        prediction = model.predict(X)[0]
+
+        confidence = 0.50
 
         if hasattr(
-            engine,
-            "tri_engine",
+            model,
+            "predict_proba",
         ):
-            engine.tri_engine.set_symbol(
-                symbol
+
+            probs = model.predict_proba(X)[0]
+
+            confidence = float(
+                np.max(probs)
             )
 
-        result = engine.analyze(
-            df=df,
-            bids=bids.tolist()
-            if isinstance(
-                bids,
-                np.ndarray,
-            )
-            else bids,
-            asks=asks.tolist()
-            if isinstance(
-                asks,
-                np.ndarray,
-            )
-            else asks,
-            trade_mode=mode,
-        )
-
-        return result
+        return {
+            "prediction": int(
+                prediction
+            ),
+            "confidence": confidence,
+        }
 
     except Exception:
-
-        return local_signal_engine(
-            df,
-            bids,
-            asks,
-        )
+        return None
 
 
 # ============================================================
-# NORMALIZE ENGINE OUTPUT
+# SIGNAL ENGINE
 # ============================================================
 
-def normalize_signal(
-    raw,
+def generate_signal(
     df,
+    bids,
+    asks,
+    symbol,
     mode,
 ):
 
-    price = (
-        safe_float(
-            raw.get(
-                "CURRENT_PRICE",
-                raw.get(
-                    "current_price",
-                    0,
-                ),
-            )
-        )
+    tech = technical_features(
+        df
     )
 
-    if price <= 0 and df is not None and not df.empty:
+    if not tech:
+        return None
 
-        price = safe_float(
-            df["Close"].iloc[-1]
-        )
-
-    score = safe_float(
-        raw.get(
-            "FINAL_SCORE",
-            raw.get(
-                "final_score",
-                raw.get(
-                    "SCORE",
-                    raw.get(
-                        "score",
-                        0,
-                    ),
-                ),
-            ),
-        )
+    ticker = fetch_ticker(
+        symbol
     )
 
-    confidence = safe_float(
-        raw.get(
-            "CONFIDENCE",
-            raw.get(
-                "confidence",
-                abs(score) * 100,
-            ),
-        )
+    trades = fetch_agg_trades(
+        symbol,
+        1000,
     )
 
-    ml_probability = safe_float(
-        raw.get(
-            "ML_PROBABILITY",
-            raw.get(
-                "ml_probability",
-                0.50,
-            ),
+    flow = calculate_taker_flow(
+        trades
+    )
+
+    obi5 = calculate_obi(
+        bids,
+        asks,
+        5,
+    )
+
+    obi10 = calculate_obi(
+        bids,
+        asks,
+        10,
+    )
+
+    obi20 = calculate_obi(
+        bids,
+        asks,
+        20,
+    )
+
+    obi50 = calculate_obi(
+        bids,
+        asks,
+        50,
+    )
+
+    weighted_obi = calculate_weighted_obi(
+        bids,
+        asks,
+        20,
+    )
+
+    multi_obi = calculate_multi_obi(
+        bids,
+        asks,
+    )
+
+    bid20, ask20 = depth_volume(
+        bids,
+        asks,
+        20,
+    )
+
+    bid50, ask50 = depth_volume(
+        bids,
+        asks,
+        50,
+    )
+
+    total20 = bid20 + ask20
+
+    spread = 0.0
+
+    if len(bids) > 0 and len(asks) > 0:
+
+        spread = (
+            asks[0, 0]
+            - bids[0, 0]
+        )
+
+    # --------------------------------------------------------
+    # XGBOOST FEATURE SET
+    # IMPORTANT:
+    # Existing model expects 7 features.
+    # --------------------------------------------------------
+
+    xgb_features = [
+        bid20,
+        ask20,
+        obi20,
+        spread,
+        (
+            bid20 / ask20
+            if ask20 > 0
+            else 0.0
         ),
-        0.50,
+        total20,
+        tech["trend_score"],
+    ]
+
+    model = load_model()
+
+    ml = model_signal(
+        model,
+        xgb_features,
     )
 
-    direction = str(
-        raw.get(
-            "SIGNAL",
-            raw.get(
-                "signal",
-                "",
-            ),
+    # --------------------------------------------------------
+    # BASE QUANT SCORE
+    # --------------------------------------------------------
+
+    score = 0.0
+
+    # Order book
+    score += multi_obi * 0.30
+
+    # Aggressive flow
+    score += flow["ratio"] * 0.25
+
+    # Trend
+    score += tech["trend_score"] * 0.25
+
+    # Short momentum
+    score += clamp(
+        tech["momentum_5"] * 30,
+        -1,
+        1,
+    ) * 0.10
+
+    # Medium momentum
+    score += clamp(
+        tech["momentum_20"] * 15,
+        -1,
+        1,
+    ) * 0.10
+
+    # --------------------------------------------------------
+    # HIGHER TF CONFIRMATION
+    # --------------------------------------------------------
+
+    htf = higher_timeframe_bias(
+        symbol
+    )
+
+    htf_score = (
+        htf.get("1h", 0.0) * 0.45
+        + htf.get("4h", 0.0) * 0.35
+        + htf.get("1d", 0.0) * 0.20
+    )
+
+    score += htf_score * 0.20
+
+    # Keep score bounded
+    score = clamp(
+        score,
+        -1,
+        1,
+    )
+
+    # --------------------------------------------------------
+    # ML VOTE
+    # --------------------------------------------------------
+
+    ml_score = 0.0
+    ml_confidence = 0.50
+
+    if ml is not None:
+
+        ml_confidence = safe_float(
+            ml["confidence"],
+            0.50,
         )
-    ).upper()
 
-    if direction in [
-        "LONG",
-        "SHORT",
-        "STRONG LONG",
-        "STRONG SHORT",
-    ]:
+        if ml["prediction"] == 1:
+            ml_score = 1.0
+        else:
+            ml_score = -1.0
 
-        final_direction = direction
+        # Only allow meaningful ML contribution
+        ml_weight = min(
+            0.25,
+            ml_confidence * 0.25,
+        )
+
+        score = clamp(
+            score
+            + ml_score * ml_weight
+        )
+
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
+
+    raw_confidence = (
+        abs(score) * 55
+        + abs(multi_obi) * 20
+        + abs(flow["ratio"]) * 15
+        + abs(htf_score) * 10
+    )
+
+    if ml is not None:
+        raw_confidence = (
+            raw_confidence * 0.75
+            + (
+                ml_confidence
+                * 100
+            ) * 0.25
+        )
+
+    confidence = float(
+        np.clip(
+            raw_confidence,
+            0,
+            99,
+        )
+    )
+
+    # --------------------------------------------------------
+    # SIGNAL THRESHOLDS
+    # --------------------------------------------------------
+
+    if (
+        score >= 0.70
+        and confidence >= 70
+    ):
+        direction = "STRONG LONG"
+
+    elif (
+        score >= 0.42
+        and confidence >= 55
+    ):
+        direction = "LONG"
+
+    elif (
+        score <= -0.70
+        and confidence >= 70
+    ):
+        direction = "STRONG SHORT"
+
+    elif (
+        score <= -0.42
+        and confidence >= 55
+    ):
+        direction = "SHORT"
 
     else:
+        direction = "WAIT"
 
-        final_direction = direction_label(
-            score,
-            confidence,
-        )
+    # --------------------------------------------------------
+    # ATR SL / TP
+    # --------------------------------------------------------
 
     atr = calculate_atr(
         df,
         14,
     )
 
+    price = tech["price"]
+
     if atr <= 0:
-        atr = price * 0.001
+        atr = price * 0.005
 
-    # ========================================================
-    # SL
-    # ========================================================
-
-    stop_loss = safe_float(
-        raw.get(
-            "STOP_LOSS",
-            raw.get(
-                "stop_loss",
-                0,
-            ),
-        )
+    # Risk adjusted to volatility
+    sl_distance = max(
+        atr * 1.15,
+        price * 0.0025,
     )
 
-    if stop_loss <= 0:
-
-        if "LONG" in final_direction:
-
-            stop_loss = (
-                price
-                - atr
-            )
-
-        elif "SHORT" in final_direction:
-
-            stop_loss = (
-                price
-                + atr
-            )
-
-    # ========================================================
-    # TP1 1:2
-    # ========================================================
-
-    risk = abs(
-        price
-        - stop_loss
+    # Hard cap at 0.6%
+    sl_distance = min(
+        sl_distance,
+        price * 0.006,
     )
 
-    if risk <= 0:
-        risk = atr
+    # Minimum 1:2 RR
+    tp_distance = sl_distance * 2.0
 
-    tp1 = safe_float(
-        raw.get(
-            "TP1",
-            raw.get(
-                "tp1",
-                0,
-            ),
-        )
-    )
-
-    if tp1 <= 0:
-
-        if "LONG" in final_direction:
-
-            tp1 = (
-                price
-                + (
-                    risk
-                    * 2
-                )
-            )
-
-        elif "SHORT" in final_direction:
-
-            tp1 = (
-                price
-                - (
-                    risk
-                    * 2
-                )
-            )
-
-    # ========================================================
-    # TP2 1:3
-    # ========================================================
-
-    tp2 = safe_float(
-        raw.get(
-            "TP2",
-            raw.get(
-                "tp2",
-                0,
-            ),
-        )
-    )
-
-    if tp2 <= 0:
-
-        if "LONG" in final_direction:
-
-            tp2 = (
-                price
-                + (
-                    risk
-                    * 3
-                )
-            )
-
-        elif "SHORT" in final_direction:
-
-            tp2 = (
-                price
-                - (
-                    risk
-                    * 3
-                )
-            )
-
-    return {
-        "direction": final_direction,
-        "score": score,
-        "confidence": confidence,
-        "ml_probability": ml_probability,
-        "entry": price,
-        "stop_loss": stop_loss,
-        "tp1": tp1,
-        "tp2": tp2,
-        "atr": atr,
-
-        "quant_score": safe_float(
-            raw.get(
-                "QUANT_SCORE",
-                raw.get(
-                    "quant_score",
-                    score,
-                ),
-            )
-        ),
-
-        "ml_score": safe_float(
-            raw.get(
-                "ML_SCORE",
-                raw.get(
-                    "ml_score",
-                    0,
-                ),
-            )
-        ),
-
-        "ml_direction": str(
-            raw.get(
-                "ML_DIRECTION",
-                raw.get(
-                    "ml_direction",
-                    "NEUTRAL",
-                ),
-            )
-        ),
-
-        "tri_signal": str(
-            raw.get(
-                "TRI_SIGNAL",
-                raw.get(
-                    "tri_signal",
-                    "NEUTRAL",
-                ),
-            )
-        ),
-
-        "tri_touched": bool(
-            raw.get(
-                "TRI_TOUCHED",
-                raw.get(
-                    "tri_touched",
-                    False,
-                ),
-            )
-        ),
-
-        "tri_timeframe": raw.get(
-            "TRI_TIMEFRAME",
-            raw.get(
-                "tri_timeframe",
-                None,
-            ),
-        ),
-
-        "tri_line": safe_float(
-            raw.get(
-                "TRI_LINE",
-                raw.get(
-                    "tri_line",
-                    0,
-                ),
-            )
-        ),
-
-        "tri_rr": safe_float(
-            raw.get(
-                "TRI_RR",
-                raw.get(
-                    "tri_rr",
-                    0,
-                ),
-            )
-        ),
-
-        "tri_reason": str(
-            raw.get(
-                "TRI_REASON",
-                raw.get(
-                    "tri_reason",
-                    "NO_SETUP",
-                ),
-            )
-        ),
-
-        "features": raw.get(
-            "FEATURES",
-            raw.get(
-                "features",
-                {},
-            ),
-        ),
-
-        "weights": raw.get(
-            "WEIGHTS",
-            raw.get(
-                "weights",
-                {},
-            ),
-        ),
-    }
-
-
-# ============================================================
-# TRADE VALIDATION
-# ============================================================
-
-def is_trade_signal(direction):
-
-    return direction in [
+    if direction in (
         "LONG",
-        "SHORT",
         "STRONG LONG",
+    ):
+
+        entry = price
+        stop_loss = entry - sl_distance
+        target1 = entry + tp_distance
+        target2 = entry + (
+            sl_distance * 3.0
+        )
+
+    elif direction in (
+        "SHORT",
         "STRONG SHORT",
-    ]
-
-
-# ============================================================
-# CREATE TRADE
-# ============================================================
-
-def create_trade(
-    symbol,
-    mode,
-    signal,
-):
-
-    if not is_trade_signal(
-        signal["direction"]
-    ):
-        return None
-
-    created = now_utc()
-
-    expiry = calculate_expiry(
-        created,
-        mode,
-    )
-
-    trade_id = (
-        f"{symbol}_"
-        f"{mode}_"
-        f"{int(time.time())}"
-    )
-
-    direction = signal[
-        "direction"
-    ]
-
-    trade = {
-
-        "trade_id": trade_id,
-
-        "timestamp": created.isoformat(),
-
-        "symbol": symbol,
-
-        "mode": mode,
-
-        "timeframe": TRADE_MODES[
-            mode
-        ][
-            "analysis_tf"
-        ],
-
-        "direction": direction,
-
-        "entry_price": signal[
-            "entry"
-        ],
-
-        "stop_loss": signal[
-            "stop_loss"
-        ],
-
-        "tp1": signal[
-            "tp1"
-        ],
-
-        "tp2": signal[
-            "tp2"
-        ],
-
-        "confidence": signal[
-            "confidence"
-        ],
-
-        "score": signal[
-            "score"
-        ],
-
-        "ml_probability": signal[
-            "ml_probability"
-        ],
-
-        "tri_signal": signal[
-            "tri_signal"
-        ],
-
-        "tri_line": signal[
-            "tri_line"
-        ],
-
-        "tri_rr": signal[
-            "tri_rr"
-        ],
-
-        "duration_minutes":
-            get_trade_horizon(
-                mode
-            ),
-
-        "duration_text":
-            get_horizon_text(
-                mode
-            ),
-
-        "expiry_time":
-            expiry.isoformat(),
-
-        "status": "ACTIVE",
-
-        "outcome": "PENDING",
-
-        "exit_price": 0.0,
-
-        "pnl_percent": 0.0,
-
-        "closed_at": "",
-
-        "close_reason": "",
-    }
-
-    return trade
-
-
-# ============================================================
-# RESOLVE ACTIVE TRADES
-# ============================================================
-
-def resolve_active_trades():
-
-    if not st.session_state.active_trades:
-        return
-
-    changed = False
-
-    current_cache = {}
-
-    for trade in st.session_state.active_trades:
-
-        symbol = trade["symbol"]
-
-        if symbol not in current_cache:
-
-            try:
-
-                ticker = fetch_ticker(
-                    symbol
-                )
-
-                price = safe_float(
-                    ticker.get(
-                        "lastPrice",
-                        0,
-                    )
-                )
-
-            except Exception:
-
-                price = 0.0
-
-            current_cache[
-                symbol
-            ] = price
-
-        price = current_cache[
-            symbol
-        ]
-
-        if price <= 0:
-            continue
-
-        direction = str(
-            trade["direction"]
-        ).upper()
-
-        entry = safe_float(
-            trade["entry_price"]
-        )
-
-        sl = safe_float(
-            trade["stop_loss"]
-        )
-
-        tp1 = safe_float(
-            trade["tp1"]
-        )
-
-        tp2 = safe_float(
-            trade["tp2"]
-        )
-
-        expiry = trade[
-            "expiry_time"
-        ]
-
-        remaining = seconds_remaining(
-            expiry
-        )
-
-        reason = None
-        outcome = None
-
-        # ====================================================
-        # LONG
-        # ====================================================
-
-        if "LONG" in direction:
-
-            if price <= sl:
-
-                reason = "STOP LOSS"
-                outcome = "LOSS"
-
-            elif price >= tp2:
-
-                reason = "TP2"
-                outcome = "WIN"
-
-            elif price >= tp1:
-
-                # TP1 is marked but trade stays alive
-                if trade.get(
-                    "status"
-                ) == "ACTIVE":
-
-                    trade[
-                        "status"
-                    ] = "TP1 HIT"
-
-                    changed = True
-
-        # ====================================================
-        # SHORT
-        # ====================================================
-
-        elif "SHORT" in direction:
-
-            if price >= sl:
-
-                reason = "STOP LOSS"
-                outcome = "LOSS"
-
-            elif price <= tp2:
-
-                reason = "TP2"
-                outcome = "WIN"
-
-            elif price <= tp1:
-
-                if trade.get(
-                    "status"
-                ) == "ACTIVE":
-
-                    trade[
-                        "status"
-                    ] = "TP1 HIT"
-
-                    changed = True
-
-        # ====================================================
-        # EXPIRY
-        # ====================================================
-
-        if (
-            reason is None
-            and remaining <= 0
-        ):
-
-            reason = "TIME EXPIRY"
-            outcome = (
-                "WIN"
-                if (
-                    (
-                        "LONG"
-                        in direction
-                        and price > entry
-                    )
-                    or
-                    (
-                        "SHORT"
-                        in direction
-                        and price < entry
-                    )
-                )
-                else "LOSS"
-            )
-
-        # ====================================================
-        # CLOSE
-        # ====================================================
-
-        if reason is not None:
-
-            if entry > 0:
-
-                if "LONG" in direction:
-
-                    pnl = (
-                        (
-                            price
-                            - entry
-                        )
-                        / entry
-                    ) * 100
-
-                else:
-
-                    pnl = (
-                        (
-                            entry
-                            - price
-                        )
-                        / entry
-                    ) * 100
-
-            else:
-
-                pnl = 0.0
-
-            trade[
-                "status"
-            ] = "CLOSED"
-
-            trade[
-                "outcome"
-            ] = outcome
-
-            trade[
-                "exit_price"
-            ] = price
-
-            trade[
-                "pnl_percent"
-            ] = round(
-                pnl,
-                4,
-            )
-
-            trade[
-                "closed_at"
-            ] = iso_now()
-
-            trade[
-                "close_reason"
-            ] = reason
-
-            st.session_state.trade_history.insert(
-                0,
-                trade.copy(),
-            )
-
-            changed = True
-
-    st.session_state.active_trades = [
-        t
-        for t in st.session_state.active_trades
-        if t.get(
-            "status"
-        )
-        not in [
-            "CLOSED",
-        ]
-    ]
-
-    if changed:
-        save_history()
-
-
-# ============================================================
-# AUTO REFRESH
-# ============================================================
-
-st_autorefresh(
-    interval=5000,
-    limit=None,
-    key="zia_research_refresh",
-)
-
-
-# ============================================================
-# RESOLVE TRADES
-# ============================================================
-
-resolve_active_trades()
-
-
-# ============================================================
-# CSS
-# ============================================================
-
-st.markdown(
-    """
-<style>
-
-.stApp {
-    background:
-        radial-gradient(
-            circle at 20% 0%,
-            rgba(0, 255, 180, 0.04),
-            transparent 35%
-        ),
-        #07090d;
-    color: #e6edf3;
-}
-
-section[data-testid="stSidebar"] {
-    background: #0b0f15;
-    border-right: 1px solid #1b2430;
-}
-
-.block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 3rem;
-}
-
-h1, h2, h3 {
-    letter-spacing: -0.02em;
-}
-
-.brand {
-    font-size: 29px;
-    font-weight: 800;
-    letter-spacing: 0.04em;
-}
-
-.subtitle {
-    color: #7d8a99;
-    font-size: 12px;
-    margin-top: -5px;
-}
-
-.card {
-    background: linear-gradient(
-        145deg,
-        #10151d,
-        #0c1118
-    );
-    border: 1px solid #1d2733;
-    border-radius: 14px;
-    padding: 17px;
-    margin-bottom: 12px;
-    box-shadow:
-        0 10px 35px
-        rgba(0,0,0,0.20);
-}
-
-.card-title {
-    color: #7f8b99;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 6px;
-}
-
-.card-value {
-    color: #f0f6fc;
-    font-size: 25px;
-    font-weight: 800;
-}
-
-.card-small {
-    color: #9ba7b5;
-    font-size: 12px;
-}
-
-.signal-card {
-    background:
-        linear-gradient(
-            135deg,
-            #101821,
-            #0b1017
-        );
-    border: 1px solid #263241;
-    border-radius: 18px;
-    padding: 25px;
-    min-height: 260px;
-}
-
-.signal-title {
-    color: #7e8c9b;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0.12em;
-}
-
-.signal-value {
-    font-size: 42px;
-    font-weight: 900;
-    margin: 7px 0 5px 0;
-}
-
-.long {
-    color: #21d19a;
-}
-
-.short {
-    color: #ff5c72;
-}
-
-.wait {
-    color: #f5c451;
-}
-
-.white {
-    color: #f5f7fa;
-}
-
-.progress-bg {
-    background: #18212b;
-    height: 8px;
-    border-radius: 20px;
-    overflow: hidden;
-}
-
-.progress-fill {
-    height: 100%;
-    border-radius: 20px;
-    background: #22d3a0;
-}
-
-.badge {
-    display: inline-block;
-    border: 1px solid #293544;
-    border-radius: 999px;
-    padding: 5px 10px;
-    font-size: 11px;
-    font-weight: 700;
-    margin-right: 5px;
-}
-
-.timer {
-    font-size: 30px;
-    font-weight: 800;
-}
-
-.section-title {
-    font-size: 18px;
-    font-weight: 800;
-    margin-top: 15px;
-    margin-bottom: 10px;
-}
-
-hr {
-    border-color: #1b2530;
-}
-
-[data-testid="stMetric"] {
-    background: #0e141c;
-    border: 1px solid #1d2733;
-    border-radius: 12px;
-    padding: 10px;
-}
-
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.markdown(
-    "## ⚡ ZIA RESEARCH"
-)
-
-st.sidebar.caption(
-    "Quantitative Market Research Terminal"
-)
-
-st.sidebar.markdown("---")
-
-
-selected_symbol = st.sidebar.selectbox(
-    "MARKET",
-    COINS,
-    index=COINS.index(
-        st.session_state.selected_symbol
-    )
-    if st.session_state.selected_symbol
-    in COINS
-    else 0,
-)
-
-selected_mode = st.sidebar.selectbox(
-    "SIGNAL MODE",
-    list(TRADE_MODES.keys()),
-    format_func=lambda x:
-        TRADE_MODES[x]["label"],
-    index=list(
-        TRADE_MODES.keys()
-    ).index(
-        st.session_state.selected_mode
-    ),
-)
-
-st.session_state.selected_symbol = (
-    selected_symbol
-)
-
-st.session_state.selected_mode = (
-    selected_mode
-)
-
-
-# ============================================================
-# MODE INFO
-# ============================================================
-
-mode_config = TRADE_MODES[
-    selected_mode
-]
-
-st.sidebar.markdown("---")
-
-st.sidebar.markdown(
-    "### TRADE HORIZON"
-)
-
-st.sidebar.info(
-    (
-        f"Analysis: **{mode_config['analysis_tf']}**\n\n"
-        f"Trade: **{mode_config['duration_text']}**\n\n"
-        f"Max holding: **{mode_config['max_holding']}**"
-    )
-)
-
-
-# ============================================================
-# SIDEBAR OPTIONS
-# ============================================================
-
-auto_scan = st.sidebar.toggle(
-    "AUTO SIGNAL SCAN",
-    value=True,
-)
-
-show_chart = st.sidebar.toggle(
-    "SHOW PRICE CHART",
-    value=True,
-)
-
-show_features = st.sidebar.toggle(
-    "SHOW RESEARCH FEATURES",
-    value=True,
-)
-
-show_orderbook = st.sidebar.toggle(
-    "SHOW ORDER BOOK",
-    value=True,
-)
-
-
-# ============================================================
-# MANUAL SIGNAL
-# ============================================================
-
-st.sidebar.markdown("---")
-
-if st.sidebar.button(
-    "🔄 REFRESH NOW",
-    use_container_width=True,
-):
-
-    st.cache_data.clear()
-    st.rerun()
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-interval = mode_config[
-    "analysis_tf"
-]
-
-df = fetch_klines(
-    selected_symbol,
-    interval,
-    200,
-)
-
-bids, asks = fetch_orderbook(
-    selected_symbol,
-    50,
-)
-
-ticker = fetch_ticker(
-    selected_symbol
-)
-
-# ============================================================
-# SIGNAL
-# ============================================================
-
-if (
-    df.empty
-    or len(df) < 20
-):
-
-    st.error(
-        "Market data unavailable."
-    )
-
-    st.stop()
-
-
-raw_signal = run_engine(
-    selected_symbol,
-    df,
-    bids,
-    asks,
-    selected_mode,
-)
-
-signal = normalize_signal(
-    raw_signal,
-    df,
-    selected_mode,
-)
-
-
-# ============================================================
-# SAVE LAST SIGNAL
-# ============================================================
-
-signal_key = (
-    f"{selected_symbol}_"
-    f"{selected_mode}"
-)
-
-st.session_state.last_signals[
-    signal_key
-] = signal
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    """
-<div class="brand">
-⚡ ZIA RESEARCH LAB
-</div>
-<div class="subtitle">
-REAL-TIME QUANTITATIVE MARKET RESEARCH & PAPER SIGNAL TERMINAL
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-st.markdown("")
-
-
-# ============================================================
-# TOP MARKET BAR
-# ============================================================
-
-price = signal[
-    "entry"
-]
-
-ticker_change = safe_float(
-    ticker.get(
-        "priceChangePercent",
-        0,
-    )
-)
-
-volume_24h = safe_float(
-    ticker.get(
-        "volume",
-        0,
-    )
-)
-
-obi = calculate_multi_obi(
-    bids,
-    asks,
-)
-
-market_change_text = (
-    f"{ticker_change:+.2f}%"
-)
-
-st.markdown(
-    f"""
-<div class="card">
-
-<div class="card-small">
-MARKET
-</div>
-
-<h2 style="margin:3px 0;">
-{selected_symbol}
-</h2>
-
-<div style="
-font-size:30px;
-font-weight:800;
-">
-{fmt_price(price)}
-</div>
-
-<div class="card-small">
-24H CHANGE:
-{market_change_text}
-&nbsp;&nbsp; | &nbsp;&nbsp;
-OBI:
-{obi:+.3f}
-&nbsp;&nbsp; | &nbsp;&nbsp;
-MODE:
-{mode_config['label']}
-</div>
-
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# MAIN SIGNAL CARD
-# ============================================================
-
-direction = signal[
-    "direction"
-]
-
-if "LONG" in direction:
-
-    direction_class = "long"
-
-elif "SHORT" in direction:
-
-    direction_class = "short"
-
-else:
-
-    direction_class = "wait"
-
-
-confidence = signal[
-    "confidence"
-]
-
-score = signal[
-    "score"
-]
-
-horizon = get_horizon_text(
-    selected_mode
-)
-
-st.markdown(
-    f"""
-<div class="signal-card">
-
-<div class="signal-title">
-CURRENT RESEARCH SIGNAL
-</div>
-
-<div class="signal-value {direction_class}">
-{direction}
-</div>
-
-<div style="
-font-size:13px;
-color:#8e9baa;
-margin-bottom:14px;
-">
-{selected_symbol}
-&nbsp; • &nbsp;
-{mode_config['label']}
-&nbsp; • &nbsp;
-TRADE HORIZON: {horizon}
-</div>
-
-<div class="card-small">
-CONFIDENCE
-</div>
-
-<div style="
-font-size:25px;
-font-weight:800;
-margin-bottom:8px;
-">
-{confidence:.1f}%
-</div>
-
-<div class="progress-bg">
-
-<div
-class="progress-fill"
-style="width:{min(100, max(0, confidence))}%">
-</div>
-
-</div>
-
-<div style="
-margin-top:16px;
-">
-
-<span class="badge">
-SCORE {score:+.3f}
-</span>
-
-<span class="badge">
-ML {signal['ml_probability'] * 100:.1f}%
-</span>
-
-<span class="badge">
-TRI {signal['tri_signal']}
-</span>
-
-</div>
-
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# TRADE PLAN
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🎯 TRADE PLAN</div>',
-    unsafe_allow_html=True,
-)
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-with c1:
-
-    st.metric(
-        "ENTRY",
-        fmt_price(
-            signal["entry"]
-        ),
-    )
-
-with c2:
-
-    st.metric(
-        "STOP LOSS",
-        fmt_price(
-            signal["stop_loss"]
-        ),
-    )
-
-with c3:
-
-    st.metric(
-        "TP1 • 1:2",
-        fmt_price(
-            signal["tp1"]
-        ),
-    )
-
-with c4:
-
-    st.metric(
-        "TP2 • 1:3",
-        fmt_price(
-            signal["tp2"]
-        ),
-    )
-
-with c5:
-
-    st.metric(
-        "HORIZON",
-        horizon,
-    )
-
-
-# ============================================================
-# RISK / RESEARCH
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🧠 RESEARCH ENGINE</div>',
-    unsafe_allow_html=True,
-)
-
-r1, r2, r3, r4, r5, r6 = st.columns(6)
-
-with r1:
-
-    st.metric(
-        "QUANT SCORE",
-        f"{signal['quant_score']:+.3f}",
-    )
-
-with r2:
-
-    st.metric(
-        "ML SCORE",
-        f"{signal['ml_score']:+.3f}",
-    )
-
-with r3:
-
-    st.metric(
-        "ML UP",
-        pct(
-            signal[
-                "ml_probability"
-            ]
-        ),
-    )
-
-with r4:
-
-    st.metric(
-        "OBI",
-        f"{obi:+.3f}",
-    )
-
-with r5:
-
-    st.metric(
-        "TRI RR",
-        (
-            f"{signal['tri_rr']:.2f}"
-            if signal["tri_rr"] > 0
-            else "—"
-        ),
-    )
-
-with r6:
-
-    st.metric(
-        "ATR",
-        fmt_price(
-            signal["atr"]
-        ),
-    )
-
-
-# ============================================================
-# SIGNAL EXPIRY / PAPER TRADE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">⏱️ SIGNAL / TRADE TIMER</div>',
-    unsafe_allow_html=True,
-)
-
-current_active = None
-
-for trade in st.session_state.active_trades:
-
-    if (
-        trade["symbol"]
-        == selected_symbol
-        and trade["mode"]
-        == selected_mode
     ):
 
-        current_active = trade
-        break
-
-
-if current_active is not None:
-
-    remaining = seconds_remaining(
-        current_active[
-            "expiry_time"
-        ]
-    )
-
-    st.markdown(
-        f"""
-<div class="card">
-
-<div class="card-title">
-ACTIVE PAPER TRADE
-</div>
-
-<div class="timer">
-{format_remaining(remaining)}
-</div>
-
-<div class="card-small">
-EXPIRY:
-{current_active['expiry_time']}
-</div>
-
-<br>
-
-<div class="card-small">
-STATUS:
-<b>
-{current_active['status']}
-</b>
-&nbsp;&nbsp; | &nbsp;&nbsp;
-ENTRY:
-<b>
-{fmt_price(current_active['entry_price'])}
-</b>
-&nbsp;&nbsp; | &nbsp;&nbsp;
-DIRECTION:
-<b>
-{current_active['direction']}
-</b>
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-else:
-
-    if is_trade_signal(
-        direction
-    ):
-
-        st.markdown(
-            f"""
-<div class="card">
-
-<div class="card-title">
-SIGNAL READY
-</div>
-
-<div style="
-font-size:21px;
-font-weight:800;
-">
-{direction}
-</div>
-
-<div class="card-small">
-If opened now, maximum trade duration:
-<b>{horizon}</b>
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
+        entry = price
+        stop_loss = entry + sl_distance
+        target1 = entry - tp_distance
+        target2 = entry - (
+            sl_distance * 3.0
         )
-
-        if st.button(
-            "🚀 OPEN PAPER TRADE",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            new_trade = create_trade(
-                selected_symbol,
-                selected_mode,
-                signal,
-            )
-
-            if new_trade:
-
-                st.session_state.active_trades.append(
-                    new_trade
-                )
-
-                st.success(
-                    (
-                        f"{direction} paper trade opened. "
-                        f"Expiry: {horizon}."
-                    )
-                )
-
-                st.rerun()
 
     else:
 
-        st.info(
-            "No valid trade signal. "
-            "Waiting for confirmation."
+        entry = price
+        stop_loss = entry
+        target1 = entry
+        target2 = entry
+
+    # --------------------------------------------------------
+    # TICKER
+    # --------------------------------------------------------
+
+    change_24h = safe_float(
+        ticker.get(
+            "priceChangePercent",
+            0,
         )
+    )
+
+    volume_24h = safe_float(
+        ticker.get(
+            "quoteVolume",
+            0,
+        )
+    )
+
+    return {
+        "symbol": symbol,
+        "mode": mode,
+        "timestamp": iso_now(),
+
+        "direction": direction,
+        "score": score,
+        "confidence": confidence,
+
+        "price": price,
+
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target1": target1,
+        "target2": target2,
+
+        "atr": atr,
+
+        "obi5": obi5,
+        "obi10": obi10,
+        "obi20": obi20,
+        "obi50": obi50,
+        "weighted_obi": weighted_obi,
+        "multi_obi": multi_obi,
+
+        "bid20": bid20,
+        "ask20": ask20,
+        "bid50": bid50,
+        "ask50": ask50,
+
+        "spread": spread,
+
+        "taker_buy": flow["buy_volume"],
+        "taker_sell": flow["sell_volume"],
+        "taker_flow": flow["flow"],
+        "taker_flow_ratio": flow["ratio"],
+        "trade_count": flow["count"],
+
+        "trend_score": tech["trend_score"],
+        "momentum_5": tech["momentum_5"],
+        "momentum_20": tech["momentum_20"],
+
+        "ema20": tech["ema20"],
+        "ema50": tech["ema50"],
+        "ema200": tech["ema200"],
+
+        "volatility": tech["volatility"],
+
+        "htf_1h": htf.get("1h", 0.0),
+        "htf_4h": htf.get("4h", 0.0),
+        "htf_1d": htf.get("1d", 0.0),
+
+        "ml_available": ml is not None,
+        "ml_confidence": ml_confidence,
+
+        "change_24h": change_24h,
+        "volume_24h": volume_24h,
+    }
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def load_history():
+
+    if not HISTORY_FILE.exists():
+        return []
+
+    try:
+
+        df = pd.read_csv(
+            HISTORY_FILE
+        )
+
+        if df.empty:
+            return []
+
+        return df.tail(
+            300
+        ).to_dict(
+            "records"
+        )
+
+    except Exception:
+        return []
+
+
+def save_signal(signal):
+
+    if signal is None:
+        return
+
+    row = {
+        "timestamp": signal["timestamp"],
+        "symbol": signal["symbol"],
+        "mode": signal["mode"],
+        "direction": signal["direction"],
+        "score": signal["score"],
+        "confidence": signal["confidence"],
+        "entry": signal["entry"],
+        "stop_loss": signal["stop_loss"],
+        "target1": signal["target1"],
+        "target2": signal["target2"],
+        "obi20": signal["obi20"],
+        "obi50": signal["obi50"],
+        "taker_flow_ratio": signal[
+            "taker_flow_ratio"
+        ],
+    }
+
+    try:
+
+        exists = HISTORY_FILE.exists()
+
+        pd.DataFrame(
+            [row]
+        ).to_csv(
+            HISTORY_FILE,
+            mode="a",
+            header=not exists,
+            index=False,
+        )
+
+    except Exception:
+        pass
 
 
 # ============================================================
 # CHART
 # ============================================================
 
-if show_chart:
+def create_chart(
+    df,
+    signal,
+):
 
-    st.markdown(
-        '<div class="section-title">📈 PRICE ACTION</div>',
-        unsafe_allow_html=True,
-    )
+    fig = go.Figure()
 
-    chart = go.Figure()
-
-    chart.add_trace(
+    fig.add_trace(
         go.Candlestick(
             x=df["Time"],
             open=df["Open"],
@@ -2542,66 +1477,731 @@ if show_chart:
         )
     )
 
-    chart.add_hline(
-        y=signal["entry"],
-        line_dash="solid",
-        annotation_text="ENTRY",
-    )
+    ema20 = df["Close"].ewm(
+        span=20,
+        adjust=False,
+    ).mean()
 
-    if signal["stop_loss"] > 0:
+    ema50 = df["Close"].ewm(
+        span=50,
+        adjust=False,
+    ).mean()
 
-        chart.add_hline(
-            y=signal["stop_loss"],
-            line_dash="dot",
-            annotation_text="SL",
-        )
-
-    if signal["tp1"] > 0:
-
-        chart.add_hline(
-            y=signal["tp1"],
-            line_dash="dot",
-            annotation_text="TP1 1:2",
-        )
-
-    if signal["tp2"] > 0:
-
-        chart.add_hline(
-            y=signal["tp2"],
-            line_dash="dot",
-            annotation_text="TP2 1:3",
-        )
-
-    if signal["tri_line"] > 0:
-
-        chart.add_hline(
-            y=signal["tri_line"],
-            line_dash="dash",
-            annotation_text=(
-                f"TRI {signal['tri_timeframe']}"
+    fig.add_trace(
+        go.Scatter(
+            x=df["Time"],
+            y=ema20,
+            name="EMA 20",
+            line=dict(
+                width=1
             ),
         )
+    )
 
-    chart.update_layout(
-        height=570,
+    fig.add_trace(
+        go.Scatter(
+            x=df["Time"],
+            y=ema50,
+            name="EMA 50",
+            line=dict(
+                width=1
+            ),
+        )
+    )
+
+    if signal is not None:
+
+        entry = signal["entry"]
+        sl = signal["stop_loss"]
+        tp1 = signal["target1"]
+        tp2 = signal["target2"]
+
+        fig.add_hline(
+            y=entry,
+            annotation_text="ENTRY",
+            line_dash="solid",
+        )
+
+        if signal["direction"] != "WAIT":
+
+            fig.add_hline(
+                y=sl,
+                annotation_text="STOP LOSS",
+                line_dash="dot",
+            )
+
+            fig.add_hline(
+                y=tp1,
+                annotation_text="TARGET 1",
+                line_dash="dash",
+            )
+
+            fig.add_hline(
+                y=tp2,
+                annotation_text="TARGET 2",
+                line_dash="dash",
+            )
+
+    fig.update_layout(
+        height=520,
         template="plotly_dark",
-        paper_bgcolor="#07090d",
-        plot_bgcolor="#07090d",
         xaxis_rangeslider_visible=False,
         margin=dict(
             l=10,
             r=10,
-            t=20,
+            t=30,
             b=10,
         ),
         legend=dict(
-            orientation="h",
+            orientation="h"
         ),
     )
 
+    return fig
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown(
+        """
+        <div class="main-title">
+        ⚡ ZIA RESEARCH
+        </div>
+
+        <div class="sub-title">
+        Quantitative Market Research Terminal
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    selected_symbol = st.selectbox(
+        "MARKET",
+        COINS,
+        index=COINS.index(
+            st.session_state.selected_symbol
+        )
+        if st.session_state.selected_symbol
+        in COINS
+        else 0,
+    )
+
+    st.session_state.selected_symbol = (
+        selected_symbol
+    )
+
+    mode_key = st.selectbox(
+        "SIGNAL MODE",
+        list(TRADE_MODES.keys()),
+        format_func=lambda x:
+            TRADE_MODES[x]["label"],
+        index=list(
+            TRADE_MODES.keys()
+        ).index(
+            st.session_state.selected_mode
+        ),
+    )
+
+    st.session_state.selected_mode = (
+        mode_key
+    )
+
+    mode = TRADE_MODES[
+        mode_key
+    ]
+
+    st.divider()
+
+    st.markdown(
+        "### TRADE HORIZON"
+    )
+
+    st.info(
+        f"""
+Analysis: {mode["analysis_tf"].upper()}
+
+Trade horizon: {mode["max_holding"]}
+
+Reference: {", ".join(mode["reference"])}
+"""
+    )
+
+    st.session_state.auto_scan = st.toggle(
+        "AUTO SIGNAL SCAN",
+        value=st.session_state.auto_scan,
+    )
+
+    st.session_state.show_chart = st.toggle(
+        "SHOW PRICE CHART",
+        value=st.session_state.show_chart,
+    )
+
+    st.divider()
+
+    st.caption(
+        "Data: Binance USDⓈ-M Futures"
+    )
+
+    st.caption(
+        "Execution: research only"
+    )
+
+
+# ============================================================
+# AUTO REFRESH
+# ============================================================
+
+if st.session_state.auto_scan:
+
+    st_autorefresh(
+        interval=5000,
+        key="zia_research_refresh",
+    )
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    """
+    <div class="main-title">
+    ⚡ ZIA RESEARCH LAB
+    </div>
+
+    <div class="sub-title">
+    Binance USDⓈ-M Futures • Microstructure • OBI • Taker Flow • ML • Quant Trend
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.write("")
+
+
+# ============================================================
+# FETCH MAIN DATA
+# ============================================================
+
+symbol = st.session_state.selected_symbol
+
+mode_key = st.session_state.selected_mode
+
+mode = TRADE_MODES[
+    mode_key
+]
+
+interval = mode[
+    "analysis_tf"
+]
+
+df = fetch_klines(
+    symbol,
+    interval,
+    250,
+)
+
+bids, asks = fetch_orderbook(
+    symbol,
+    100,
+)
+
+
+# ============================================================
+# DATA VALIDATION
+# ============================================================
+
+if df.empty or len(df) < 20:
+
+    st.error(
+        "Market data unavailable."
+    )
+
+    st.info(
+        f"""
+        Binance Futures data could not be loaded for {symbol}.
+
+        API:
+        {BINANCE_BASE}
+
+        Try refreshing the page.
+        """
+    )
+
+    st.stop()
+
+
+if len(bids) < 20 or len(asks) < 20:
+
+    st.warning(
+        "Order book depth is temporarily unavailable. "
+        "Retrying automatically..."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# GENERATE SIGNAL
+# ============================================================
+
+signal = generate_signal(
+    df=df,
+    bids=bids,
+    asks=asks,
+    symbol=symbol,
+    mode=mode_key,
+)
+
+if signal is None:
+
+    st.error(
+        "Signal engine could not calculate data."
+    )
+
+    st.stop()
+
+
+st.session_state.last_signal = signal
+
+
+# ============================================================
+# SAVE SIGNAL OCCASIONALLY
+# ============================================================
+
+current_minute = now_utc().strftime(
+    "%Y-%m-%d %H:%M"
+)
+
+if (
+    st.session_state.get(
+        "last_saved_minute"
+    )
+    != current_minute
+):
+
+    save_signal(
+        signal
+    )
+
+    st.session_state.last_saved_minute = (
+        current_minute
+    )
+
+
+# ============================================================
+# TOP STATUS
+# ============================================================
+
+ticker = fetch_ticker(
+    symbol
+)
+
+price = signal["price"]
+
+change = signal[
+    "change_24h"
+]
+
+direction = signal[
+    "direction"
+]
+
+confidence = signal[
+    "confidence"
+]
+
+score = signal[
+    "score"
+]
+
+card_class = direction_class(
+    direction
+)
+
+
+# ============================================================
+# MAIN SIGNAL CARD
+# ============================================================
+
+st.markdown(
+    f"""
+    <div class="signal-card {card_class}">
+
+        <div class="signal-title">
+        FINAL RESEARCH SIGNAL • {symbol} • {mode["label"]}
+        </div>
+
+        <div class="signal-value">
+        {direction}
+        </div>
+
+        <div style="margin-top:10px;color:#9aa6b7;">
+        Quant Score: {score:+.3f}
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        Confidence: {confidence:.1f}%
+        </div>
+
+        <div style="margin-top:12px;">
+        <span class="price-value">
+        ${fmt_price(price)}
+        </span>
+
+        &nbsp;&nbsp;
+
+        <span style="color:#8d99aa;">
+        24H {change:+.2f}%
+        </span>
+        </div>
+
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# KEY METRICS
+# ============================================================
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+with c1:
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">
+        Confidence
+        </div>
+        <div class="metric-value">
+        {confidence:.1f}%
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with c2:
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">
+        OBI 20
+        </div>
+        <div class="metric-value">
+        {signal["obi20"]:+.4f}
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with c3:
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">
+        OBI 50
+        </div>
+        <div class="metric-value">
+        {signal["obi50"]:+.4f}
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with c4:
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">
+        Taker Flow
+        </div>
+        <div class="metric-value">
+        {signal["taker_flow_ratio"]:+.4f}
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with c5:
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">
+        ATR
+        </div>
+        <div class="metric-value">
+        {fmt_price(signal["atr"])}
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# ENTRY / SL / TP
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">TRADE PLAN</div>',
+    unsafe_allow_html=True,
+)
+
+p1, p2, p3, p4 = st.columns(4)
+
+with p1:
+    st.metric(
+        "ENTRY",
+        fmt_price(
+            signal["entry"]
+        ),
+    )
+
+with p2:
+    st.metric(
+        "STOP LOSS",
+        (
+            fmt_price(
+                signal["stop_loss"]
+            )
+            if direction != "WAIT"
+            else "WAIT"
+        ),
+    )
+
+with p3:
+    st.metric(
+        "TARGET 1 • 1:2",
+        (
+            fmt_price(
+                signal["target1"]
+            )
+            if direction != "WAIT"
+            else "WAIT"
+        ),
+    )
+
+with p4:
+    st.metric(
+        "TARGET 2 • 1:3",
+        (
+            fmt_price(
+                signal["target2"]
+            )
+            if direction != "WAIT"
+            else "WAIT"
+        ),
+    )
+
+
+# ============================================================
+# MICROSTRUCTURE
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">MICROSTRUCTURE</div>',
+    unsafe_allow_html=True,
+)
+
+m1, m2, m3, m4 = st.columns(4)
+
+with m1:
+    st.metric(
+        "OBI 5",
+        f'{signal["obi5"]:+.4f}',
+    )
+
+with m2:
+    st.metric(
+        "OBI 10",
+        f'{signal["obi10"]:+.4f}',
+    )
+
+with m3:
+    st.metric(
+        "OBI 20",
+        f'{signal["obi20"]:+.4f}',
+    )
+
+with m4:
+    st.metric(
+        "OBI 50",
+        f'{signal["obi50"]:+.4f}',
+    )
+
+
+f1, f2, f3, f4 = st.columns(4)
+
+with f1:
+    st.metric(
+        "Taker Buy",
+        f'{signal["taker_buy"]:.3f}',
+    )
+
+with f2:
+    st.metric(
+        "Taker Sell",
+        f'{signal["taker_sell"]:.3f}',
+    )
+
+with f3:
+    st.metric(
+        "Flow Ratio",
+        f'{signal["taker_flow_ratio"]:+.4f}',
+    )
+
+with f4:
+    st.metric(
+        "Trades",
+        f'{signal["trade_count"]:,}',
+    )
+
+
+# ============================================================
+# TREND / ML
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">QUANT + ML</div>',
+    unsafe_allow_html=True,
+)
+
+q1, q2, q3, q4, q5 = st.columns(5)
+
+with q1:
+    st.metric(
+        "Trend Score",
+        f'{signal["trend_score"]:+.3f}',
+    )
+
+with q2:
+    st.metric(
+        "EMA 20",
+        fmt_price(
+            signal["ema20"]
+        ),
+    )
+
+with q3:
+    st.metric(
+        "EMA 50",
+        fmt_price(
+            signal["ema50"]
+        ),
+    )
+
+with q4:
+    st.metric(
+        "EMA 200",
+        fmt_price(
+            signal["ema200"]
+        ),
+    )
+
+with q5:
+
+    ml_text = (
+        f'{signal["ml_confidence"] * 100:.1f}%'
+        if signal["ml_available"]
+        else "OFF"
+    )
+
+    st.metric(
+        "XGBoost",
+        ml_text,
+    )
+
+
+# ============================================================
+# HIGHER TIMEFRAME
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">HIGHER TIMEFRAME CONFIRMATION</div>',
+    unsafe_allow_html=True,
+)
+
+h1, h2, h3 = st.columns(3)
+
+def bias_text(value):
+
+    value = safe_float(value)
+
+    if value > 0.25:
+        return "BULLISH"
+
+    if value < -0.25:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+with h1:
+    st.metric(
+        "1H",
+        bias_text(
+            signal["htf_1h"]
+        ),
+        delta=f'{signal["htf_1h"]:+.2f}',
+    )
+
+with h2:
+    st.metric(
+        "4H",
+        bias_text(
+            signal["htf_4h"]
+        ),
+        delta=f'{signal["htf_4h"]:+.2f}',
+    )
+
+with h3:
+    st.metric(
+        "1D",
+        bias_text(
+            signal["htf_1d"]
+        ),
+        delta=f'{signal["htf_1d"]:+.2f}',
+    )
+
+
+# ============================================================
+# CHART
+# ============================================================
+
+if st.session_state.show_chart:
+
+    st.markdown(
+        '<div class="section-title">PRICE ACTION</div>',
+        unsafe_allow_html=True,
+    )
+
+    fig = create_chart(
+        df.tail(150),
+        signal,
+    )
+
     st.plotly_chart(
-        chart,
+        fig,
         use_container_width=True,
+        config={
+            "displaylogo": False,
+            "responsive": True,
+        },
     )
 
 
@@ -2609,473 +2209,149 @@ if show_chart:
 # ORDER BOOK
 # ============================================================
 
-if show_orderbook:
+with st.expander(
+    "ORDER BOOK DEPTH",
+    expanded=False,
+):
 
-    st.markdown(
-        '<div class="section-title">📚 ORDER BOOK IMBALANCE</div>',
-        unsafe_allow_html=True,
-    )
+    ob_left, ob_right = st.columns(2)
 
-    ob1, ob2 = st.columns(2)
-
-    with ob1:
-
-        bid_total = (
-            float(
-                np.sum(
-                    bids[:20, 1]
-                )
-            )
-            if len(bids) >= 20
-            else 0
-        )
-
-        ask_total = (
-            float(
-                np.sum(
-                    asks[:20, 1]
-                )
-            )
-            if len(asks) >= 20
-            else 0
-        )
+    with ob_left:
 
         st.markdown(
-            f"""
-<div class="card">
-
-<div class="card-title">
-TOP 20 DEPTH
-</div>
-
-<div style="
-font-size:24px;
-font-weight:800;
-">
-BIDS {bid_total:.2f}
-</div>
-
-<div style="
-font-size:24px;
-font-weight:800;
-">
-ASKS {ask_total:.2f}
-</div>
-
-<div class="card-small">
-OBI: {calculate_obi(bids, asks, 20):+.4f}
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
+            "### BIDS"
         )
 
-    with ob2:
-
-        bid_total50 = (
-            float(
-                np.sum(
-                    bids[:50, 1]
-                )
-            )
-            if len(bids) >= 50
-            else 0
+        bid_df = pd.DataFrame(
+            bids[:20],
+            columns=[
+                "Price",
+                "Quantity",
+            ],
         )
 
-        ask_total50 = (
-            float(
-                np.sum(
-                    asks[:50, 1]
-                )
-            )
-            if len(asks) >= 50
-            else 0
+        bid_df["Price"] = bid_df[
+            "Price"
+        ].map(fmt_price)
+
+        st.dataframe(
+            bid_df,
+            use_container_width=True,
+            hide_index=True,
         )
+
+    with ob_right:
 
         st.markdown(
-            f"""
-<div class="card">
+            "### ASKS"
+        )
 
-<div class="card-title">
-TOP 50 DEPTH
-</div>
+        ask_df = pd.DataFrame(
+            asks[:20],
+            columns=[
+                "Price",
+                "Quantity",
+            ],
+        )
 
-<div style="
-font-size:24px;
-font-weight:800;
-">
-BIDS {bid_total50:.2f}
-</div>
+        ask_df["Price"] = ask_df[
+            "Price"
+        ].map(fmt_price)
 
-<div style="
-font-size:24px;
-font-weight:800;
-">
-ASKS {ask_total50:.2f}
-</div>
-
-<div class="card-small">
-OBI: {calculate_obi(bids, asks, 50):+.4f}
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
+        st.dataframe(
+            ask_df,
+            use_container_width=True,
+            hide_index=True,
         )
 
 
 # ============================================================
-# RESEARCH FEATURES
-# ============================================================
-
-if show_features:
-
-    features = signal.get(
-        "features",
-        {},
-    )
-
-    if isinstance(
-        features,
-        dict,
-    ) and features:
-
-        st.markdown(
-            '<div class="section-title">🔬 RESEARCH FEATURES</div>',
-            unsafe_allow_html=True,
-        )
-
-        feature_df = pd.DataFrame(
-            [
-                {
-                    "FEATURE": key,
-                    "VALUE": safe_float(
-                        value
-                    ),
-                }
-                for key, value
-                in features.items()
-            ]
-        )
-
-        if not feature_df.empty:
-
-            st.dataframe(
-                feature_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-# ============================================================
-# ACTIVE TRADES
+# SIGNAL HISTORY
 # ============================================================
 
 st.markdown(
-    '<div class="section-title">🔥 ACTIVE TRADES</div>',
+    '<div class="section-title">RECENT SIGNALS</div>',
     unsafe_allow_html=True,
 )
 
-if st.session_state.active_trades:
-
-    active_rows = []
-
-    for trade in st.session_state.active_trades:
-
-        active_rows.append(
-            {
-                "Symbol":
-                    trade["symbol"],
-
-                "Mode":
-                    trade["mode"],
-
-                "Direction":
-                    trade["direction"],
-
-                "Entry":
-                    fmt_price(
-                        trade[
-                            "entry_price"
-                        ]
-                    ),
-
-                "SL":
-                    fmt_price(
-                        trade[
-                            "stop_loss"
-                        ]
-                    ),
-
-                "TP1":
-                    fmt_price(
-                        trade[
-                            "tp1"
-                        ]
-                    ),
-
-                "TP2":
-                    fmt_price(
-                        trade[
-                            "tp2"
-                        ]
-                    ),
-
-                "Horizon":
-                    trade[
-                        "duration_text"
-                    ],
-
-                "Remaining":
-                    format_remaining(
-                        seconds_remaining(
-                            trade[
-                                "expiry_time"
-                            ]
-                        )
-                    ),
-
-                "Status":
-                    trade["status"],
-            }
-        )
-
-    st.dataframe(
-        pd.DataFrame(
-            active_rows
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-else:
-
-    st.info(
-        "No active paper trades."
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📊 TRADE HISTORY</div>',
-    unsafe_allow_html=True,
-)
-
-history = st.session_state.trade_history
+history = load_history()
 
 if history:
 
-    hist_df = pd.DataFrame(
+    history_df = pd.DataFrame(
         history
     )
 
-    total = len(
-        hist_df
-    )
+    if not history_df.empty:
 
-    wins = len(
-        hist_df[
-            hist_df[
-                "outcome"
-            ].astype(str).str.upper()
-            == "WIN"
+        cols = [
+            "timestamp",
+            "symbol",
+            "mode",
+            "direction",
+            "score",
+            "confidence",
+            "entry",
+            "stop_loss",
+            "target1",
+            "target2",
         ]
-    )
 
-    losses = len(
-        hist_df[
-            hist_df[
-                "outcome"
-            ].astype(str).str.upper()
-            == "LOSS"
+        cols = [
+            c for c in cols
+            if c in history_df.columns
         ]
-    )
 
-    win_rate = (
-        wins
-        / max(
-            1,
-            wins + losses,
+        display_df = history_df[
+            cols
+        ].tail(20).copy()
+
+        if "score" in display_df:
+            display_df["score"] = (
+                display_df["score"]
+                .astype(float)
+                .round(3)
+            )
+
+        if "confidence" in display_df:
+            display_df["confidence"] = (
+                display_df["confidence"]
+                .astype(float)
+                .round(1)
+            )
+
+        st.dataframe(
+            display_df.iloc[::-1],
+            use_container_width=True,
+            hide_index=True,
         )
-    ) * 100
-
-    pnl = (
-        pd.to_numeric(
-            hist_df.get(
-                "pnl_percent",
-                pd.Series(
-                    [0] * total
-                ),
-            ),
-            errors="coerce",
-        )
-        .fillna(0)
-        .sum()
-    )
-
-    h1, h2, h3, h4 = st.columns(4)
-
-    with h1:
-        st.metric(
-            "TOTAL TRADES",
-            total,
-        )
-
-    with h2:
-        st.metric(
-            "WINS",
-            wins,
-        )
-
-    with h3:
-        st.metric(
-            "WIN RATE",
-            f"{win_rate:.1f}%",
-        )
-
-    with h4:
-        st.metric(
-            "TOTAL PNL",
-            f"{pnl:+.2f}%",
-        )
-
-    display_cols = [
-        "timestamp",
-        "symbol",
-        "mode",
-        "direction",
-        "entry_price",
-        "stop_loss",
-        "tp1",
-        "tp2",
-        "confidence",
-        "outcome",
-        "pnl_percent",
-        "close_reason",
-    ]
-
-    available = [
-        col
-        for col in display_cols
-        if col in hist_df.columns
-    ]
-
-    display_df = hist_df[
-        available
-    ].copy()
-
-    rename = {
-        "timestamp": "TIME",
-        "symbol": "SYMBOL",
-        "mode": "MODE",
-        "direction": "DIRECTION",
-        "entry_price": "ENTRY",
-        "stop_loss": "SL",
-        "tp1": "TP1",
-        "tp2": "TP2",
-        "confidence": "CONFIDENCE",
-        "outcome": "OUTCOME",
-        "pnl_percent": "PNL %",
-        "close_reason": "REASON",
-    }
-
-    display_df = display_df.rename(
-        columns=rename
-    )
-
-    st.dataframe(
-        display_df.head(100),
-        use_container_width=True,
-        hide_index=True,
-    )
 
 else:
 
     st.info(
-        "No closed trades yet."
+        "No signal history yet."
     )
 
 
 # ============================================================
-# CLEAR HISTORY
+# FOOTER STATUS
 # ============================================================
 
-with st.expander(
-    "⚙️ HISTORY MANAGEMENT"
-):
+st.divider()
 
-    col_a, col_b = st.columns(2)
+status1, status2, status3 = st.columns(3)
 
-    with col_a:
+with status1:
+    st.caption(
+        f"Market: Binance USDⓈ-M Futures • {symbol}"
+    )
 
-        if st.button(
-            "DELETE HISTORY",
-            use_container_width=True,
-        ):
+with status2:
+    st.caption(
+        f"Analysis: {interval.upper()}"
+    )
 
-            st.session_state.trade_history = []
-
-            try:
-
-                if HISTORY_FILE.exists():
-                    HISTORY_FILE.unlink()
-
-            except Exception:
-                pass
-
-            st.success(
-                "Trade history deleted."
-            )
-
-            st.rerun()
-
-    with col_b:
-
-        if history:
-
-            csv_data = pd.DataFrame(
-                history
-            ).to_csv(
-                index=False
-            )
-
-            st.download_button(
-                "DOWNLOAD CSV",
-                csv_data,
-                file_name=(
-                    "zia_research_trade_history.csv"
-                ),
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    """
-<div style="
-text-align:center;
-color:#596675;
-font-size:11px;
-padding:15px;
-">
-ZIA RESEARCH LAB • QUANTITATIVE PAPER SIGNAL TERMINAL
-<br>
-Signal horizons are configured as:
-30M SCALPING → 15 MIN |
-15M → 90 MIN |
-1H → 24 HOURS |
-4H → 24 HOURS MAX
-</div>
-""",
-    unsafe_allow_html=True,
-)
+with status3:
+    st.caption(
+        f"Last update: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
