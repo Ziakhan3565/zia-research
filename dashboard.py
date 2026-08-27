@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,396 +11,252 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-# ============================================================
-# ZIA RESEARCH TERMINAL
-# Single-file dashboard entry point.
-# Market -> Order Book -> Research features -> XGBoost -> UI
-# Existing project files are read when available; the dashboard
-# never places orders.
-# ============================================================
-
-st.set_page_config(
-    page_title="ZIA Research Terminal",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="ZIA Research Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 
 ROOT = Path(__file__).resolve().parent
-FUTURES = "https://fapi.binance.com"
-SPOT = "https://api.binance.com"
-
 MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
-MODEL_META = ROOT / "ml_model_metadata.json"
-RESEARCH_MODEL = ROOT / "research_lab_ml.pkl"
-RESEARCH_SCALER = ROOT / "research_lab_scaler.pkl"
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
-    "TRXUSDT", "LTCUSDT", "BCHUSDT", "DOTUSDT", "XLMUSDT",
-    "NEARUSDT", "UNIUSDT", "APTUSDT", "TAOUSDT", "XMRUSDT",
+# Public Binance endpoints. We try several hosts because a single Binance host can
+# be blocked/rate-limited from a cloud region.
+FUTURES_HOSTS = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
 ]
+SPOT_HOSTS = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
+DATA_HOST = "https://data-api.binance.vision"
 
-TIMEFRAMES = {
-    "5M": "5m", "15M": "15m", "30M": "30m", "1H": "1h",
-    "4H": "4h", "1D": "1d", "1W": "1w",
-}
+TIMEFRAMES = {"5M":"5m", "15M":"15m", "30M":"30m", "1H":"1h", "4H":"4h", "1D":"1d", "1W":"1w"}
+SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","SUIUSDT","TRXUSDT","LTCUSDT","BCHUSDT","DOTUSDT","XLMUSDT"]
 
-# Known feature layouts from the project's ML work.
-FEATURES_25 = [
-    "top20_bid_sum", "top20_ask_sum", "obi_5", "obi_10", "obi_20", "obi_50",
-    "spread", "spread_pct", "bid_ask_ratio_20", "bid_ask_ratio_50",
-    "top20_total_depth", "top50_total_depth", "taker_buy_volume", "taker_sell_volume",
-    "taker_flow", "taker_flow_ratio", "price_return", "price_change", "sma_distance",
-    "realized_volatility", "BOOK_IMB", "QUANT_IMPLY", "ADAPT_CONF", "BAYESIAN",
-    "FOURIER_TREND",
-]
-FEATURES_7 = [
-    "top20_bid_sum", "top20_ask_sum", "obi_top20", "spread",
-    "bid_ask_ratio", "total_depth", "trend_signal",
-]
+F25 = ["top20_bid_sum","top20_ask_sum","obi_5","obi_10","obi_20","obi_50","spread","spread_pct","bid_ask_ratio_20","bid_ask_ratio_50","top20_total_depth","top50_total_depth","taker_buy_volume","taker_sell_volume","taker_flow","taker_flow_ratio","price_return","price_change","sma_distance","realized_volatility","BOOK_IMB","QUANT_IMPLY","ADAPT_CONF","BAYESIAN","FOURIER_TREND"]
+F7 = ["top20_bid_sum","top20_ask_sum","obi_top20","spread","bid_ask_ratio","total_depth","trend_signal"]
 
 st.markdown("""
 <style>
-:root{color-scheme:dark}
-html,body,[data-testid="stAppViewContainer"]{background:#070b12;color:#e8eef8}
-.block-container{max-width:1900px;padding:10px clamp(7px,1.5vw,28px) 60px}
-[data-testid="stHeader"]{background:transparent}
-[data-testid="stSidebar"]{background:#090e16;border-right:1px solid #1d2a3b}
-.hero{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1c2939;padding:5px 2px 11px;margin-bottom:10px}
-.brand{font-weight:950;font-size:clamp(20px,2.4vw,32px);letter-spacing:-1px}.brand span{color:#7f8cff}
-.muted{font-size:9px;color:#748298;letter-spacing:1px}
-.live{font-size:10px;font-weight:900;color:#6fe0a3;border:1px solid #22583e;background:#0a1711;border-radius:999px;padding:7px 10px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#48db8e;box-shadow:0 0 9px #48db8e;margin-right:6px}
-.card{background:linear-gradient(145deg,#101824,#0b1119);border:1px solid #202d3e;border-radius:13px;padding:11px;min-height:77px}.label{font-size:9px;color:#75859a;font-weight:900;letter-spacing:1px}.value{font-size:19px;font-weight:950;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sub{font-size:10px;color:#8290a4;margin-top:3px}
-.signal{border:1px solid #26364a;border-radius:15px;padding:15px;background:linear-gradient(135deg,#111b2a,#0a1018)}.signal.long{border-color:#267c59}.signal.short{border-color:#9b4052}.signal.wait{border-color:#46526a}.sig{font-size:34px;font-weight:950}.score{font-size:11px;color:#8998ad}
-.panel{background:#0b1119;border:1px solid #1d2939;border-radius:14px;padding:8px}.section{font-size:14px;font-weight:950;margin:13px 0 7px}.small{font-size:10px;color:#718096}
-[data-testid="stMetric"]{background:#0c131d;border:1px solid #202d3d;border-radius:12px;padding:8px}
-@media(max-width:700px){.block-container{padding:6px 7px 45px}.brand{font-size:20px}.muted{font-size:7px}.card{padding:8px;min-height:67px}.value{font-size:15px}.sub{font-size:9px}.sig{font-size:27px}.section{margin-top:9px}.live{padding:5px 7px}}
+html,body,[data-testid=stAppViewContainer]{background:#070b12;color:#e9eef7}
+.block-container{max-width:1900px;padding:10px clamp(7px,1.5vw,26px) 45px}
+[data-testid=stHeader]{background:transparent}
+.hero{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1c2938;padding:4px 2px 10px;margin-bottom:10px}
+.brand{font-size:clamp(20px,2.3vw,31px);font-weight:950;letter-spacing:-1px}.brand span{color:#8490ff}.live{border:1px solid #225a40;background:#0a1711;color:#6fe2a5;border-radius:999px;padding:6px 10px;font-size:10px;font-weight:900}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#48dc8f;box-shadow:0 0 9px #48dc8f;margin-right:6px}
+.card{background:linear-gradient(145deg,#101824,#0b1119);border:1px solid #202d3e;border-radius:13px;padding:10px;min-height:72px}.label{font-size:9px;color:#77879d;font-weight:900;letter-spacing:1px}.value{font-size:18px;font-weight:950;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sub{font-size:10px;color:#8491a5;margin-top:3px}.panel{background:#0b1119;border:1px solid #1d2939;border-radius:14px;padding:8px}.section{font-size:14px;font-weight:950;margin:12px 0 7px}.sig{font-size:32px;font-weight:950}.small{font-size:10px;color:#748399}
+@media(max-width:700px){.block-container{padding:6px 7px 40px}.brand{font-size:20px}.live{font-size:8px;padding:5px 7px}.card{min-height:62px;padding:8px}.value{font-size:15px}.sub{font-size:9px}.sig{font-size:27px}}
 </style>
 """, unsafe_allow_html=True)
 
 
-def n(x: Any, default: float = 0.0) -> float:
+def num(x: Any, default=0.0):
     try:
-        v = float(x)
+        v=float(x)
         return v if np.isfinite(v) else default
     except Exception:
         return default
 
 
-def price_text(x: Any) -> str:
-    x = n(x)
-    if x >= 1000:
-        return f"{x:,.2f}"
-    if x >= 1:
-        return f"{x:,.4f}"
+def fmt_price(x):
+    x=num(x)
+    if x >= 1000: return f"{x:,.2f}"
+    if x >= 1: return f"{x:,.4f}"
     return f"{x:,.7f}" if x else "—"
 
 
+def request_json(hosts, path, params):
+    last_error=""
+    for host in hosts:
+        try:
+            r=requests.get(host+path, params=params, timeout=5, headers={"User-Agent":"ZIA-Research/5.0"})
+            if r.ok:
+                return r.json(), host, "OK"
+            last_error=f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last_error=type(e).__name__
+    return None, None, last_error
+
+
 @st.cache_data(ttl=2, show_spinner=False)
-def http_json(base: str, endpoint: str, params: dict) -> Any:
-    try:
-        r = requests.get(
-            base + endpoint,
-            params=params,
-            timeout=6,
-            headers={"User-Agent": "ZIA-Research-Terminal/4.0"},
-        )
-        if r.ok:
-            return r.json()
-    except Exception:
-        pass
-    return None
-
-
-@st.cache_data(ttl=3, show_spinner=False)
-def candles(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    raw = http_json(FUTURES, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1500)})
-    source = "Futures"
-    if not isinstance(raw, list):
-        raw = http_json(SPOT, "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)})
-        source = "Spot"
-    rows = []
+def get_candles(symbol, interval, limit=500):
+    raw,host,status=request_json(FUTURES_HOSTS,"/fapi/v1/klines",{"symbol":symbol,"interval":interval,"limit":min(limit,1500)})
+    source="Futures"
+    if not isinstance(raw,list):
+        raw,host,status=request_json(SPOT_HOSTS,"/api/v3/klines",{"symbol":symbol,"interval":interval,"limit":min(limit,1000)})
+        source="Spot"
+    if not isinstance(raw,list):
+        raw,host,status=request_json([DATA_HOST],"/api/v3/klines",{"symbol":symbol,"interval":interval,"limit":min(limit,1000)})
+        source="Data API"
+    rows=[]
     for c in raw or []:
         try:
-            rows.append([
-                pd.to_datetime(int(c[0]), unit="ms", utc=True),
-                n(c[1]), n(c[2]), n(c[3]), n(c[4]), n(c[5]), n(c[9]),
-            ])
-        except Exception:
-            continue
-    df = pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume", "TakerBuy"])
-    df.attrs["source"] = source
-    return df
+            rows.append([pd.to_datetime(int(c[0]),unit="ms",utc=True),num(c[1]),num(c[2]),num(c[3]),num(c[4]),num(c[5]),num(c[9])])
+        except Exception: pass
+    df=pd.DataFrame(rows,columns=["Time","Open","High","Low","Close","Volume","TakerBuy"])
+    return df,source,status,host
 
 
 @st.cache_data(ttl=2, show_spinner=False)
-def order_book(symbol: str):
-    raw = http_json(FUTURES, "/fapi/v1/depth", {"symbol": symbol, "limit": 100})
-    source = "Futures"
-    if not isinstance(raw, dict):
-        raw = http_json(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 100})
-        source = "Spot"
+def get_order_book(symbol):
+    # Futures first, then several Binance mirrors, then Binance public data API.
+    raw,host,status=request_json(FUTURES_HOSTS,"/fapi/v1/depth",{"symbol":symbol,"limit":100})
+    source="Futures"
+    if not isinstance(raw,dict) or not raw.get("bids") or not raw.get("asks"):
+        raw,host,status=request_json(SPOT_HOSTS,"/api/v3/depth",{"symbol":symbol,"limit":100})
+        source="Spot"
+    if not isinstance(raw,dict) or not raw.get("bids") or not raw.get("asks"):
+        raw,host,status=request_json([DATA_HOST],"/api/v3/depth",{"symbol":symbol,"limit":100})
+        source="Data API"
     try:
-        return np.asarray(raw.get("bids", []), dtype=float), np.asarray(raw.get("asks", []), dtype=float), source
+        bids=np.asarray(raw.get("bids",[]),dtype=float)
+        asks=np.asarray(raw.get("asks",[]),dtype=float)
+        if bids.ndim!=2 or asks.ndim!=2 or len(bids)==0 or len(asks)==0: raise ValueError("empty book")
+        return bids,asks,source,"OK",host
     except Exception:
-        return np.empty((0, 2)), np.empty((0, 2)), source
+        return np.empty((0,2)),np.empty((0,2)),source,status,host
 
 
-def obi(bids, asks, k: int):
-    if len(bids) == 0 or len(asks) == 0:
-        return 0.0, 0.0, 0.0
-    k = min(k, len(bids), len(asks))
-    b = float(bids[:k, 1].sum()); a = float(asks[:k, 1].sum())
-    return ((b - a) / (b + a) if b + a else 0.0), b, a
+def ob(bids,asks,k):
+    if len(bids)==0 or len(asks)==0:return 0.0,0.0,0.0
+    k=min(k,len(bids),len(asks)); b=float(bids[:k,1].sum()); a=float(asks[:k,1].sum())
+    return ((b-a)/(b+a) if b+a else 0),b,a
 
 
-def make_features(df: pd.DataFrame, bids, asks) -> dict[str, float]:
-    f = {x: 0.0 for x in FEATURES_25}
-    o5,b5,a5 = obi(bids, asks, 5); o10,b10,a10 = obi(bids, asks, 10)
-    o20,b20,a20 = obi(bids, asks, 20); o50,b50,a50 = obi(bids, asks, 50)
-    f.update({
-        "top20_bid_sum": b20, "top20_ask_sum": a20, "obi_5": o5, "obi_10": o10,
-        "obi_20": o20, "obi_50": o50, "top20_total_depth": b20+a20,
-        "top50_total_depth": b50+a50,
-    })
-    if df.empty:
-        return f
-    close = df["Close"]
-    last = n(close.iloc[-1]); prev = n(close.iloc[-2] if len(close)>1 else last)
-    sma = n(close.rolling(20).mean().iloc[-1], last)
-    rv = n(close.pct_change().rolling(20).std())
-    buy = n(df["TakerBuy"].tail(20).mean())
-    vol = n(df["Volume"].tail(20).mean())
-    sell = max(vol-buy, 0.0); flow = buy-sell
-    spread = n(asks[0,0]-bids[0,0]) if len(asks) and len(bids) else 0.0
-    trend = np.tanh((last/sma-1)*100) if sma else 0.0
-    fourier = np.tanh(close.pct_change().tail(16).mean()*1000) if len(close)>5 else trend
-    f.update({
-        "spread": spread, "spread_pct": spread/last if last else 0.0,
-        "bid_ask_ratio_20": b20/a20 if a20 else 1.0, "bid_ask_ratio_50": b50/a50 if a50 else 1.0,
-        "taker_buy_volume": buy, "taker_sell_volume": sell, "taker_flow": flow,
-        "taker_flow_ratio": flow/(buy+sell) if buy+sell else 0.0,
-        "price_return": last/prev-1 if prev else 0.0, "price_change": last-prev,
-        "sma_distance": last/sma-1 if sma else 0.0, "realized_volatility": rv,
-        "BOOK_IMB": o20, "QUANT_IMPLY": float(np.tanh((o20+o50+trend)/3)),
-        "ADAPT_CONF": float(np.clip(.5+(abs(o20)+abs(trend))/2,0,1)),
-        "BAYESIAN": float(np.clip(.5+(o20+trend)/4,0,1)), "FOURIER_TREND": fourier,
-    })
+def features(df,bids,asks):
+    f={x:0.0 for x in F25}
+    o5,b5,a5=ob(bids,asks,5);o10,b10,a10=ob(bids,asks,10);o20,b20,a20=ob(bids,asks,20);o50,b50,a50=ob(bids,asks,50)
+    f.update(top20_bid_sum=b20,top20_ask_sum=a20,obi_5=o5,obi_10=o10,obi_20=o20,obi_50=o50,top20_total_depth=b20+a20,top50_total_depth=b50+a50)
+    if df.empty:return f
+    close=df.Close; last=num(close.iloc[-1]); prev=num(close.iloc[-2] if len(close)>1 else last); sma=num(close.rolling(20).mean().iloc[-1],last)
+    spread=num(asks[0,0]-bids[0,0]) if len(asks) and len(bids) else 0
+    buy=num(df.TakerBuy.tail(20).sum()); total=num(df.Volume.tail(20).sum()); sell=max(total-buy,0); flow=buy-sell
+    ret=last/prev-1 if prev else 0; rv=num(close.pct_change().tail(30).std()); trend=last/sma-1 if sma else 0
+    f.update(spread=spread,spread_pct=spread/last if last else 0,bid_ask_ratio_20=b20/a20 if a20 else 1,bid_ask_ratio_50=b50/a50 if a50 else 1,taker_buy_volume=buy,taker_sell_volume=sell,taker_flow=flow,taker_flow_ratio=flow/total if total else 0,price_return=ret,price_change=last-prev,sma_distance=trend,realized_volatility=rv,BOOK_IMB=o20,QUANT_IMPLY=float(np.tanh((o20+o50+np.tanh(trend*100))/3)),ADAPT_CONF=float(np.clip(.5+(abs(o20)+abs(np.tanh(trend*100)))/2,0,1)),BAYESIAN=float(np.clip(.5+(o20+np.tanh(trend*100))/4,0,1)),FOURIER_TREND=float(np.tanh(close.pct_change().tail(16).mean()*1000)))
     return f
 
 
 @st.cache_resource(show_spinner=False)
-def load_xgb():
+def load_model():
+    try:return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
+    except Exception:return None
+
+
+def ml_predict(f):
+    model=load_model()
+    if model is None:return None,None,"MODEL FILE NOT FOUND"
     try:
-        return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
-    except Exception:
-        return None
+        names=[]
+        if hasattr(model,"get_booster"):
+            names=list(model.get_booster().feature_names or [])
+        count=int(getattr(model,"n_features_in_",len(names) or 25))
+        cols=names if names and all(x in f or x in ("obi_top20","bid_ask_ratio","total_depth","trend_signal") for x in names) else (F7 if count==7 else F25)
+        row=dict(f,obi_top20=f["obi_20"],bid_ask_ratio=f["bid_ask_ratio_20"],total_depth=f["top20_total_depth"],trend_signal=f["sma_distance"])
+        x=pd.DataFrame([[row.get(c,0.0) for c in cols]],columns=cols)
+        pred=int(model.predict(x)[0]); prob=None
+        if hasattr(model,"predict_proba"):
+            p=model.predict_proba(x)[0]; prob=float(p[-1])
+        return pred,prob,f"OK • {len(cols)} features"
+    except Exception as e:return None,None,f"ML ERROR: {type(e).__name__}"
 
 
-def predict_xgb(f: dict[str,float]):
-    model = load_xgb()
-    if model is None:
-        return None, None, 0, "Model file not found"
-    try:
-        names = []
-        if hasattr(model, "get_booster"):
-            names = list(model.get_booster().feature_names or [])
-        count = int(getattr(model, "n_features_in_", len(names) or 25))
-        if names and all(k in f for k in names):
-            cols = names
-        elif count == 7:
-            cols = FEATURES_7
-        else:
-            cols = FEATURES_25
-        row = dict(f)
-        row["obi_top20"] = f.get("obi_20",0.0); row["bid_ask_ratio"] = f.get("bid_ask_ratio_20",1.0)
-        row["total_depth"] = f.get("top20_total_depth",0.0); row["trend_signal"] = f.get("sma_distance",0.0)
-        x = pd.DataFrame([[row.get(c,0.0) for c in cols]], columns=cols)
-        pred = int(model.predict(x)[0])
-        prob = None
-        if hasattr(model, "predict_proba"):
-            p = model.predict_proba(x)[0]
-            prob = float(p[-1]) if len(p) else None
-        return pred, prob, len(cols), "OK"
-    except Exception as e:
-        return None, None, 0, f"Prediction error: {type(e).__name__}"
+def signal(f,pred,prob):
+    research=float(np.clip(.35*f["obi_20"]+.20*f["obi_50"]+.20*f["taker_flow_ratio"]+.15*np.tanh(f["sma_distance"]*100)+.10*f["FOURIER_TREND"],-1,1))
+    ml=((prob-.5)*2) if prob is not None else (1 if pred==1 else -1 if pred==0 else 0)
+    score=.6*research+.4*ml if pred is not None else research
+    s="LONG" if score>=.45 else "SHORT" if score<=-.45 else "WAIT"
+    return s,score,float(np.clip(50+abs(score)*49,1,99))
 
 
-def tri_levels(symbol: str):
-    # Same formulas as src/research_lab.py, but with dashboard data and no
-    # dependency on the module's working directory.
-    out = {}
-    intervals = {"MONTHLY":"1M","WEEKLY":"1w","DAILY":"1d","4H":"4h","1H":"1h","30M":"30m","15M":"15m"}
-    for name, interval in intervals.items():
-        df = candles(symbol, interval, 5)
-        if len(df) < 2: continue
-        c = df.iloc[-2]
-        o,h,l,cl = map(n,[c.Open,c.High,c.Low,c.Close])
-        bh=max(o,cl); bl=min(o,cl)
-        out[name] = {"body_50":(bh+bl)/2, "upper_50":(h+bh)/2, "lower_50":(l+bl)/2, "time":c.Time}
-    return out
-
-
-def signal_from_features(f, pred, prob):
-    research = float(np.clip(
-        .30*f["obi_20"] + .18*f["obi_50"] + .20*f["taker_flow_ratio"] +
-        .17*f["sma_distance"]*20 + .15*f["FOURIER_TREND"], -1, 1))
-    ml = ((prob-.5)*2) if prob is not None else (1 if pred==1 else -1 if pred==0 else 0)
-    score = .60*research + .40*ml if pred is not None else research
-    if score >= .45: sig="LONG"
-    elif score <= -.45: sig="SHORT"
-    else: sig="WAIT"
-    conf = float(np.clip(50+abs(score)*49, 1, 99))
-    return sig, score, conf, research
-
-
-def add_card(col, label, value, sub=""):
-    col.markdown(f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
-
-
-def build_chart(df, symbol, interval, future_bars, show_volume, levels, show_tri):
-    fig = go.Figure()
-    if df.empty:
-        return fig
-    fig.add_trace(go.Candlestick(
-        x=df.Time, open=df.Open, high=df.High, low=df.Low, close=df.Close,
-        name=symbol, increasing_line_color="#28d18d", increasing_fillcolor="#159d6a",
-        decreasing_line_color="#ff7180", decreasing_fillcolor="#d84b60",
-    ))
-    for span, name in [(20,"EMA 20"),(50,"EMA 50"),(200,"EMA 200")]:
-        if len(df) >= span:
-            fig.add_trace(go.Scatter(x=df.Time, y=df.Close.ewm(span=span,adjust=False).mean(), name=name, line={"width":1.2}, hoverinfo="skip"))
-    if show_volume:
-        fig.add_trace(go.Bar(x=df.Time, y=df.Volume, name="Volume", opacity=.14, yaxis="y2"))
-    last = n(df.Close.iloc[-1])
-    fig.add_hline(y=last, line_width=1, line_dash="dot", opacity=.45)
-    if show_tri:
-        styles = [("body_50","BODY 50"),("upper_50","UPPER WICK 50"),("lower_50","LOWER WICK 50")]
-        for tf, vals in levels.items():
-            for key, label in styles:
-                y=n(vals.get(key))
-                if y:
-                    fig.add_hline(y=y, line_width=1, line_dash="dash", opacity=.25, annotation_text=f"{tf} {label}", annotation_position="top left")
-    step = df.Time.iloc[-1]-df.Time.iloc[-2] if len(df)>1 else pd.Timedelta(minutes=5)
-    left = df.Time.iloc[max(0,len(df)-220)]
-    right = df.Time.iloc[-1] + step*future_bars
-    fig.update_layout(
-        template="plotly_dark", height=620, paper_bgcolor="#080d14", plot_bgcolor="#080d14",
-        margin={"l":3,"r":3,"t":8,"b":3}, hovermode="x unified", dragmode="pan",
-        uirevision=f"{symbol}-{interval}", legend={"orientation":"h","y":1.02,"x":0,"font":{"size":9}},
-        xaxis={"range":[left,right],"rangeslider":{"visible":False},"fixedrange":False,"showgrid":True,"gridcolor":"#172231","showspikes":True,"spikemode":"across"},
-        yaxis={"side":"right","fixedrange":False,"showgrid":True,"gridcolor":"#172231","automargin":True},
-        yaxis2={"overlaying":"y","side":"left","showticklabels":False,"showgrid":False},
-    )
+def chart(df,symbol,interval,future):
+    fig=go.Figure()
+    if df.empty:return fig
+    fig.add_trace(go.Candlestick(x=df.Time,open=df.Open,high=df.High,low=df.Low,close=df.Close,name=symbol,increasing_line_color="#28d18d",increasing_fillcolor="#159d6a",decreasing_line_color="#ff7180",decreasing_fillcolor="#d84b60"))
+    for span in (20,50,200):
+        if len(df)>=span:fig.add_trace(go.Scatter(x=df.Time,y=df.Close.ewm(span=span,adjust=False).mean(),name=f"EMA {span}",mode="lines",line={"width":1}))
+    last=df.Time.iloc[-1]
+    if len(df)>1:
+        step=df.Time.iloc[-1]-df.Time.iloc[-2]
+        end=last+step*future
+        fig.update_xaxes(range=[df.Time.iloc[max(0,len(df)-220)],end])
+    fig.update_layout(template="plotly_dark",height=620,margin=dict(l=5,r=5,t=25,b=5),xaxis_rangeslider_visible=False,dragmode="pan",hovermode="x unified",paper_bgcolor="#0b1119",plot_bgcolor="#0b1119",font=dict(size=11),legend=dict(orientation="h",y=1.02,x=0))
+    fig.update_xaxes(showgrid=True,gridcolor="#172230",showspikes=True,spikemode="across",spikesnap="cursor")
+    fig.update_yaxes(showgrid=True,gridcolor="#172230",side="right",fixedrange=False)
     return fig
 
 
-# ----------------------------- state -------------------------
-if "symbol" not in st.session_state: st.session_state.symbol="BTCUSDT"
-if "tf" not in st.session_state: st.session_state.tf="5m"
-if "refresh" not in st.session_state: st.session_state.refresh=5
-if "auto" not in st.session_state: st.session_state.auto=True
+def card(col,label,value,sub=""):
+    col.markdown(f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>',unsafe_allow_html=True)
+
+
+# ---------------- UI ----------------
+st.markdown('<div class="hero"><div><div class="brand">ZIA <span>RESEARCH</span> TERMINAL</div><div class="muted">ORDER FLOW • RESEARCH LAB • XGBOOST • LIVE MARKET</div></div><div class="live"><span class="dot"></span>LIVE</div></div>',unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("## ⚡ ZIA RESEARCH")
-    st.caption("ML + order-flow + TRI research terminal")
-    st.session_state.symbol = st.selectbox("Market", SYMBOLS, index=SYMBOLS.index(st.session_state.symbol))
-    tf_label = st.selectbox("Timeframe", list(TIMEFRAMES), index=list(TIMEFRAMES.values()).index(st.session_state.tf))
-    st.session_state.tf = TIMEFRAMES[tf_label]
-    candle_count = st.slider("Candles", 100, 1000, 500, 50)
-    future_bars = st.slider("Future chart space", 10, 150, 45, 5)
-    show_volume = st.checkbox("Volume", True)
-    show_tri = st.checkbox("TRI levels", True)
-    st.session_state.auto = st.toggle("Seamless auto refresh", st.session_state.auto)
-    st.session_state.refresh = st.slider("Refresh seconds", 2, 15, st.session_state.refresh)
-    st.caption("Chart: wheel zoom · drag pan · double-click reset. Mobile supports touch pan/zoom.")
+    st.header("Terminal")
+    symbol=st.selectbox("Symbol",SYMBOLS,index=0)
+    tf=st.selectbox("Timeframe",list(TIMEFRAMES),index=3)
+    refresh=st.slider("Refresh seconds",2,15,4)
+    bars=st.slider("Candles",100,1000,500,50)
+    future=st.slider("Future chart space",5,80,25)
+    st.caption("Data is public/read-only. No orders are placed by this dashboard.")
 
-st.markdown('<div class="hero"><div><div class="brand">ZIA <span>RESEARCH TERMINAL</span></div><div class="muted">ORDER FLOW · XGBOOST ML · TRI LINES · PRICE ACTION</div></div><div class="live"><span class="dot"></span>LIVE</div></div>', unsafe_allow_html=True)
+# Keep the whole UI refresh seamless when supported. On older Streamlit, the app still works.
+def render():
+    df,market_source,market_status,market_host=get_candles(symbol,TIMEFRAMES[tf],bars)
+    bids,asks,book_source,book_status,book_host=get_order_book(symbol)
+    f=features(df,bids,asks)
+    pred,prob,ml_status=ml_predict(f)
+    sig,score,conf=signal(f,pred,prob)
+    price=num(df.Close.iloc[-1]) if not df.empty else 0
+    spread=num(asks[0,0]-bids[0,0]) if len(asks) and len(bids) else 0
+    o20,b20,a20=ob(bids,asks,20);o50,b50,a50=ob(bids,asks,50)
 
-# Fragment keeps refresh local when supported. On older Streamlit, the
-# autorefresh dependency from requirements.txt is used as a safe fallback.
-def render_dashboard():
-    symbol=st.session_state.symbol; interval=st.session_state.tf
-    df=candles(symbol, interval, candle_count)
-    bids,asks,book_source=order_book(symbol)
-    f=make_features(df,bids,asks)
-    pred,prob,nfeat,ml_status=predict_xgb(f)
-    sig,score,conf,research=signal_from_features(f,pred,prob)
-    last=n(df.Close.iloc[-1]) if not df.empty else 0
-    prev=n(df.Close.iloc[-2]) if len(df)>1 else last
-    change=(last/prev-1)*100 if prev else 0
-    bias="BULLISH" if f["obi_20"]>.15 else "BEARISH" if f["obi_20"]<-.15 else "NEUTRAL"
+    controls=st.columns([1.3,1,1,1,1,1])
+    card(controls[0],"PRICE",fmt_price(price),f"{symbol} • {market_source}")
+    card(controls[1],"SIGNAL",sig,f"Confidence {conf:.1f}%")
+    card(controls[2],"ML",f"{prob*100:.1f}%" if prob is not None else "N/A",ml_status)
+    card(controls[3],"OBI 20",f"{o20:+.3f}",f"B {b20:,.2f} / A {a20:,.2f}")
+    card(controls[4],"OBI 50",f"{o50:+.3f}",f"B {b50:,.2f} / A {a50:,.2f}")
+    card(controls[5],"SPREAD",f"{spread:.4f}",f"Book: {book_source}")
 
-    cols=st.columns(6)
-    add_card(cols[0],"PRICE",price_text(last),f"{change:+.2f}%")
-    add_card(cols[1],"OBI TOP 20",f"{f['obi_20']:+.3f}",bias)
-    add_card(cols[2],"OBI TOP 50",f"{f['obi_50']:+.3f}","order-book imbalance")
-    add_card(cols[3],"ML PROBABILITY",f"{prob*100:.1f}%" if prob is not None else "—",f"features: {nfeat or '—'}")
-    add_card(cols[4],"CONFIDENCE",f"{conf:.1f}%",f"research {research:+.3f}")
-    add_card(cols[5],"DATA",book_source,f"candles: {len(df)}")
+    if market_status!="OK":st.warning(f"Market API issue: {market_status}. Trying Binance fallback endpoints automatically.")
+    if book_status!="OK":st.error(f"Order book unavailable after all Binance endpoints. Status: {book_status}. Check Streamlit Cloud network access.")
 
-    cls="long" if sig=="LONG" else "short" if sig=="SHORT" else "wait"
-    ml_text=(f"{prob*100:.1f}%" if prob is not None else "N/A")
-    st.markdown(f'<div class="signal {cls}"><div class="muted">FINAL RESEARCH / ML BIAS</div><div class="sig">{sig}</div><div class="score">Score {score:+.3f} · Confidence {conf:.1f}% · XGBoost {ml_text} · {ml_status}</div></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section">MARKET CHART</div>', unsafe_allow_html=True)
-    levels=tri_levels(symbol) if show_tri else {}
-    fig=build_chart(df,symbol,interval,future_bars,show_volume,levels,show_tri)
-    st.plotly_chart(fig,use_container_width=True,config={
-        "scrollZoom":True,"displaylogo":False,"responsive":True,
-        "modeBarButtonsToAdd":["drawline","drawrect","eraseshape"],
-        "doubleClick":"reset",
-    })
-    st.markdown('<div class="small" style="text-align:center">TradingView-style controls: mouse wheel zoom · drag/pan · crosshair · drawing tools · future space after latest candle</div>',unsafe_allow_html=True)
-
-    a,b=st.columns([1,1])
-    with a:
+    c1,c2=st.columns([5,1])
+    with c1:
+        st.markdown(f'<div class="section">{symbol} / {tf} — LIVE CHART</div>',unsafe_allow_html=True)
+        st.plotly_chart(chart(df,symbol,tf,future),use_container_width=True,config={"scrollZoom":True,"displaylogo":False,"responsive":True,"modeBarButtonsToAdd":["drawline","drawrect","eraseshape"]})
+    with c2:
         st.markdown('<div class="section">ORDER BOOK</div>',unsafe_allow_html=True)
-        if len(bids) and len(asks):
-            left,right=st.columns(2)
-            with left:
-                st.caption("TOP 10 BIDS")
-                st.dataframe(pd.DataFrame({"Price":bids[:10,0],"Qty":bids[:10,1]}),use_container_width=True,hide_index=True,height=245)
-            with right:
-                st.caption("TOP 10 ASKS")
-                st.dataframe(pd.DataFrame({"Price":asks[:10,0],"Qty":asks[:10,1]}),use_container_width=True,hide_index=True,height=245)
-        else:
-            st.warning("Order book unavailable. Binance may be temporarily unreachable.")
-    with b:
-        st.markdown('<div class="section">ML / RESEARCH FEATURES</div>',unsafe_allow_html=True)
-        rows={
-            "OBI 5":f["obi_5"],"OBI 10":f["obi_10"],"OBI 20":f["obi_20"],"OBI 50":f["obi_50"],
-            "Taker flow ratio":f["taker_flow_ratio"],"SMA distance":f["sma_distance"],
-            "Realized volatility":f["realized_volatility"],"Fourier trend":f["FOURIER_TREND"],
-            "Book imbalance":f["BOOK_IMB"],"Quant imply":f["QUANT_IMPLY"],
-        }
-        st.dataframe(pd.DataFrame(list(rows.items()),columns=["Feature","Value"]),use_container_width=True,hide_index=True,height=305)
+        if len(bids):
+            for i in range(min(10,len(bids))):
+                st.markdown(f"`{bids[i,0]:,.2f}`  **{bids[i,1]:.4f}**")
+            st.divider()
+            for i in range(min(10,len(asks))):
+                st.markdown(f"`{asks[i,0]:,.2f}`  **{asks[i,1]:.4f}**")
+        else: st.info("Waiting for order book data…")
 
-    st.markdown('<div class="section">TRI LEVELS</div>',unsafe_allow_html=True)
-    if levels:
-        tri_df=pd.DataFrame([{"Timeframe":k,"Body 50":v["body_50"],"Upper 50":v["upper_50"],"Lower 50":v["lower_50"]} for k,v in levels.items()])
-        st.dataframe(tri_df,use_container_width=True,hide_index=True)
-    else:
-        st.info("TRI levels are temporarily unavailable.")
+    st.markdown('<div class="section">RESEARCH SNAPSHOT</div>',unsafe_allow_html=True)
+    a=st.columns(6)
+    card(a[0],"OBI 5",f"{f['obi_5']:+.3f}")
+    card(a[1],"OBI 10",f"{f['obi_10']:+.3f}")
+    card(a[2],"OBI 20",f"{f['obi_20']:+.3f}")
+    card(a[3],"OBI 50",f"{f['obi_50']:+.3f}")
+    card(a[4],"TAKER FLOW",f"{f['taker_flow_ratio']:+.3f}")
+    card(a[5],"VOLATILITY",f"{f['realized_volatility']:.4%}")
 
-    st.markdown('<div class="section">PROJECT FILES / ML STATUS</div>',unsafe_allow_html=True)
-    s1,s2,s3,s4=st.columns(4)
-    s1.metric("XGBoost model","READY" if MODEL_FILE.exists() else "MISSING")
-    s2.metric("Research Lab ML","READY" if RESEARCH_MODEL.exists() else "NOT TRAINED")
-    s3.metric("Metadata","FOUND" if MODEL_META.exists() else "NOT FOUND")
-    s4.metric("Signal engine","DASHBOARD SAFE MODE")
-    st.caption("Dashboard is read-only: it does not place trades. Existing bot_engine.py remains responsible for execution.")
+    with st.expander("ML / ENGINE DIAGNOSTICS"):
+        st.write({"model_file":str(MODEL_FILE),"model_exists":MODEL_FILE.exists(),"ml":ml_status,"market_source":market_source,"market_host":market_host,"book_source":book_source,"book_host":book_host,"score":round(score,4),"signal":sig})
 
-render_dashboard()
+try:
+    fragment=st.fragment
+except AttributeError:
+    fragment=None
 
-# Seamless refresh: Streamlit >=1.37 supports fragments. A fragment reruns
-# the live portion instead of refreshing the whole browser page. If a
-# deployment has an unusual Streamlit build, use the sidebar refresh toggle
-# off and manually rerun; no hard reload is forced by this file.
-if st.session_state.auto:
-    try:
-        st.markdown(f'<script>setTimeout(function(){{window.parent.postMessage({{type:"streamlit:rerun"}},"*");}}, {int(st.session_state.refresh)*1000});</script>', unsafe_allow_html=True)
-    except Exception:
-        pass
+if fragment:
+    @fragment(run_every=refresh)
+    def live_dashboard():
+        render()
+    live_dashboard()
+else:
+    render()
+    time.sleep(refresh)
+    st.rerun()
