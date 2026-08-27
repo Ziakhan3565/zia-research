@@ -1,39 +1,39 @@
 from __future__ import annotations
- 
+
 from datetime import datetime, timezone
 from pathlib import Path
 import time
- 
+
 import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
- 
+
 # ============================================================
 # ZIA RESEARCH TERMINAL — consolidated build
 # Merges dashboard_v6 (silent 1s live engine) with the visual
 # polish of v3/v5, and adds a new Multi-Market Scanner tab that
 # ranks every tracked symbol by live signal strength at once.
 # ============================================================
- 
+
 st.set_page_config(page_title="ZIA Research Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
- 
+
 ROOT = Path(__file__).resolve().parent
 MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
 SIGNAL_FILE = ROOT / "saved_signals.csv"
 TRADE_FILE = ROOT / "trade_history.csv"
- 
+
 FUTURES = ["https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
 SPOT = ["https://api.binance.com", "https://api1.binance.com"]
 DATA = ["https://data-api.binance.vision"]
- 
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
            "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "TRXUSDT", "LTCUSDT"]
 TFS = {"1MO": "1M", "1W": "1w", "1D": "1d", "4H": "4h", "1H": "1h",
        "30M": "30m", "15M": "15m", "5M": "5m", "3M": "3m", "1M": "1m"}
- 
+
 # ------------------------------------------------------------
 # STYLE — dark quant-terminal theme, violet/green/red signal accents
 # ------------------------------------------------------------
@@ -82,19 +82,19 @@ div[data-testid="stTabs"] button{font-weight:900;font-size:11px}
 }
 </style>
 """, unsafe_allow_html=True)
- 
+
 # ------------------------------------------------------------
 # DATA HELPERS
 # ------------------------------------------------------------
- 
+
 def num(x, default=0.0):
     try:
         v = float(x)
         return v if np.isfinite(v) else default
     except Exception:
         return default
- 
- 
+
+
 def api(hosts, path, params):
     err = "network"
     for host in hosts:
@@ -106,8 +106,8 @@ def api(hosts, path, params):
         except requests.RequestException as e:
             err = type(e).__name__
     return None, None, err
- 
- 
+
+
 @st.cache_data(ttl=1.0, show_spinner=False)
 def candles(symbol, interval, limit=650):
     raw, host, status = api(FUTURES, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": min(limit, 1500)})
@@ -125,8 +125,8 @@ def candles(symbol, interval, limit=650):
         except Exception:
             pass
     return pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume", "TakerBuy"]), source, status, host
- 
- 
+
+
 @st.cache_data(ttl=1.0, show_spinner=False)
 def orderbook(symbol):
     raw, host, status = api(FUTURES, "/fapi/v1/depth", {"symbol": symbol, "limit": 100})
@@ -141,8 +141,8 @@ def orderbook(symbol):
         return np.asarray(raw.get("bids", []), float), np.asarray(raw.get("asks", []), float), source, status, host
     except Exception:
         return np.empty((0, 2)), np.empty((0, 2)), source, status, host
- 
- 
+
+
 def obi(bids, asks, k):
     if len(bids) == 0 or len(asks) == 0:
         return 0., 0., 0.
@@ -150,8 +150,8 @@ def obi(bids, asks, k):
     bv = float(bids[:k, 1].sum())
     av = float(asks[:k, 1].sum())
     return ((bv - av) / (bv + av) if bv + av else 0.), bv, av
- 
- 
+
+
 def features(df, b, a):
     f = {k: 0. for k in ["top20_bid_sum", "top20_ask_sum", "obi_5", "obi_10", "obi_20", "obi_50", "spread",
                           "spread_pct", "bid_ask_ratio_20", "bid_ask_ratio_50", "top20_total_depth",
@@ -184,16 +184,16 @@ def features(df, b, a):
               ADAPT_CONF=float(np.clip(.5 + (abs(o20) + abs(trend)) / 2, 0, 1)),
               BAYESIAN=float(np.clip(.5 + (o20 + trend) / 4, 0, 1)), FOURIER_TREND=float(four))
     return f
- 
- 
+
+
 @st.cache_resource(show_spinner=False)
 def load_model():
     try:
         return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
     except Exception:
         return None
- 
- 
+
+
 def ml_predict(f):
     m = load_model()
     if m is None:
@@ -211,8 +211,8 @@ def ml_predict(f):
         return pred, proba, "OK", len(cols)
     except Exception as e:
         return None, None, "ML ERROR: " + type(e).__name__, 0
- 
- 
+
+
 def research(f):
     scores = {
         "OBI 20": np.clip(f["obi_20"] * 2, -1, 1),
@@ -227,17 +227,17 @@ def research(f):
     weights = {"OBI 20": .22, "OBI 20+50": .14, "OFI / Taker": .20, "Trend / SMA": .14,
                "Fourier": .10, "Bayesian": .08, "Quant Imply": .07, "Adaptive": .05}
     return scores, weights, float(sum(scores[k] * weights[k] for k in scores))
- 
- 
-def final_state(f, p, pr):
+
+
+def final_state(f, p, pr, threshold=0.45):
     scores, weights, rscore = research(f)
     mlscore = (pr - .5) * 2 if pr is not None else (1 if p == 1 else -1 if p == 0 else 0)
     combined = .6 * rscore + .4 * mlscore if p is not None else rscore
-    signal = "LONG" if combined >= .45 else "SHORT" if combined <= -.45 else "WAIT"
+    signal = "LONG" if combined >= threshold else "SHORT" if combined <= -threshold else "WAIT"
     confidence = float(np.clip(50 + abs(combined) * 49, 1, 99))
     return signal, confidence, combined, scores, weights, rscore, mlscore
- 
- 
+
+
 def visible_tri_timeframes(tf):
     if tf in ("1M", "3M", "5M", "15M", "30M"):
         return [("1H", "1 HOUR"), ("4H", "4 HOUR")]
@@ -248,8 +248,8 @@ def visible_tri_timeframes(tf):
     if tf == "1W":
         return [("1MO", "MONTHLY")]
     return []
- 
- 
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def tri_levels(symbol, interval):
     df, _, _, _ = candles(symbol, interval, 8)
@@ -259,8 +259,8 @@ def tri_levels(symbol, interval):
     o, h, l, cl = map(num, [c.Open, c.High, c.Low, c.Close])
     bh, bl = max(o, cl), min(o, cl)
     return {"body": (bh + bl) / 2, "upper": (h + bh) / 2, "lower": (l + bl) / 2}
- 
- 
+
+
 def make_chart(df, symbol, tf, future):
     fig = go.Figure()
     if df.empty:
@@ -293,44 +293,44 @@ def make_chart(df, symbol, tf, future):
                       uirevision=f"ZIA-{symbol}-{tf}", legend=dict(orientation="h", y=1.02, x=0),
                       hoverlabel=dict(font_size=11))
     return fig
- 
- 
+
+
 def cards(items):
     cs = st.columns(len(items))
     for c, (lab, val, sub, cl) in zip(cs, items):
         with c:
             st.markdown(f'<div class="card"><div class="label">{lab}</div><div class="value {cl}">{val}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
- 
- 
+
+
 def read_csv(path):
     try:
         return pd.read_csv(path) if path.exists() else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
- 
- 
+
+
 def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
     row = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "timeframe": tf, "price": price,
            "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",
            "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs}
     pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)
- 
- 
+
+
 @st.cache_data(ttl=3.0, show_spinner=False)
-def scan_symbol(symbol, tf_key):
+def scan_symbol(symbol, tf_key, threshold=0.20):
     """One-shot signal snapshot for the multi-market scanner."""
     df, source, _, _ = candles(symbol, TFS[tf_key], 120)
     bids, asks, *_ = orderbook(symbol)
     f = features(df, bids, asks)
     pred, prob, _, _ = ml_predict(f)
-    signal, confidence, combined, *_ = final_state(f, pred, prob)
+    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold)
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
     return {"symbol": symbol, "price": price, "change": change, "signal": signal,
             "confidence": confidence, "combined": combined, "obi20": f["obi_20"]}
- 
- 
+
+
 # ------------------------------------------------------------
 # STATE
 # ------------------------------------------------------------
@@ -340,19 +340,25 @@ if "tf" not in st.session_state:
     st.session_state.tf = "15M"
 if "future" not in st.session_state:
     st.session_state.future = 30
- 
+if "threshold" not in st.session_state:
+    st.session_state.threshold = 0.20
+
 st.markdown('<div class="hero"><div><div class="brand">ZIA <b>RESEARCH</b></div>'
             '<div class="micro">QUANT MARKET INTELLIGENCE • LIVE ML • ORDER FLOW • MULTI-MARKET SCANNER</div></div>'
             '<div class="live"><span class="dot"></span>LIVE • SILENT 1S</div></div>', unsafe_allow_html=True)
- 
-c1, c2, c3 = st.columns([2.2, 1.15, 1])
+
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1.3])
 with c1:
     symbol = st.selectbox("MARKET", SYMBOLS, index=SYMBOLS.index(st.session_state.symbol), key="symbol")
 with c2:
     tf = st.selectbox("TIMEFRAME", list(TFS.keys()), index=list(TFS.keys()).index(st.session_state.tf), key="tf")
 with c3:
     future = st.selectbox("FUTURE SPACE", [12, 20, 30, 45, 60], index=2, key="future", format_func=lambda x: f"{x} bars")
- 
+with c4:
+    threshold = st.slider("SIGNAL SENSITIVITY", min_value=0.10, max_value=0.60, step=0.05,
+                          value=st.session_state.threshold, key="threshold",
+                          help="Lower = more LONG/SHORT signals (less strict). Higher = fewer, stronger-conviction signals.")
+
 visible = visible_tri_timeframes(tf)
 tri_text = " + ".join(x[0] for x in visible) if visible else "NONE"
 st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
@@ -360,8 +366,8 @@ st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
             f'<div class="tri-chip">DISPLAY <span>{tri_text}</span></div>'
             f'<div class="tri-chip">ZOOM <span>ON</span></div>'
             f'<div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
- 
- 
+
+
 @st.fragment(run_every="1s")
 def live_engine():
     started = time.perf_counter()
@@ -369,7 +375,7 @@ def live_engine():
     bids, asks, bsrc, bstat, _ = orderbook(symbol)
     f = features(df, bids, asks)
     pred, prob, mlstat, feature_count = ml_predict(f)
-    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob)
+    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold)
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
@@ -377,12 +383,12 @@ def live_engine():
     cls = "signal-long" if signal == "LONG" else "signal-short" if signal == "SHORT" else "signal-wait"
     sigcolor = "good" if signal == "LONG" else "bad" if signal == "SHORT" else "amber"
     mltext = f"{prob * 100:.2f}%" if prob is not None else "—"
- 
+
     st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'
                 f'<div class="signal-main {sigcolor}">{signal}</div>'
                 f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div></div>',
                 unsafe_allow_html=True)
- 
+
     cards([
         ("PRICE", f"${price:,.2f}", f"{change:+.2f}% • {tf}", "good" if change >= 0 else "bad"),
         ("SIGNAL", signal, f"strength {confidence:.1f}%", sigcolor),
@@ -391,9 +397,9 @@ def live_engine():
         ("OBI 50", f"{f['obi_50']:+.3f}", "top 50 depth", "good" if f['obi_50'] >= 0 else "bad"),
         ("DATA", source, f"book {bsrc}", "cyan"),
     ])
- 
+
     tabs = st.tabs(["⌂ OVERVIEW", "◈ CHART", "◌ ORDER FLOW", "🧠 ML LAB", "🔬 RESEARCH LAB", "▣ SIGNALS", "⌖ SCANNER"])
- 
+
     with tabs[0]:
         l, r = st.columns([2, 1])
         with l:
@@ -411,7 +417,7 @@ def live_engine():
             st.write(f"Engine: `{elapsed:.0f} ms` • silent 1s cycle")
             st.write(f"Updated: `{datetime.now().strftime('%H:%M:%S')}`")
             st.markdown('</div>', unsafe_allow_html=True)
- 
+
     with tabs[1]:
         st.markdown(f'<div class="panel"><b>TRADINGVIEW-STYLE MARKET CHART</b>'
                     f'<div class="section-sub">Automatic TRI only • {tf} → {tri_text} • scroll zoom • mouse pan • crosshair • future space</div>',
@@ -421,7 +427,7 @@ def live_engine():
                                  "doubleClick": "reset", "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
                          key="main_market_chart")
         st.markdown('</div>', unsafe_allow_html=True)
- 
+
     with tabs[2]:
         vals = [obi(bids, asks, k) for k in (5, 10, 20, 50)]
         cards([(f"OBI {k}", f"{v[0]:+.3f}", f"B {v[1]:,.1f} / A {v[2]:,.1f}", "good" if v[0] >= 0 else "bad")
@@ -429,7 +435,7 @@ def live_engine():
         l, r = st.columns(2)
         l.dataframe(pd.DataFrame(bids[:20], columns=["Bid Price", "Bid Qty"]), use_container_width=True, hide_index=True)
         r.dataframe(pd.DataFrame(asks[:20], columns=["Ask Price", "Ask Qty"]), use_container_width=True, hide_index=True)
- 
+
     with tabs[3]:
         cards([
             ("MODEL", mlstat, "xgboost_obi_model.pkl", "violet"),
@@ -444,7 +450,7 @@ def live_engine():
             "Value": [f["obi_5"], f["obi_10"], f["obi_20"], f["obi_50"], f["spread"], f["taker_flow_ratio"], f["sma_distance"], f["realized_volatility"]],
         }), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
- 
+
     with tabs[4]:
         rd = pd.DataFrame([{"Formula": k, "Live Score": round(float(v), 4), "Weight %": round(rw[k] * 100, 1),
                              "Contribution": round(float(v * rw[k]), 4),
@@ -454,7 +460,7 @@ def live_engine():
         st.dataframe(rd, use_container_width=True, hide_index=True)
         st.write(f"Strongest contributor: **{rd.iloc[0]['Formula'] if not rd.empty else '—'}** • Composite **{rscore:+.3f}**")
         st.markdown('</div>', unsafe_allow_html=True)
- 
+
     with tabs[5]:
         if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):
             save_signal(symbol, tf, price, signal, confidence, prob, f, rscore)
@@ -474,12 +480,12 @@ def live_engine():
             wr = wins / total * 100 if total else 0
             cards([("CLOSED", str(total), "resolved trades", "cyan"), ("WINS", str(wins), "winning trades", "good"),
                    ("LOSSES", str(losses), "losing trades", "bad"), ("WIN RATE", f"{wr:.1f}%", "closed trade rate", "violet")])
- 
+
     with tabs[6]:
         st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
                     f'<div class="section-sub">Every tracked symbol scored on the {tf} timeframe, refreshed every few seconds • click a row\'s symbol above to jump in</div>',
                     unsafe_allow_html=True)
-        rows = [scan_symbol(s, tf) for s in SYMBOLS]
+        rows = [scan_symbol(s, tf, threshold) for s in SYMBOLS]
         rows.sort(key=lambda r: r["combined"], reverse=True)
         longs = sum(1 for r in rows if r["signal"] == "LONG")
         shorts = sum(1 for r in rows if r["signal"] == "SHORT")
@@ -502,8 +508,8 @@ def live_engine():
                 f'<div style="width:12%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
                 f'</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
- 
+
     st.caption(f"ZIA Research • {symbol} • {tf} • silent live engine • {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
- 
- 
+
+
 live_engine()
