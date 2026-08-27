@@ -1,2 +1,2 @@
 # ZIA Research Terminal - main dashboard entrypoint
-from dashboard_v6 import *
+from dashboard_v7 import *
