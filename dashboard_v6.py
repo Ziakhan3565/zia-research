@@ -1,140 +1,109 @@
-"""ZIA Research Terminal v6.
-
-Keeps the original v6 dashboard as the source of truth. The launcher only
-adds the requested 15M signal lock and LIVE TRADES section when the original
-source is available. It never replaces the dashboard UI with a new design.
-"""
 from __future__ import annotations
 
 from pathlib import Path
-import runpy
-import requests
+import datetime as dt
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
-ORIGINAL = "https://raw.githubusercontent.com/Ziakhan3565/zia-research/2c02c995fbb6e30790da8c9644fe7e9ebb29cf16/dashboard_v6.py"
+TV = ROOT / "dashboard_tv.py"
 
+# Keep the existing dashboard UI. Only inject the requested 15M lock + LIVE TRADES.
+source = TV.read_text(encoding="utf-8")
 
-def _load_original():
-    """Load the original v6 source; fall back to the local TV dashboard."""
-    try:
-        r = requests.get(ORIGINAL, timeout=8, headers={"User-Agent": "ZIA-Research"})
-        r.raise_for_status()
-        return r.text
-    except Exception:
-        # Streamlit Cloud/network failure must not make the app crash.
-        fallback = ROOT / "dashboard_tv.py"
-        if fallback.exists():
-            return fallback.read_text(encoding="utf-8")
-        raise RuntimeError("Unable to load the original dashboard source.")
-
-
-def _patch(source: str) -> str:
-    """Apply only the two requested additions to the original source."""
-    if "def final_state(f,p,pr):" not in source:
-        return source
-
-    source = source.replace(
-        "def final_state(f,p,pr):",
-        "def _zia_raw_final_state(f,p,pr):",
-        1,
-    )
-
-    marker = "\n# TRI controls are intentionally removed. The chart decides which source timeframes are visible."
-    if marker not in source:
-        return source
-
-    lock_code = r'''
+needle = 'sig,score,conf,research=composite(features,pred,prob)\nprice=num(df.Close.iloc[-1]) if not df.empty else 0; prev=num(df.Close.iloc[-2] if len(df)>1 else price); change=(price/prev-1)*100 if prev else 0\n'
+patch = r'''sig,score,conf,research=composite(features,pred,prob)
 
 # ============================================================
-# ZIA ADDITION: 15M LONG/SHORT LOCK + LIVE TRADES
+# ZIA MINIMAL ADDITION: 15M SIGNAL LOCK + LIVE TRADES
+# Existing dashboard/UI is intentionally preserved.
 # ============================================================
-from datetime import timedelta as _zia_timedelta
-
 _ZIA_LOCK_MINUTES = 20
-if "_zia_15m_locks" not in st.session_state:
-    st.session_state._zia_15m_locks = {}
-if "_zia_live_trades" not in st.session_state:
-    st.session_state._zia_live_trades = {}
+if "_zia_15m_trade" not in st.session_state:
+    st.session_state._zia_15m_trade = None
 
-def final_state(f,p,pr):
-    raw = _zia_raw_final_state(f,p,pr)
-    if str(tf) != "15M":
-        return raw
-    key = f"{symbol}:15M"
-    now = datetime.now(timezone.utc)
-    old = st.session_state._zia_15m_locks.get(key)
-    if old is not None:
-        try:
-            until = datetime.fromisoformat(old["until"])
-            if now < until:
-                return tuple(old["result"])
-        except Exception:
-            pass
-        st.session_state._zia_15m_locks.pop(key, None)
-        st.session_state._zia_live_trades.pop(key, None)
-    signal, confidence, combined, scores, weights, rscore, mlscore = raw
-    if signal not in ("LONG", "SHORT"):
-        return raw
-    until = now + _zia_timedelta(minutes=_ZIA_LOCK_MINUTES)
-    result = [signal, confidence, combined, scores, weights, rscore, mlscore]
-    st.session_state._zia_15m_locks[key] = {
-        "until": until.isoformat(),
-        "result": result,
-    }
-    st.session_state._zia_live_trades[key] = {
-        "symbol": str(symbol),
+_now = dt.datetime.now(dt.timezone.utc)
+_zia_is_15m = st.session_state.interval == "15m"
+_zia_trade = st.session_state._zia_15m_trade
+
+# Expire the old 15M trade only after its fixed 20-minute window.
+if _zia_trade is not None:
+    try:
+        _until = dt.datetime.fromisoformat(_zia_trade["until"])
+        if _now >= _until:
+            st.session_state._zia_15m_trade = None
+            _zia_trade = None
+    except Exception:
+        st.session_state._zia_15m_trade = None
+        _zia_trade = None
+
+# While locked, NEVER allow a new 15M LONG/SHORT to replace the active signal.
+if _zia_is_15m and _zia_trade is not None:
+    sig = _zia_trade["signal"]
+    score = float(_zia_trade["score"])
+    conf = float(_zia_trade["confidence"])
+    research = float(_zia_trade["research"])
+
+# Create a new locked trade only when a fresh 15M actionable signal appears.
+if _zia_is_15m and _zia_trade is None and sig in ("LONG", "SHORT"):
+    _entry = float(price) if 'price' in locals() else (num(df.Close.iloc[-1]) if not df.empty else 0.0)
+    _atr = float((df.High - df.Low).tail(14).mean()) if not df.empty else 0.0
+    _atr = max(_atr, _entry * 0.001) if _entry else _atr
+    if sig == "LONG":
+        _tp1, _tp2, _sl = _entry + _atr, _entry + 2*_atr, _entry - 0.75*_atr
+    else:
+        _tp1, _tp2, _sl = _entry - _atr, _entry - 2*_atr, _entry + 0.75*_atr
+    _until = _now + dt.timedelta(minutes=_ZIA_LOCK_MINUTES)
+    st.session_state._zia_15m_trade = {
+        "symbol": st.session_state.symbol,
         "timeframe": "15M",
-        "signal": signal,
-        "confidence": float(confidence),
-        "entry_time": now.isoformat(),
-        "until": until.isoformat(),
+        "signal": sig,
+        "confidence": float(conf),
+        "score": float(score),
+        "research": float(research),
+        "entry": _entry,
+        "tp1": _tp1,
+        "tp2": _tp2,
+        "sl": _sl,
+        "created": _now.isoformat(),
+        "until": _until.isoformat(),
     }
-    return raw
+    _zia_trade = st.session_state._zia_15m_trade
 
-def _zia_live_trade_frame():
-    now = datetime.now(timezone.utc)
-    rows = []
-    for key, trade in list(st.session_state._zia_live_trades.items()):
-        try:
-            until = datetime.fromisoformat(trade["until"])
-            remaining = max(0, int((until-now).total_seconds()))
-            if remaining <= 0:
-                st.session_state._zia_live_trades.pop(key, None)
-                st.session_state._zia_15m_locks.pop(key, None)
-                continue
-            rows.append({
-                "Crypto": trade["symbol"],
-                "TF": "15M",
-                "Signal": trade["signal"],
-                "Confidence": f"{trade['confidence']:.1f}%",
-                "Entry Time": pd.to_datetime(trade["entry_time"]).strftime("%H:%M:%S UTC"),
-                "Lock Remaining": f"{remaining//60:02d}:{remaining%60:02d}",
-                "Status": "LONG LOCKED" if trade["signal"] == "LONG" else "SHORT LOCKED",
-            })
-        except Exception:
-            st.session_state._zia_live_trades.pop(key, None)
-            st.session_state._zia_15m_locks.pop(key, None)
-    return pd.DataFrame(rows)
+# Price variables used by the original dashboard remain unchanged.
+price=num(df.Close.iloc[-1]) if not df.empty else 0; prev=num(df.Close.iloc[-2] if len(df)>1 else price); change=(price/prev-1)*100 if prev else 0
 '''
-    source = source.replace(marker, lock_code + marker, 1)
 
-    needle = 'with tabs[5]:\n        if st.button("💾 SAVE CURRENT SIGNAL"'
-    if needle in source:
-        replacement = '''with tabs[5]:
-        _zia_live = _zia_live_trade_frame()
-        st.markdown('<div class="panel"><b>LIVE TRADES</b><div class="section-sub">15M LONG/SHORT signals are locked for 20 minutes. No new 15M signal replaces an active one.</div>',unsafe_allow_html=True)
-        if not _zia_live.empty:
-            st.dataframe(_zia_live,use_container_width=True,hide_index=True)
-        else:
-            st.info("No active 15M LONG/SHORT trade right now.")
-        st.markdown('</div>',unsafe_allow_html=True)
-        if st.button("💾 SAVE CURRENT SIGNAL"'''
-        source = source.replace(needle, replacement, 1)
-    return source
+if needle not in source:
+    raise RuntimeError("Expected dashboard_tv signal marker was not found; dashboard left untouched.")
+source = source.replace(needle, patch, 1)
 
+# Insert the LIVE TRADES section before the existing Market Chart. This does not alter existing panels.
+chart_marker = 'st.markdown(\'<div class="section">MARKET CHART</div>\',unsafe_allow_html=True)\n'
+trade_panel = r'''# Existing dashboard + one additional LIVE TRADES section.
+st.markdown('<div class="section">LIVE TRADES</div>',unsafe_allow_html=True)
+if _zia_trade is not None and _zia_trade.get("signal") in ("LONG","SHORT"):
+    try:
+        _remaining=max(0,int((dt.datetime.fromisoformat(_zia_trade["until"])-dt.datetime.now(dt.timezone.utc)).total_seconds()))
+    except Exception:
+        _remaining=0
+    _mins,_secs=divmod(_remaining,60)
+    _hours,_mins=divmod(_mins,60)
+    _lock=f"{_hours:02d}:{_mins:02d}:{_secs:02d}"
+    _sigcls="long" if _zia_trade["signal"]=="LONG" else "short"
+    _entry=float(_zia_trade["entry"]); _tp1=float(_zia_trade["tp1"]); _tp2=float(_zia_trade["tp2"]); _sl=float(_zia_trade["sl"])
+    _html=(
+        f'<div class="sigbox {_sigcls}"><div class="label">15M LIVE TRADE • LOCKED</div>'
+        f'<div class="sig">{_zia_trade["symbol"]} · {_zia_trade["signal"]}</div>'
+        f'<div class="sub">Entry {fmt_price(_entry)} · TP1 {fmt_price(_tp1)} · TP2 {fmt_price(_tp2)} · SL {fmt_price(_sl)} · Confidence {_zia_trade["confidence"]:.1f}% · Lock {_lock}</div>'
+        f'</div>'
+    )
+    st.markdown(_html,unsafe_allow_html=True)
+else:
+    st.markdown('<div class="panel"><div class="sub">No active 15M LONG/SHORT trade. WAIT signals are not locked.</div></div>',unsafe_allow_html=True)
 
-source = _patch(_load_original())
+''' + chart_marker
+if chart_marker not in source:
+    raise RuntimeError("Expected market chart marker was not found; dashboard left untouched.")
+source = source.replace(chart_marker, trade_panel, 1)
 
-# The original source already calls st.set_page_config once; execute it directly.
-exec(compile(source, "dashboard_v6_original.py", "exec"), globals(), globals())
+exec(compile(source, str(TV), "exec"), globals(), globals())
