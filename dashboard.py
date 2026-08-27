@@ -1,2357 +1,330 @@
 from __future__ import annotations
 
-import os
-import time
-import math
-import joblib
 import datetime as dt
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
-import requests
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-
 from streamlit_autorefresh import st_autorefresh
 
-
 # ============================================================
-# ZIA RESEARCH LAB
-# BINANCE USDⓈ-M FUTURES RESEARCH DASHBOARD
-# ============================================================
-
-st.set_page_config(
-    page_title="ZIA RESEARCH LAB",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-# ============================================================
-# CONFIG
+# ZIA RESEARCH LAB — ML MARKET TERMINAL
+# Dashboard only: existing research/training files are untouched.
+# Existing XGBoost 7-feature schema is preserved.
 # ============================================================
 
+st.set_page_config(page_title="ZIA Research Lab", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 ROOT = Path(__file__).resolve().parent
-
-HISTORY_FILE = ROOT / "signal_history.csv"
 MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
-
-# IMPORTANT:
-# Futures endpoints — NOT Spot endpoints
+HISTORY_FILE = ROOT / "signal_history.csv"
 BINANCE_BASE = "https://fapi.binance.com"
-
-BINANCE_KLINES = f"{BINANCE_BASE}/fapi/v1/klines"
-BINANCE_DEPTH = f"{BINANCE_BASE}/fapi/v1/depth"
-BINANCE_TICKER = f"{BINANCE_BASE}/fapi/v1/ticker/24hr"
-BINANCE_AGG_TRADES = f"{BINANCE_BASE}/fapi/v1/aggTrades"
-
+KLINES_URL = f"{BINANCE_BASE}/fapi/v1/klines"
+DEPTH_URL = f"{BINANCE_BASE}/fapi/v1/depth"
+TICKER_URL = f"{BINANCE_BASE}/fapi/v1/ticker/24hr"
+AGG_TRADES_URL = f"{BINANCE_BASE}/fapi/v1/aggTrades"
 REQUEST_TIMEOUT = 8
 
-
-# ============================================================
-# COINS
-# ============================================================
-
-COINS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "ADAUSDT",
-    "AVAXUSDT",
-    "LINKUSDT",
-    "SUIUSDT",
-    "TRXUSDT",
-    "LTCUSDT",
-    "BCHUSDT",
-    "DOTUSDT",
-    "XLMUSDT",
-    "NEARUSDT",
-    "UNIUSDT",
-    "APTUSDT",
-    "TAOUSDT",
-    "XMRUSDT",
-]
-
-
-# ============================================================
-# TRADE MODES
-# ============================================================
-
-TRADE_MODES = {
-    "SCALPING": {
-        "label": "30M SCALPING",
-        "analysis_tf": "30m",
-        "duration_minutes": 15,
-        "max_holding": "15 minutes",
-        "reference": ["1h", "4h"],
-    },
-
-    "15M": {
-        "label": "15M",
-        "analysis_tf": "15m",
-        "duration_minutes": 90,
-        "max_holding": "90 minutes",
-        "reference": ["1h", "4h"],
-    },
-
-    "1H": {
-        "label": "1H",
-        "analysis_tf": "1h",
-        "duration_minutes": 1440,
-        "max_holding": "24 hours",
-        "reference": ["1d", "1w"],
-    },
-
-    "4H": {
-        "label": "4H",
-        "analysis_tf": "4h",
-        "duration_minutes": 1440,
-        "max_holding": "24 hours max",
-        "reference": ["1w", "1M"],
-    },
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","SUIUSDT","TRXUSDT","LTCUSDT","BCHUSDT","DOTUSDT","XLMUSDT","NEARUSDT","UNIUSDT","APTUSDT","TAOUSDT","XMRUSDT"]
+MODES = {
+    "SCALPING": {"label":"5M / SCALP", "tf":"5m", "hold":"5–30 min", "refs":["15m","1h","4h"]},
+    "15M": {"label":"15M", "tf":"15m", "hold":"30–120 min", "refs":["1h","4h"]},
+    "1H": {"label":"1H", "tf":"1h", "hold":"2–24 hours", "refs":["4h","1d"]},
+    "4H": {"label":"4H", "tf":"4h", "hold":"12–72 hours", "refs":["1d","1w"]},
 }
+MODEL_FEATURES = ["top20_bid_sum","top20_ask_sum","obi_top20","spread","bid_ask_ratio","total_depth","trend_signal"]
 
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-DEFAULT_STATE = {
-    "selected_symbol": "BTCUSDT",
-    "selected_mode": "SCALPING",
-    "auto_scan": True,
-    "show_chart": True,
-    "last_signal": {},
-    "signal_history": [],
-}
-
-for key, value in DEFAULT_STATE.items():
+for key, value in {"symbol":"BTCUSDT","mode":"SCALPING","auto_refresh":True,"refresh_seconds":5,"last_signal":None,"last_saved_key":""}.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-
-# ============================================================
-# CSS
-# ============================================================
-
-st.markdown(
-    """
+st.markdown("""
 <style>
-
-.block-container {
-    padding-top: 1.5rem;
-    padding-bottom: 2rem;
-    max-width: 1600px;
-}
-
-[data-testid="stSidebar"] {
-    background: #080c12;
-}
-
-[data-testid="stSidebar"] * {
-    color: #e8edf5;
-}
-
-.main-title {
-    font-size: 30px;
-    font-weight: 800;
-    letter-spacing: 0.5px;
-}
-
-.sub-title {
-    color: #8f9bad;
-    font-size: 14px;
-    margin-top: -8px;
-}
-
-.signal-card {
-    padding: 25px;
-    border-radius: 16px;
-    background: linear-gradient(
-        135deg,
-        #101722,
-        #0b1018
-    );
-    border: 1px solid #1f2b3a;
-    margin-bottom: 18px;
-}
-
-.signal-long {
-    border: 1px solid #1f9d68;
-    box-shadow: 0 0 25px rgba(31,157,104,.10);
-}
-
-.signal-short {
-    border: 1px solid #d64a5c;
-    box-shadow: 0 0 25px rgba(214,74,92,.10);
-}
-
-.signal-wait {
-    border: 1px solid #526070;
-}
-
-.signal-title {
-    font-size: 14px;
-    color: #8995a6;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-.signal-value {
-    font-size: 38px;
-    font-weight: 900;
-    margin-top: 5px;
-}
-
-.price-value {
-    font-size: 27px;
-    font-weight: 800;
-}
-
-.metric-card {
-    padding: 18px;
-    border-radius: 12px;
-    background: #0d131c;
-    border: 1px solid #1c2735;
-}
-
-.metric-label {
-    color: #8d99aa;
-    font-size: 12px;
-    text-transform: uppercase;
-}
-
-.metric-value {
-    font-size: 21px;
-    font-weight: 800;
-    margin-top: 4px;
-}
-
-.section-title {
-    font-size: 18px;
-    font-weight: 800;
-    margin-top: 12px;
-    margin-bottom: 12px;
-}
-
-.info-box {
-    padding: 15px;
-    border-radius: 10px;
-    background: #0c141e;
-    border: 1px solid #203044;
-}
-
+.block-container{max-width:1700px;padding:1.15rem 2rem 2rem}
+[data-testid="stSidebar"]{background:#080d14;border-right:1px solid #182231}
+[data-testid="stSidebar"] *{color:#e9eef6}
+.stApp{background:radial-gradient(circle at 75% -10%,#172235 0%,#080c12 42%)}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:18px}
+.brand{font-size:30px;font-weight:900}.brand span{color:#7c8cff}.subtitle{color:#8190a5;font-size:13px;margin-top:3px}
+.live{display:inline-flex;gap:7px;align-items:center;padding:6px 10px;border:1px solid #284236;border-radius:999px;background:#0c1914;color:#8fe0b2;font-size:12px;font-weight:700}
+.dot{width:7px;height:7px;border-radius:50%;background:#4bd58b;box-shadow:0 0 12px #4bd58b}
+.signal{border-radius:18px;padding:22px 24px;background:linear-gradient(135deg,#111b2a,#0b111a);border:1px solid #263448;margin-bottom:14px}
+.signal.long{border-color:#1c8f60;box-shadow:0 0 35px rgba(35,170,111,.08)}.signal.short{border-color:#a23c4d;box-shadow:0 0 35px rgba(220,67,91,.08)}.signal.wait{border-color:#344153}
+.signal-label{color:#8794a6;font-size:11px;font-weight:800;letter-spacing:1.1px}.signal-name{font-size:42px;line-height:1.05;font-weight:950;margin:6px 0 5px}.signal-meta{color:#9ba7b8;font-size:13px}.big-price{font-size:29px;font-weight:850}
+.kpi{background:#0d141e;border:1px solid #1d2939;border-radius:13px;padding:15px 16px;min-height:88px}.kpi-label{color:#7f8c9f;font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:800}.kpi-value{color:#f1f5fa;font-size:22px;font-weight:850;margin-top:5px}.kpi-sub{color:#7f8c9f;font-size:11px;margin-top:2px}
+.trade-row{background:#0c131d;border:1px solid #1d2938;border-radius:12px;padding:13px;text-align:center}.trade-label{color:#7f8c9e;font-size:10px;font-weight:800;letter-spacing:.8px}.trade-value{font-size:18px;font-weight:850;margin-top:4px}
+.section{font-size:16px;font-weight:850;margin:20px 0 10px}.model-box{background:linear-gradient(145deg,#101a29,#0b1119);border:1px solid #29374a;border-radius:15px;padding:17px}.panel-title{color:#8c99aa;font-size:11px;font-weight:800;letter-spacing:1.25px;text-transform:uppercase}.progress{height:8px;border-radius:99px;background:#1b2635;overflow:hidden;margin-top:8px}.progress>div{height:100%;border-radius:99px;background:#7586ff}.small{color:#7e8b9d;font-size:11px}.good{color:#62d69b!important}.bad{color:#f17c8d!important}.neutral{color:#aab5c4!important}
+div[data-testid="stMetric"]{background:#0d141e;border:1px solid #1d2939;padding:12px;border-radius:12px}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def safe_float(value, default=0.0):
+# --------------------------- helpers -------------------------
+def f(v: Any, default: float=0.0) -> float:
     try:
-        value = float(value)
-        if np.isfinite(value):
-            return value
-    except Exception:
-        pass
+        x=float(v); return x if np.isfinite(x) else default
+    except Exception: return default
 
-    return default
+def clamp(v: Any, low: float=-1.0, high: float=1.0) -> float: return float(np.clip(f(v),low,high))
+def price(v: Any) -> str:
+    x=f(v)
+    if x<=0:return "—"
+    if x>=1000:return f"{x:,.2f}"
+    if x>=1:return f"{x:,.4f}"
+    return f"{x:.6f}"
+def now_utc(): return dt.datetime.now(dt.timezone.utc)
+def signal_class(d): return "long" if "LONG" in str(d).upper() else "short" if "SHORT" in str(d).upper() else "wait"
+def bias(v):
+    x=f(v)
+    return ("BULLISH","good") if x>.25 else ("BEARISH","bad") if x<-.25 else ("NEUTRAL","neutral")
+def pred_direction(p):
+    try:return "LONG" if int(p)==1 else "SHORT"
+    except:return "UNKNOWN"
 
-
-def clamp(value, low=-1.0, high=1.0):
-    return float(np.clip(safe_float(value), low, high))
-
-
-def now_utc():
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def iso_now():
-    return now_utc().isoformat()
-
-
-def fmt_price(value):
-    value = safe_float(value)
-
-    if value <= 0:
-        return "—"
-
-    if value >= 1000:
-        return f"{value:,.2f}"
-
-    if value >= 1:
-        return f"{value:,.4f}"
-
-    return f"{value:.6f}"
-
-
-def fmt_pct(value):
-    return f"{safe_float(value):.2f}%"
-
-
-def normalize_confidence(value):
-    value = safe_float(value)
-
-    if value <= 1.0:
-        value *= 100.0
-
-    return float(np.clip(value, 0, 100))
-
-
-def direction_class(direction):
-    direction = str(direction).upper()
-
-    if "LONG" in direction:
-        return "signal-long"
-
-    if "SHORT" in direction:
-        return "signal-short"
-
-    return "signal-wait"
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def binance_get(endpoint, params=None):
-
+# --------------------------- Binance --------------------------
+def api_get(url, params=None):
     try:
-        response = requests.get(
-            endpoint,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent": "ZIA-RESEARCH-LAB/2.0"
-            },
-        )
+        r=requests.get(url,params=params,timeout=REQUEST_TIMEOUT,headers={"User-Agent":"ZIA-RESEARCH-LAB"})
+        r.raise_for_status(); return r.json()
+    except Exception:return None
 
-        response.raise_for_status()
+@st.cache_data(ttl=7,show_spinner=False)
+def klines(symbol,interval,limit=260):
+    raw=api_get(KLINES_URL,{"symbol":symbol,"interval":interval,"limit":limit})
+    if not isinstance(raw,list):return pd.DataFrame()
+    rows=[]
+    for c in raw:
+        try:rows.append({"Time":pd.to_datetime(int(c[0]),unit="ms",utc=True),"Open":float(c[1]),"High":float(c[2]),"Low":float(c[3]),"Close":float(c[4]),"Volume":float(c[5]),"Trades":int(c[8]),"TakerBuy":float(c[9])})
+        except Exception:pass
+    return pd.DataFrame(rows).dropna().reset_index(drop=True) if rows else pd.DataFrame()
 
-        data = response.json()
+@st.cache_data(ttl=2,show_spinner=False)
+def orderbook(symbol,limit=100):
+    raw=api_get(DEPTH_URL,{"symbol":symbol,"limit":limit})
+    if not isinstance(raw,dict):return np.empty((0,2)),np.empty((0,2))
+    try:
+        b=np.asarray(raw.get("bids",[]),dtype=float); a=np.asarray(raw.get("asks",[]),dtype=float)
+        if b.ndim!=2:b=np.empty((0,2))
+        if a.ndim!=2:a=np.empty((0,2))
+        return b,a
+    except Exception:return np.empty((0,2)),np.empty((0,2))
 
-        return data
+@st.cache_data(ttl=4,show_spinner=False)
+def ticker(symbol):
+    raw=api_get(TICKER_URL,{"symbol":symbol}); return raw if isinstance(raw,dict) else {}
 
-    except Exception:
-        return None
+@st.cache_data(ttl=3,show_spinner=False)
+def agg_trades(symbol,limit=1000):
+    raw=api_get(AGG_TRADES_URL,{"symbol":symbol,"limit":limit}); return raw if isinstance(raw,list) else []
 
+# --------------------------- research math --------------------
+def obi(bids,asks,levels):
+    n=min(len(bids),len(asks),levels)
+    if n<=0:return 0.0
+    bv=max(0.0,float(bids[:n,1].sum())); av=max(0.0,float(asks[:n,1].sum())); total=bv+av
+    return clamp((bv-av)/total) if total else 0.0
 
-# ============================================================
-# FUTURES KLINES
-# ============================================================
+def weighted_obi(bids,asks,levels=20):
+    n=min(len(bids),len(asks),levels)
+    if n<=0:return 0.0
+    w=1/(np.arange(n)+1.0); bv=float((bids[:n,1]*w).sum()); av=float((asks[:n,1]*w).sum())
+    return clamp((bv-av)/(bv+av)) if bv+av else 0.0
 
-@st.cache_data(
-    ttl=8,
-    show_spinner=False,
-)
-def fetch_klines(
-    symbol: str,
-    interval: str,
-    limit: int = 250,
-):
+def depth(bids,asks,levels):
+    n=min(len(bids),len(asks),levels)
+    return (float(bids[:n,1].sum()),float(asks[:n,1].sum())) if n else (0.0,0.0)
 
-    data = binance_get(
-        BINANCE_KLINES,
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        },
-    )
-
-    if not isinstance(data, list):
-        return pd.DataFrame()
-
-    rows = []
-
-    for candle in data:
-
-        if len(candle) < 12:
-            continue
-
+def taker_flow(trades):
+    buy=sell=0.0; count=0
+    for t in trades:
         try:
-
-            rows.append(
-                {
-                    "Time": pd.to_datetime(
-                        int(candle[0]),
-                        unit="ms",
-                        utc=True,
-                    ),
-                    "Open": float(candle[1]),
-                    "High": float(candle[2]),
-                    "Low": float(candle[3]),
-                    "Close": float(candle[4]),
-                    "Volume": float(candle[5]),
-                    "Trades": int(candle[8]),
-                    "Taker_Buy_Base": float(candle[9]),
-                    "Taker_Buy_Quote": float(candle[10]),
-                }
-            )
-
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-
-    return df.dropna().reset_index(drop=True)
-
-
-# ============================================================
-# FUTURES ORDER BOOK
-# ============================================================
-
-@st.cache_data(
-    ttl=2,
-    show_spinner=False,
-)
-def fetch_orderbook(
-    symbol: str,
-    limit: int = 100,
-):
-
-    data = binance_get(
-        BINANCE_DEPTH,
-        {
-            "symbol": symbol,
-            "limit": limit,
-        },
-    )
-
-    if not isinstance(data, dict):
-        return (
-            np.empty((0, 2)),
-            np.empty((0, 2)),
-        )
-
-    try:
-
-        bids = np.asarray(
-            data.get("bids", []),
-            dtype=np.float64,
-        )
-
-        asks = np.asarray(
-            data.get("asks", []),
-            dtype=np.float64,
-        )
-
-        if bids.ndim != 2:
-            bids = np.empty((0, 2))
-
-        if asks.ndim != 2:
-            asks = np.empty((0, 2))
-
-        return bids, asks
-
-    except Exception:
-
-        return (
-            np.empty((0, 2)),
-            np.empty((0, 2)),
-        )
-
-
-# ============================================================
-# FUTURES TICKER
-# ============================================================
-
-@st.cache_data(
-    ttl=5,
-    show_spinner=False,
-)
-def fetch_ticker(symbol):
-
-    data = binance_get(
-        BINANCE_TICKER,
-        {
-            "symbol": symbol,
-        },
-    )
-
-    return data if isinstance(data, dict) else {}
-
-
-# ============================================================
-# FUTURES AGG TRADES
-# ============================================================
-
-@st.cache_data(
-    ttl=3,
-    show_spinner=False,
-)
-def fetch_agg_trades(
-    symbol,
-    limit=1000,
-):
-
-    data = binance_get(
-        BINANCE_AGG_TRADES,
-        {
-            "symbol": symbol,
-            "limit": limit,
-        },
-    )
-
-    return data if isinstance(data, list) else []
-
-
-# ============================================================
-# OBI
-# ============================================================
-
-def calculate_obi(
-    bids,
-    asks,
-    levels=20,
-):
-
-    if len(bids) == 0 or len(asks) == 0:
-        return 0.0
-
-    n = min(
-        levels,
-        len(bids),
-        len(asks),
-    )
-
-    bid_volume = np.sum(
-        np.maximum(
-            bids[:n, 1],
-            0,
-        )
-    )
-
-    ask_volume = np.sum(
-        np.maximum(
-            asks[:n, 1],
-            0,
-        )
-    )
-
-    total = bid_volume + ask_volume
-
-    if total <= 0:
-        return 0.0
-
-    return clamp(
-        (bid_volume - ask_volume)
-        / total
-    )
-
-
-def calculate_weighted_obi(
-    bids,
-    asks,
-    levels=20,
-):
-
-    if len(bids) == 0 or len(asks) == 0:
-        return 0.0
-
-    n = min(
-        levels,
-        len(bids),
-        len(asks),
-    )
-
-    weights = 1.0 / (
-        np.arange(n) + 1.0
-    )
-
-    bid_volume = np.sum(
-        bids[:n, 1] * weights
-    )
-
-    ask_volume = np.sum(
-        asks[:n, 1] * weights
-    )
-
-    total = bid_volume + ask_volume
-
-    if total <= 0:
-        return 0.0
-
-    return clamp(
-        (bid_volume - ask_volume)
-        / total
-    )
-
-
-def calculate_multi_obi(
-    bids,
-    asks,
-):
-
-    values = {
-        5: calculate_obi(bids, asks, 5),
-        10: calculate_obi(bids, asks, 10),
-        20: calculate_obi(bids, asks, 20),
-        50: calculate_obi(bids, asks, 50),
-    }
-
-    # Stronger weight on top 20 / 50
-    score = (
-        values[5] * 0.15
-        + values[10] * 0.20
-        + values[20] * 0.35
-        + values[50] * 0.30
-    )
-
-    return clamp(score)
-
-
-# ============================================================
-# DEPTH
-# ============================================================
-
-def depth_volume(
-    bids,
-    asks,
-    levels,
-):
-
-    if len(bids) < levels or len(asks) < levels:
-        return 0.0, 0.0
-
-    bid_sum = float(
-        np.sum(
-            bids[:levels, 1]
-        )
-    )
-
-    ask_sum = float(
-        np.sum(
-            asks[:levels, 1]
-        )
-    )
-
-    return bid_sum, ask_sum
-
-
-# ============================================================
-# TAKER FLOW
-# ============================================================
-
-def calculate_taker_flow(trades):
-
-    buy_volume = 0.0
-    sell_volume = 0.0
-
-    buy_notional = 0.0
-    sell_notional = 0.0
-
-    count = 0
-
-    for trade in trades:
-
-        try:
-
-            price = float(trade["p"])
-            qty = float(trade["q"])
-            maker = bool(trade["m"])
-
-            notional = price * qty
-
-            if maker:
-                sell_volume += qty
-                sell_notional += notional
-            else:
-                buy_volume += qty
-                buy_notional += notional
-
-            count += 1
-
-        except Exception:
-            continue
-
-    total = buy_volume + sell_volume
-
-    if total <= 0:
-        ratio = 0.0
-    else:
-        ratio = (
-            buy_volume - sell_volume
-        ) / total
-
-    return {
-        "buy_volume": buy_volume,
-        "sell_volume": sell_volume,
-        "buy_notional": buy_notional,
-        "sell_notional": sell_notional,
-        "flow": buy_volume - sell_volume,
-        "ratio": clamp(ratio),
-        "count": count,
-    }
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def calculate_atr(
-    df,
-    period=14,
-):
-
-    if df is None or len(df) < 2:
-        return 0.0
-
-    previous_close = df["Close"].shift(1)
-
-    tr = pd.concat(
-        [
-            df["High"] - df["Low"],
-            (
-                df["High"]
-                - previous_close
-            ).abs(),
-            (
-                df["Low"]
-                - previous_close
-            ).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr = tr.ewm(
-        alpha=1.0 / period,
-        adjust=False,
-    ).mean()
-
-    return max(
-        0.0,
-        safe_float(
-            atr.iloc[-1]
-        ),
-    )
-
-
-# ============================================================
-# TECHNICAL FEATURES
-# ============================================================
-
-def technical_features(df):
-
-    if df.empty:
-        return {}
-
-    close = df["Close"]
-
-    ema20 = close.ewm(
-        span=20,
-        adjust=False,
-    ).mean()
-
-    ema50 = close.ewm(
-        span=50,
-        adjust=False,
-    ).mean()
-
-    ema200 = close.ewm(
-        span=200,
-        adjust=False,
-    ).mean()
-
-    sma20 = close.rolling(
-        20,
-        min_periods=5,
-    ).mean()
-
-    returns = close.pct_change()
-
-    volatility = (
-        returns
-        .rolling(20)
-        .std()
-        .iloc[-1]
-    )
-
-    momentum_5 = (
-        close.iloc[-1]
-        / close.iloc[-6]
-        - 1
-        if len(close) >= 6
-        else 0
-    )
-
-    momentum_20 = (
-        close.iloc[-1]
-        / close.iloc[-21]
-        - 1
-        if len(close) >= 21
-        else 0
-    )
-
-    price = safe_float(
-        close.iloc[-1]
-    )
-
-    trend_score = 0.0
-
-    if price > safe_float(ema20.iloc[-1]):
-        trend_score += 0.30
-    else:
-        trend_score -= 0.30
-
-    if price > safe_float(ema50.iloc[-1]):
-        trend_score += 0.25
-    else:
-        trend_score -= 0.25
-
-    if price > safe_float(ema200.iloc[-1]):
-        trend_score += 0.20
-    else:
-        trend_score -= 0.20
-
-    trend_score += clamp(
-        momentum_20 * 20,
-        -0.25,
-        0.25,
-    )
-
-    return {
-        "price": price,
-        "ema20": safe_float(
-            ema20.iloc[-1]
-        ),
-        "ema50": safe_float(
-            ema50.iloc[-1]
-        ),
-        "ema200": safe_float(
-            ema200.iloc[-1]
-        ),
-        "sma20": safe_float(
-            sma20.iloc[-1]
-        ),
-        "volatility": safe_float(
-            volatility
-        ),
-        "momentum_5": safe_float(
-            momentum_5
-        ),
-        "momentum_20": safe_float(
-            momentum_20
-        ),
-        "trend_score": clamp(
-            trend_score
-        ),
-    }
-
-
-# ============================================================
-# HIGHER TIMEFRAME CONFIRMATION
-# ============================================================
-
-@st.cache_data(
-    ttl=10,
-    show_spinner=False,
-)
-def higher_timeframe_bias(symbol):
-
-    timeframes = [
-        "1h",
-        "4h",
-        "1d",
-    ]
-
-    result = {}
-
-    for tf in timeframes:
-
-        df = fetch_klines(
-            symbol,
-            tf,
-            100,
-        )
-
-        if df.empty:
-            result[tf] = 0.0
-            continue
-
-        close = df["Close"]
-
-        ema20 = close.ewm(
-            span=20,
-            adjust=False,
-        ).mean()
-
-        ema50 = close.ewm(
-            span=50,
-            adjust=False,
-        ).mean()
-
-        price = safe_float(
-            close.iloc[-1]
-        )
-
-        score = 0.0
-
-        if price > safe_float(
-            ema20.iloc[-1]
-        ):
-            score += 0.5
-        else:
-            score -= 0.5
-
-        if price > safe_float(
-            ema50.iloc[-1]
-        ):
-            score += 0.5
-        else:
-            score -= 0.5
-
-        result[tf] = clamp(score)
-
-    return result
-
-
-# ============================================================
-# XGBOOST
-# ============================================================
-
-@st.cache_resource(
-    show_spinner=False,
-)
+            q=float(t["q"])
+            if bool(t["m"]):sell+=q
+            else:buy+=q
+            count+=1
+        except Exception:pass
+    total=buy+sell
+    return {"buy":buy,"sell":sell,"flow":buy-sell,"ratio":clamp((buy-sell)/total) if total else 0.0,"count":count}
+
+def technical(df):
+    if df.empty:return {}
+    c=df["Close"]; e20=c.ewm(span=20,adjust=False).mean(); e50=c.ewm(span=50,adjust=False).mean(); e200=c.ewm(span=200,adjust=False).mean()
+    m5=f(c.iloc[-1]/c.iloc[-6]-1) if len(c)>=6 else 0.0; m20=f(c.iloc[-1]/c.iloc[-21]-1) if len(c)>=21 else 0.0
+    p=f(c.iloc[-1]); trend=(.30 if p>f(e20.iloc[-1]) else -.30)+(.25 if p>f(e50.iloc[-1]) else -.25)+(.20 if p>f(e200.iloc[-1]) else -.20)+clamp(m20*20,-.25,.25)
+    return {"price":p,"ema20":f(e20.iloc[-1]),"ema50":f(e50.iloc[-1]),"ema200":f(e200.iloc[-1]),"momentum5":m5,"momentum20":m20,"volatility":f(c.pct_change().rolling(20).std().iloc[-1]),"trend":clamp(trend)}
+
+def calc_atr(df,period=14):
+    if len(df)<2:return 0.0
+    prev=df["Close"].shift(1); tr=pd.concat([df["High"]-df["Low"],(df["High"]-prev).abs(),(df["Low"]-prev).abs()],axis=1).max(axis=1)
+    return max(0.0,f(tr.ewm(alpha=1/period,adjust=False).mean().iloc[-1]))
+
+@st.cache_data(ttl=12,show_spinner=False)
+def htf_bias(symbol):
+    out={}
+    for tf in ["1h","4h","1d"]:
+        d=klines(symbol,tf,120)
+        if d.empty:out[tf]=0.0; continue
+        c=d["Close"]; e20=c.ewm(span=20,adjust=False).mean().iloc[-1]; e50=c.ewm(span=50,adjust=False).mean().iloc[-1]; p=f(c.iloc[-1])
+        out[tf]=(.5 if p>f(e20) else -.5)+(.5 if p>f(e50) else -.5)
+    return out
+
+# --------------------------- ML connection -------------------
+@st.cache_resource(show_spinner=False)
 def load_model():
+    if not MODEL_FILE.exists():return None,"Model file not found"
+    try:return joblib.load(MODEL_FILE),"Loaded"
+    except Exception as e:return None,f"Load error: {type(e).__name__}"
 
-    if not MODEL_FILE.exists():
-        return None
-
+def predict_ml(model,features):
+    if model is None:return None
     try:
-        return joblib.load(
-            MODEL_FILE
-        )
-    except Exception:
-        return None
-
-
-def model_signal(
-    model,
-    features,
-):
-
-    if model is None:
-        return None
-
-    try:
-
-        expected = getattr(
-            model,
-            "n_features_in_",
-            None,
-        )
-
-        if expected is not None:
-
-            if expected != len(features):
-                return None
-
-        X = np.asarray(
-            [features],
-            dtype=float,
-        )
-
-        prediction = model.predict(X)[0]
-
-        confidence = 0.50
-
-        if hasattr(
-            model,
-            "predict_proba",
-        ):
-
-            probs = model.predict_proba(X)[0]
-
-            confidence = float(
-                np.max(probs)
-            )
-
-        return {
-            "prediction": int(
-                prediction
-            ),
-            "confidence": confidence,
-        }
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-def generate_signal(
-    df,
-    bids,
-    asks,
-    symbol,
-    mode,
-):
-
-    tech = technical_features(
-        df
-    )
-
-    if not tech:
-        return None
-
-    ticker = fetch_ticker(
-        symbol
-    )
-
-    trades = fetch_agg_trades(
-        symbol,
-        1000,
-    )
-
-    flow = calculate_taker_flow(
-        trades
-    )
-
-    obi5 = calculate_obi(
-        bids,
-        asks,
-        5,
-    )
-
-    obi10 = calculate_obi(
-        bids,
-        asks,
-        10,
-    )
-
-    obi20 = calculate_obi(
-        bids,
-        asks,
-        20,
-    )
-
-    obi50 = calculate_obi(
-        bids,
-        asks,
-        50,
-    )
-
-    weighted_obi = calculate_weighted_obi(
-        bids,
-        asks,
-        20,
-    )
-
-    multi_obi = calculate_multi_obi(
-        bids,
-        asks,
-    )
-
-    bid20, ask20 = depth_volume(
-        bids,
-        asks,
-        20,
-    )
-
-    bid50, ask50 = depth_volume(
-        bids,
-        asks,
-        50,
-    )
-
-    total20 = bid20 + ask20
-
-    spread = 0.0
-
-    if len(bids) > 0 and len(asks) > 0:
-
-        spread = (
-            asks[0, 0]
-            - bids[0, 0]
-        )
-
-    # --------------------------------------------------------
-    # XGBOOST FEATURE SET
-    # IMPORTANT:
-    # Existing model expects 7 features.
-    # --------------------------------------------------------
-
-    xgb_features = [
-        bid20,
-        ask20,
-        obi20,
-        spread,
-        (
-            bid20 / ask20
-            if ask20 > 0
-            else 0.0
-        ),
-        total20,
-        tech["trend_score"],
-    ]
-
-    model = load_model()
-
-    ml = model_signal(
-        model,
-        xgb_features,
-    )
-
-    # --------------------------------------------------------
-    # BASE QUANT SCORE
-    # --------------------------------------------------------
-
-    score = 0.0
-
-    # Order book
-    score += multi_obi * 0.30
-
-    # Aggressive flow
-    score += flow["ratio"] * 0.25
-
-    # Trend
-    score += tech["trend_score"] * 0.25
-
-    # Short momentum
-    score += clamp(
-        tech["momentum_5"] * 30,
-        -1,
-        1,
-    ) * 0.10
-
-    # Medium momentum
-    score += clamp(
-        tech["momentum_20"] * 15,
-        -1,
-        1,
-    ) * 0.10
-
-    # --------------------------------------------------------
-    # HIGHER TF CONFIRMATION
-    # --------------------------------------------------------
-
-    htf = higher_timeframe_bias(
-        symbol
-    )
-
-    htf_score = (
-        htf.get("1h", 0.0) * 0.45
-        + htf.get("4h", 0.0) * 0.35
-        + htf.get("1d", 0.0) * 0.20
-    )
-
-    score += htf_score * 0.20
-
-    # Keep score bounded
-    score = clamp(
-        score,
-        -1,
-        1,
-    )
-
-    # --------------------------------------------------------
-    # ML VOTE
-    # --------------------------------------------------------
-
-    ml_score = 0.0
-    ml_confidence = 0.50
-
-    if ml is not None:
-
-        ml_confidence = safe_float(
-            ml["confidence"],
-            0.50,
-        )
-
-        if ml["prediction"] == 1:
-            ml_score = 1.0
-        else:
-            ml_score = -1.0
-
-        # Only allow meaningful ML contribution
-        ml_weight = min(
-            0.25,
-            ml_confidence * 0.25,
-        )
-
-        score = clamp(
-            score
-            + ml_score * ml_weight
-        )
-
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    raw_confidence = (
-        abs(score) * 55
-        + abs(multi_obi) * 20
-        + abs(flow["ratio"]) * 15
-        + abs(htf_score) * 10
-    )
-
-    if ml is not None:
-        raw_confidence = (
-            raw_confidence * 0.75
-            + (
-                ml_confidence
-                * 100
-            ) * 0.25
-        )
-
-    confidence = float(
-        np.clip(
-            raw_confidence,
-            0,
-            99,
-        )
-    )
-
-    # --------------------------------------------------------
-    # SIGNAL THRESHOLDS
-    # --------------------------------------------------------
-
-    if (
-        score >= 0.70
-        and confidence >= 70
-    ):
-        direction = "STRONG LONG"
-
-    elif (
-        score >= 0.42
-        and confidence >= 55
-    ):
-        direction = "LONG"
-
-    elif (
-        score <= -0.70
-        and confidence >= 70
-    ):
-        direction = "STRONG SHORT"
-
-    elif (
-        score <= -0.42
-        and confidence >= 55
-    ):
-        direction = "SHORT"
-
-    else:
-        direction = "WAIT"
-
-    # --------------------------------------------------------
-    # ATR SL / TP
-    # --------------------------------------------------------
-
-    atr = calculate_atr(
-        df,
-        14,
-    )
-
-    price = tech["price"]
-
-    if atr <= 0:
-        atr = price * 0.005
-
-    # Risk adjusted to volatility
-    sl_distance = max(
-        atr * 1.15,
-        price * 0.0025,
-    )
-
-    # Hard cap at 0.6%
-    sl_distance = min(
-        sl_distance,
-        price * 0.006,
-    )
-
-    # Minimum 1:2 RR
-    tp_distance = sl_distance * 2.0
-
-    if direction in (
-        "LONG",
-        "STRONG LONG",
-    ):
-
-        entry = price
-        stop_loss = entry - sl_distance
-        target1 = entry + tp_distance
-        target2 = entry + (
-            sl_distance * 3.0
-        )
-
-    elif direction in (
-        "SHORT",
-        "STRONG SHORT",
-    ):
-
-        entry = price
-        stop_loss = entry + sl_distance
-        target1 = entry - tp_distance
-        target2 = entry - (
-            sl_distance * 3.0
-        )
-
-    else:
-
-        entry = price
-        stop_loss = entry
-        target1 = entry
-        target2 = entry
-
-    # --------------------------------------------------------
-    # TICKER
-    # --------------------------------------------------------
-
-    change_24h = safe_float(
-        ticker.get(
-            "priceChangePercent",
-            0,
-        )
-    )
-
-    volume_24h = safe_float(
-        ticker.get(
-            "quoteVolume",
-            0,
-        )
-    )
-
-    return {
-        "symbol": symbol,
-        "mode": mode,
-        "timestamp": iso_now(),
-
-        "direction": direction,
-        "score": score,
-        "confidence": confidence,
-
-        "price": price,
-
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "target1": target1,
-        "target2": target2,
-
-        "atr": atr,
-
-        "obi5": obi5,
-        "obi10": obi10,
-        "obi20": obi20,
-        "obi50": obi50,
-        "weighted_obi": weighted_obi,
-        "multi_obi": multi_obi,
-
-        "bid20": bid20,
-        "ask20": ask20,
-        "bid50": bid50,
-        "ask50": ask50,
-
-        "spread": spread,
-
-        "taker_buy": flow["buy_volume"],
-        "taker_sell": flow["sell_volume"],
-        "taker_flow": flow["flow"],
-        "taker_flow_ratio": flow["ratio"],
-        "trade_count": flow["count"],
-
-        "trend_score": tech["trend_score"],
-        "momentum_5": tech["momentum_5"],
-        "momentum_20": tech["momentum_20"],
-
-        "ema20": tech["ema20"],
-        "ema50": tech["ema50"],
-        "ema200": tech["ema200"],
-
-        "volatility": tech["volatility"],
-
-        "htf_1h": htf.get("1h", 0.0),
-        "htf_4h": htf.get("4h", 0.0),
-        "htf_1d": htf.get("1d", 0.0),
-
-        "ml_available": ml is not None,
-        "ml_confidence": ml_confidence,
-
-        "change_24h": change_24h,
-        "volume_24h": volume_24h,
-    }
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-def load_history():
-
-    if not HISTORY_FILE.exists():
-        return []
-
-    try:
-
-        df = pd.read_csv(
-            HISTORY_FILE
-        )
-
-        if df.empty:
-            return []
-
-        return df.tail(
-            300
-        ).to_dict(
-            "records"
-        )
-
-    except Exception:
-        return []
-
-
-def save_signal(signal):
-
-    if signal is None:
-        return
-
-    row = {
-        "timestamp": signal["timestamp"],
-        "symbol": signal["symbol"],
-        "mode": signal["mode"],
-        "direction": signal["direction"],
-        "score": signal["score"],
-        "confidence": signal["confidence"],
-        "entry": signal["entry"],
-        "stop_loss": signal["stop_loss"],
-        "target1": signal["target1"],
-        "target2": signal["target2"],
-        "obi20": signal["obi20"],
-        "obi50": signal["obi50"],
-        "taker_flow_ratio": signal[
-            "taker_flow_ratio"
-        ],
-    }
-
-    try:
-
-        exists = HISTORY_FILE.exists()
-
-        pd.DataFrame(
-            [row]
-        ).to_csv(
-            HISTORY_FILE,
-            mode="a",
-            header=not exists,
-            index=False,
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# CHART
-# ============================================================
-
-def create_chart(
-    df,
-    signal,
-):
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df["Time"],
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
-        )
-    )
-
-    ema20 = df["Close"].ewm(
-        span=20,
-        adjust=False,
-    ).mean()
-
-    ema50 = df["Close"].ewm(
-        span=50,
-        adjust=False,
-    ).mean()
-
-    fig.add_trace(
-        go.Scatter(
-            x=df["Time"],
-            y=ema20,
-            name="EMA 20",
-            line=dict(
-                width=1
-            ),
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df["Time"],
-            y=ema50,
-            name="EMA 50",
-            line=dict(
-                width=1
-            ),
-        )
-    )
-
-    if signal is not None:
-
-        entry = signal["entry"]
-        sl = signal["stop_loss"]
-        tp1 = signal["target1"]
-        tp2 = signal["target2"]
-
-        fig.add_hline(
-            y=entry,
-            annotation_text="ENTRY",
-            line_dash="solid",
-        )
-
-        if signal["direction"] != "WAIT":
-
-            fig.add_hline(
-                y=sl,
-                annotation_text="STOP LOSS",
-                line_dash="dot",
-            )
-
-            fig.add_hline(
-                y=tp1,
-                annotation_text="TARGET 1",
-                line_dash="dash",
-            )
-
-            fig.add_hline(
-                y=tp2,
-                annotation_text="TARGET 2",
-                line_dash="dash",
-            )
-
-    fig.update_layout(
-        height=520,
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        margin=dict(
-            l=10,
-            r=10,
-            t=30,
-            b=10,
-        ),
-        legend=dict(
-            orientation="h"
-        ),
-    )
-
+        expected=getattr(model,"n_features_in_",None)
+        if expected is not None and int(expected)!=len(features):return {"error":f"Model expects {expected} features; dashboard supplied {len(features)}"}
+        X=np.asarray([features],dtype=float); p=int(model.predict(X)[0]); out={"prediction":p,"direction":pred_direction(p)}
+        if hasattr(model,"predict_proba"):
+            probs=np.asarray(model.predict_proba(X)[0],dtype=float); out["probabilities"]=probs.tolist(); out["confidence"]=float(np.max(probs)); out["classes"]=np.asarray(getattr(model,"classes_",range(len(probs)))).tolist()
+        else:out["confidence"]=.5
+        return out
+    except Exception as e:return {"error":f"Prediction error: {type(e).__name__}"}
+
+def build_signal(df,bids,asks,symbol,mode_key):
+    tech=technical(df)
+    if not tech:return None
+    flow=taker_flow(agg_trades(symbol)); o5,o10,o20,o50=[obi(bids,asks,n) for n in (5,10,20,50)]; wobi=weighted_obi(bids,asks,20)
+    multi=clamp(o5*.15+o10*.20+o20*.35+o50*.30); bid20,ask20=depth(bids,asks,20); bid50,ask50=depth(bids,asks,50); spread=f(asks[0,0]-bids[0,0]) if len(bids) and len(asks) else 0.0; ratio=bid20/ask20 if ask20>0 else 0.0
+    ml_features=[bid20,ask20,o20,spread,ratio,bid20+ask20,tech["trend"]]
+    model,model_status=load_model(); ml=predict_ml(model,ml_features)
+    score=multi*.30+flow["ratio"]*.25+tech["trend"]*.25+clamp(tech["momentum5"]*30)*.10+clamp(tech["momentum20"]*15)*.10
+    htf=htf_bias(symbol); hscore=htf.get("1h",0)*.45+htf.get("4h",0)*.35+htf.get("1d",0)*.20; score=clamp(score+hscore*.20)
+    ml_conf=f(ml.get("confidence",.5),.5) if ml and "error" not in ml else .5
+    if ml and "error" not in ml:score=clamp(score+(1 if ml["prediction"]==1 else -1)*min(.25,ml_conf*.25))
+    conf=abs(score)*55+abs(multi)*20+abs(flow["ratio"])*15+abs(hscore)*10
+    if ml and "error" not in ml:conf=conf*.75+ml_conf*100*.25
+    confidence=float(np.clip(conf,0,99))
+    if score>=.70 and confidence>=70:direction="STRONG LONG"
+    elif score>=.42 and confidence>=55:direction="LONG"
+    elif score<=-.70 and confidence>=70:direction="STRONG SHORT"
+    elif score<=-.42 and confidence>=55:direction="SHORT"
+    else:direction="WAIT"
+    a=calc_atr(df) or tech["price"]*.005; sd=min(max(a*1.15,tech["price"]*.0025),tech["price"]*.006); entry=tech["price"]
+    if "LONG" in direction:sl,tp1,tp2=entry-sd,entry+sd*2,entry+sd*3
+    elif "SHORT" in direction:sl,tp1,tp2=entry+sd,entry-sd*2,entry-sd*3
+    else:sl=tp1=tp2=entry
+    tk=ticker(symbol)
+    return {"timestamp":now_utc().isoformat(),"symbol":symbol,"mode":mode_key,"direction":direction,"score":score,"confidence":confidence,"price":entry,"entry":entry,"stop_loss":sl,"target1":tp1,"target2":tp2,"atr":a,"obi5":o5,"obi10":o10,"obi20":o20,"obi50":o50,"weighted_obi":wobi,"multi_obi":multi,"bid20":bid20,"ask20":ask20,"bid50":bid50,"ask50":ask50,"spread":spread,"taker_buy":flow["buy"],"taker_sell":flow["sell"],"taker_flow":flow["flow"],"taker_flow_ratio":flow["ratio"],"trade_count":flow["count"],"trend":tech["trend"],"momentum5":tech["momentum5"],"momentum20":tech["momentum20"],"ema20":tech["ema20"],"ema50":tech["ema50"],"ema200":tech["ema200"],"volatility":tech["volatility"],"htf_1h":htf.get("1h",0),"htf_4h":htf.get("4h",0),"htf_1d":htf.get("1d",0),"ml":ml,"ml_available":ml is not None and "error" not in ml,"ml_confidence":ml_conf,"ml_features":ml_features,"model_status":model_status,"change24":f(tk.get("priceChangePercent")),"volume24":f(tk.get("quoteVolume"))}
+
+# --------------------------- persistence ----------------------
+def save_signal(s):
+    if s["direction"]=="WAIT":return
+    row={k:s.get(k) for k in ["timestamp","symbol","mode","direction","score","confidence","entry","stop_loss","target1","target2","obi20","obi50","taker_flow_ratio"]}
+    try:pd.DataFrame([row]).to_csv(HISTORY_FILE,mode="a",header=not HISTORY_FILE.exists(),index=False)
+    except Exception:pass
+
+def read_history():
+    try:return pd.read_csv(HISTORY_FILE).tail(300) if HISTORY_FILE.exists() else pd.DataFrame()
+    except Exception:return pd.DataFrame()
+
+# --------------------------- charts ---------------------------
+def price_chart(df,s):
+    d=df.tail(180); fig=go.Figure(); fig.add_trace(go.Candlestick(x=d["Time"],open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],name="Price"))
+    for span,name in [(20,"EMA 20"),(50,"EMA 50"),(200,"EMA 200")]:fig.add_trace(go.Scatter(x=d["Time"],y=d["Close"].ewm(span=span,adjust=False).mean(),name=name,line=dict(width=1.3)))
+    fig.add_hline(y=s["entry"],annotation_text="ENTRY",line_dash="solid")
+    if s["direction"]!="WAIT":
+        fig.add_hline(y=s["stop_loss"],annotation_text="SL",line_dash="dot"); fig.add_hline(y=s["target1"],annotation_text="TP1 1:2",line_dash="dash"); fig.add_hline(y=s["target2"],annotation_text="TP2 1:3",line_dash="dash")
+    fig.update_layout(template="plotly_dark",height=560,xaxis_rangeslider_visible=False,margin=dict(l=5,r=5,t=25,b=5),legend=dict(orientation="h",y=1.02),hovermode="x unified",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
     return fig
 
+def obi_chart(s):
+    vals=[s["obi5"],s["obi10"],s["obi20"],s["obi50"]]; fig=go.Figure(go.Bar(x=["Top 5","Top 10","Top 20","Top 50"],y=vals,text=[f"{v:+.3f}" for v in vals],textposition="outside")); fig.add_hline(y=0); fig.update_layout(template="plotly_dark",height=310,yaxis=dict(range=[-1,1]),margin=dict(l=5,r=5,t=20,b=5),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)"); return fig
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
+# --------------------------- sidebar --------------------------
 with st.sidebar:
-
-    st.markdown(
-        """
-        <div class="main-title">
-        ⚡ ZIA RESEARCH
-        </div>
-
-        <div class="sub-title">
-        Quantitative Market Research Terminal
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.divider()
-
-    selected_symbol = st.selectbox(
-        "MARKET",
-        COINS,
-        index=COINS.index(
-            st.session_state.selected_symbol
-        )
-        if st.session_state.selected_symbol
-        in COINS
-        else 0,
-    )
-
-    st.session_state.selected_symbol = (
-        selected_symbol
-    )
-
-    mode_key = st.selectbox(
-        "SIGNAL MODE",
-        list(TRADE_MODES.keys()),
-        format_func=lambda x:
-            TRADE_MODES[x]["label"],
-        index=list(
-            TRADE_MODES.keys()
-        ).index(
-            st.session_state.selected_mode
-        ),
-    )
-
-    st.session_state.selected_mode = (
-        mode_key
-    )
-
-    mode = TRADE_MODES[
-        mode_key
-    ]
-
-    st.divider()
-
-    st.markdown(
-        "### TRADE HORIZON"
-    )
-
-    st.info(
-        f"""
-Analysis: {mode["analysis_tf"].upper()}
-
-Trade horizon: {mode["max_holding"]}
-
-Reference: {", ".join(mode["reference"])}
-"""
-    )
-
-    st.session_state.auto_scan = st.toggle(
-        "AUTO SIGNAL SCAN",
-        value=st.session_state.auto_scan,
-    )
-
-    st.session_state.show_chart = st.toggle(
-        "SHOW PRICE CHART",
-        value=st.session_state.show_chart,
-    )
-
-    st.divider()
-
-    st.caption(
-        "Data: Binance USDⓈ-M Futures"
-    )
-
-    st.caption(
-        "Execution: research only"
-    )
-
-
-# ============================================================
-# AUTO REFRESH
-# ============================================================
-
-if st.session_state.auto_scan:
-
-    st_autorefresh(
-        interval=5000,
-        key="zia_research_refresh",
-    )
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    """
-    <div class="main-title">
-    ⚡ ZIA RESEARCH LAB
-    </div>
-
-    <div class="sub-title">
-    Binance USDⓈ-M Futures • Microstructure • OBI • Taker Flow • ML • Quant Trend
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.write("")
-
-
-# ============================================================
-# FETCH MAIN DATA
-# ============================================================
-
-symbol = st.session_state.selected_symbol
-
-mode_key = st.session_state.selected_mode
-
-mode = TRADE_MODES[
-    mode_key
-]
-
-interval = mode[
-    "analysis_tf"
-]
-
-df = fetch_klines(
-    symbol,
-    interval,
-    250,
-)
-
-bids, asks = fetch_orderbook(
-    symbol,
-    100,
-)
-
-
-# ============================================================
-# DATA VALIDATION
-# ============================================================
-
-if df.empty or len(df) < 20:
-
-    st.error(
-        "Market data unavailable."
-    )
-
-    st.info(
-        f"""
-        Binance Futures data could not be loaded for {symbol}.
-
-        API:
-        {BINANCE_BASE}
-
-        Try refreshing the page.
-        """
-    )
-
-    st.stop()
-
-
-if len(bids) < 20 or len(asks) < 20:
-
-    st.warning(
-        "Order book depth is temporarily unavailable. "
-        "Retrying automatically..."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# GENERATE SIGNAL
-# ============================================================
-
-signal = generate_signal(
-    df=df,
-    bids=bids,
-    asks=asks,
-    symbol=symbol,
-    mode=mode_key,
-)
-
-if signal is None:
-
-    st.error(
-        "Signal engine could not calculate data."
-    )
-
-    st.stop()
-
-
-st.session_state.last_signal = signal
-
-
-# ============================================================
-# SAVE SIGNAL OCCASIONALLY
-# ============================================================
-
-current_minute = now_utc().strftime(
-    "%Y-%m-%d %H:%M"
-)
-
-if (
-    st.session_state.get(
-        "last_saved_minute"
-    )
-    != current_minute
-):
-
-    save_signal(
-        signal
-    )
-
-    st.session_state.last_saved_minute = (
-        current_minute
-    )
-
-
-# ============================================================
-# TOP STATUS
-# ============================================================
-
-ticker = fetch_ticker(
-    symbol
-)
-
-price = signal["price"]
-
-change = signal[
-    "change_24h"
-]
-
-direction = signal[
-    "direction"
-]
-
-confidence = signal[
-    "confidence"
-]
-
-score = signal[
-    "score"
-]
-
-card_class = direction_class(
-    direction
-)
-
-
-# ============================================================
-# MAIN SIGNAL CARD
-# ============================================================
-
-st.markdown(
-    f"""
-    <div class="signal-card {card_class}">
-
-        <div class="signal-title">
-        FINAL RESEARCH SIGNAL • {symbol} • {mode["label"]}
-        </div>
-
-        <div class="signal-value">
-        {direction}
-        </div>
-
-        <div style="margin-top:10px;color:#9aa6b7;">
-        Quant Score: {score:+.3f}
-        &nbsp;&nbsp;|&nbsp;&nbsp;
-        Confidence: {confidence:.1f}%
-        </div>
-
-        <div style="margin-top:12px;">
-        <span class="price-value">
-        ${fmt_price(price)}
-        </span>
-
-        &nbsp;&nbsp;
-
-        <span style="color:#8d99aa;">
-        24H {change:+.2f}%
-        </span>
-        </div>
-
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# KEY METRICS
-# ============================================================
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-with c1:
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-        <div class="metric-label">
-        Confidence
-        </div>
-        <div class="metric-value">
-        {confidence:.1f}%
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with c2:
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-        <div class="metric-label">
-        OBI 20
-        </div>
-        <div class="metric-value">
-        {signal["obi20"]:+.4f}
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with c3:
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-        <div class="metric-label">
-        OBI 50
-        </div>
-        <div class="metric-value">
-        {signal["obi50"]:+.4f}
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with c4:
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-        <div class="metric-label">
-        Taker Flow
-        </div>
-        <div class="metric-value">
-        {signal["taker_flow_ratio"]:+.4f}
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with c5:
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-        <div class="metric-label">
-        ATR
-        </div>
-        <div class="metric-value">
-        {fmt_price(signal["atr"])}
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ============================================================
-# ENTRY / SL / TP
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">TRADE PLAN</div>',
-    unsafe_allow_html=True,
-)
-
-p1, p2, p3, p4 = st.columns(4)
-
-with p1:
-    st.metric(
-        "ENTRY",
-        fmt_price(
-            signal["entry"]
-        ),
-    )
-
-with p2:
-    st.metric(
-        "STOP LOSS",
-        (
-            fmt_price(
-                signal["stop_loss"]
-            )
-            if direction != "WAIT"
-            else "WAIT"
-        ),
-    )
-
-with p3:
-    st.metric(
-        "TARGET 1 • 1:2",
-        (
-            fmt_price(
-                signal["target1"]
-            )
-            if direction != "WAIT"
-            else "WAIT"
-        ),
-    )
-
-with p4:
-    st.metric(
-        "TARGET 2 • 1:3",
-        (
-            fmt_price(
-                signal["target2"]
-            )
-            if direction != "WAIT"
-            else "WAIT"
-        ),
-    )
-
-
-# ============================================================
-# MICROSTRUCTURE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">MICROSTRUCTURE</div>',
-    unsafe_allow_html=True,
-)
-
-m1, m2, m3, m4 = st.columns(4)
-
-with m1:
-    st.metric(
-        "OBI 5",
-        f'{signal["obi5"]:+.4f}',
-    )
-
-with m2:
-    st.metric(
-        "OBI 10",
-        f'{signal["obi10"]:+.4f}',
-    )
-
-with m3:
-    st.metric(
-        "OBI 20",
-        f'{signal["obi20"]:+.4f}',
-    )
-
-with m4:
-    st.metric(
-        "OBI 50",
-        f'{signal["obi50"]:+.4f}',
-    )
-
-
-f1, f2, f3, f4 = st.columns(4)
-
-with f1:
-    st.metric(
-        "Taker Buy",
-        f'{signal["taker_buy"]:.3f}',
-    )
-
-with f2:
-    st.metric(
-        "Taker Sell",
-        f'{signal["taker_sell"]:.3f}',
-    )
-
-with f3:
-    st.metric(
-        "Flow Ratio",
-        f'{signal["taker_flow_ratio"]:+.4f}',
-    )
-
-with f4:
-    st.metric(
-        "Trades",
-        f'{signal["trade_count"]:,}',
-    )
-
-
-# ============================================================
-# TREND / ML
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">QUANT + ML</div>',
-    unsafe_allow_html=True,
-)
-
-q1, q2, q3, q4, q5 = st.columns(5)
-
-with q1:
-    st.metric(
-        "Trend Score",
-        f'{signal["trend_score"]:+.3f}',
-    )
-
-with q2:
-    st.metric(
-        "EMA 20",
-        fmt_price(
-            signal["ema20"]
-        ),
-    )
-
-with q3:
-    st.metric(
-        "EMA 50",
-        fmt_price(
-            signal["ema50"]
-        ),
-    )
-
-with q4:
-    st.metric(
-        "EMA 200",
-        fmt_price(
-            signal["ema200"]
-        ),
-    )
-
-with q5:
-
-    ml_text = (
-        f'{signal["ml_confidence"] * 100:.1f}%'
-        if signal["ml_available"]
-        else "OFF"
-    )
-
-    st.metric(
-        "XGBoost",
-        ml_text,
-    )
-
-
-# ============================================================
-# HIGHER TIMEFRAME
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">HIGHER TIMEFRAME CONFIRMATION</div>',
-    unsafe_allow_html=True,
-)
-
-h1, h2, h3 = st.columns(3)
-
-def bias_text(value):
-
-    value = safe_float(value)
-
-    if value > 0.25:
-        return "BULLISH"
-
-    if value < -0.25:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-with h1:
-    st.metric(
-        "1H",
-        bias_text(
-            signal["htf_1h"]
-        ),
-        delta=f'{signal["htf_1h"]:+.2f}',
-    )
-
-with h2:
-    st.metric(
-        "4H",
-        bias_text(
-            signal["htf_4h"]
-        ),
-        delta=f'{signal["htf_4h"]:+.2f}',
-    )
-
-with h3:
-    st.metric(
-        "1D",
-        bias_text(
-            signal["htf_1d"]
-        ),
-        delta=f'{signal["htf_1d"]:+.2f}',
-    )
-
-
-# ============================================================
-# CHART
-# ============================================================
-
-if st.session_state.show_chart:
-
-    st.markdown(
-        '<div class="section-title">PRICE ACTION</div>',
-        unsafe_allow_html=True,
-    )
-
-    fig = create_chart(
-        df.tail(150),
-        signal,
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "displaylogo": False,
-            "responsive": True,
-        },
-    )
-
-
-# ============================================================
-# ORDER BOOK
-# ============================================================
-
-with st.expander(
-    "ORDER BOOK DEPTH",
-    expanded=False,
-):
-
-    ob_left, ob_right = st.columns(2)
-
-    with ob_left:
-
-        st.markdown(
-            "### BIDS"
-        )
-
-        bid_df = pd.DataFrame(
-            bids[:20],
-            columns=[
-                "Price",
-                "Quantity",
-            ],
-        )
-
-        bid_df["Price"] = bid_df[
-            "Price"
-        ].map(fmt_price)
-
-        st.dataframe(
-            bid_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with ob_right:
-
-        st.markdown(
-            "### ASKS"
-        )
-
-        ask_df = pd.DataFrame(
-            asks[:20],
-            columns=[
-                "Price",
-                "Quantity",
-            ],
-        )
-
-        ask_df["Price"] = ask_df[
-            "Price"
-        ].map(fmt_price)
-
-        st.dataframe(
-            ask_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# ============================================================
-# SIGNAL HISTORY
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">RECENT SIGNALS</div>',
-    unsafe_allow_html=True,
-)
-
-history = load_history()
-
-if history:
-
-    history_df = pd.DataFrame(
-        history
-    )
-
-    if not history_df.empty:
-
-        cols = [
-            "timestamp",
-            "symbol",
-            "mode",
-            "direction",
-            "score",
-            "confidence",
-            "entry",
-            "stop_loss",
-            "target1",
-            "target2",
-        ]
-
-        cols = [
-            c for c in cols
-            if c in history_df.columns
-        ]
-
-        display_df = history_df[
-            cols
-        ].tail(20).copy()
-
-        if "score" in display_df:
-            display_df["score"] = (
-                display_df["score"]
-                .astype(float)
-                .round(3)
-            )
-
-        if "confidence" in display_df:
-            display_df["confidence"] = (
-                display_df["confidence"]
-                .astype(float)
-                .round(1)
-            )
-
-        st.dataframe(
-            display_df.iloc[::-1],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-else:
-
-    st.info(
-        "No signal history yet."
-    )
-
-
-# ============================================================
-# FOOTER STATUS
-# ============================================================
-
-st.divider()
-
-status1, status2, status3 = st.columns(3)
-
-with status1:
-    st.caption(
-        f"Market: Binance USDⓈ-M Futures • {symbol}"
-    )
-
-with status2:
-    st.caption(
-        f"Analysis: {interval.upper()}"
-    )
-
-with status3:
-    st.caption(
-        f"Last update: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
+    st.markdown("### ⚡ ZIA RESEARCH"); st.caption("ML-powered Binance Futures research terminal"); st.divider()
+    st.session_state.symbol=st.selectbox("MARKET",COINS,index=COINS.index(st.session_state.symbol) if st.session_state.symbol in COINS else 0)
+    keys=list(MODES); st.session_state.mode=st.selectbox("ANALYSIS MODE",keys,index=keys.index(st.session_state.mode),format_func=lambda x:MODES[x]["label"])
+    st.divider(); st.markdown("**ENGINE**")
+    st.session_state.auto_refresh=st.toggle("Live refresh",value=st.session_state.auto_refresh)
+    if st.session_state.auto_refresh:st.session_state.refresh_seconds=st.slider("Refresh interval",3,30,int(st.session_state.refresh_seconds),1)
+    if st.button("↻ Refresh now",use_container_width=True):st.cache_data.clear();st.rerun()
+    st.divider(); m=MODES[st.session_state.mode]; st.markdown("**CURRENT HORIZON**"); st.info(f"**{m['tf'].upper()}** analysis\n\nHolding: {m['hold']}\n\nHTF: {', '.join(m['refs']).upper()}"); st.caption("Research / signal generation only — no order execution.")
+if st.session_state.auto_refresh:st_autorefresh(interval=int(st.session_state.refresh_seconds*1000),key="zia_live_refresh")
+
+# --------------------------- live state -----------------------
+symbol=st.session_state.symbol; mode_key=st.session_state.mode; mode=MODES[mode_key]; df=klines(symbol,mode["tf"]); bids,asks=orderbook(symbol)
+if df.empty or len(df)<30:st.error(f"Market data unavailable for {symbol}. Check Binance Futures connectivity and refresh.");st.stop()
+if len(bids)<20 or len(asks)<20:st.warning("Order-book depth is temporarily unavailable. Retrying on the next refresh.");st.stop()
+s=build_signal(df,bids,asks,symbol,mode_key)
+if s is None:st.error("Signal engine could not calculate the current market state.");st.stop()
+st.session_state.last_signal=s
+save_key=f"{symbol}:{mode_key}:{now_utc().strftime('%Y-%m-%d-%H-%M')}"
+if st.session_state.last_saved_key!=save_key:save_signal(s);st.session_state.last_saved_key=save_key
+
+# --------------------------- header ----------------------------
+st.markdown(f"<div class='hero'><div><div class='brand'><span>⚡</span> ZIA RESEARCH LAB</div><div class='subtitle'>Binance USDⓈ-M Futures · Order Flow · OBI · Quant Trend · XGBoost ML</div></div><div class='live'><span class='dot'></span> LIVE · {now_utc().strftime('%H:%M:%S UTC')}</div></div>",unsafe_allow_html=True)
+sc=signal_class(s["direction"]); ml_label="CONNECTED" if s["ml_available"] else "OFFLINE"; ml_cls="good" if s["ml_available"] else "bad"
+st.markdown(f"<div class='signal {sc}'><div style='display:flex;justify-content:space-between;gap:20px;align-items:center'><div><div class='signal-label'>FINAL RESEARCH SIGNAL · {symbol} · {mode['label']}</div><div class='signal-name'>{s['direction']}</div><div class='signal-meta'>Quant score <b>{s['score']:+.3f}</b> · Confidence <b>{s['confidence']:.1f}%</b> · ML <b class='{ml_cls}'>{ml_label}</b></div></div><div style='text-align:right'><div class='signal-label'>LAST PRICE</div><div class='big-price'>${price(s['price'])}</div><div class='signal-meta'>24H {s['change24']:+.2f}%</div></div></div></div>",unsafe_allow_html=True)
+
+cols=st.columns(6); kpis=[("Confidence",f"{s['confidence']:.1f}%","signal confidence"),("OBI 20",f"{s['obi20']:+.4f}","order-book imbalance"),("OBI 50",f"{s['obi50']:+.4f}","deep liquidity"),("Taker Flow",f"{s['taker_flow_ratio']:+.4f}","aggressive flow"),("Trend",f"{s['trend']:+.3f}","quant trend score"),("XGBoost",f"{s['ml_confidence']*100:.1f}%" if s['ml_available'] else "OFF","model probability")]
+for c,(lab,val,sub) in zip(cols,kpis):
+    with c:st.markdown(f"<div class='kpi'><div class='kpi-label'>{lab}</div><div class='kpi-value'>{val}</div><div class='kpi-sub'>{sub}</div></div>",unsafe_allow_html=True)
+
+# --------------------------- tabs -----------------------------
+tab1,tab2,tab3,tab4=st.tabs(["▣ Overview","◈ Order Flow","◎ ML Engine","▤ Signal History"])
+with tab1:
+    st.markdown('<div class="section">TRADE PLAN</div>',unsafe_allow_html=True); pc=st.columns(4)
+    for c,(lab,val,sub) in zip(pc,[("ENTRY",s["entry"],"market reference"),("STOP LOSS",s["stop_loss"],"volatility adjusted"),("TARGET 1",s["target1"],"1 : 2 risk / reward"),("TARGET 2",s["target2"],"1 : 3 risk / reward")]):
+        with c:st.markdown(f"<div class='trade-row'><div class='trade-label'>{lab}</div><div class='trade-value'>{price(val) if s['direction']!='WAIT' or lab=='ENTRY' else 'WAIT'}</div><div class='small'>{sub}</div></div>",unsafe_allow_html=True)
+    st.markdown('<div class="section">PRICE ACTION</div>',unsafe_allow_html=True); st.plotly_chart(price_chart(df,s),use_container_width=True,config={"displaylogo":False,"responsive":True})
+    a,b,c=st.columns(3)
+    with a:
+        st.markdown("**Higher-timeframe bias**")
+        for tf in ["1h","4h","1d"]:
+            lab,cls=bias(s[f"htf_{tf}"]);st.markdown(f"`{tf.upper()}` &nbsp; <span class='{cls}'><b>{lab}</b></span> &nbsp; {s[f'htf_{tf}']:+.2f}",unsafe_allow_html=True)
+    with b:
+        st.markdown("**Momentum & volatility**");st.metric("5-candle momentum",f"{s['momentum5']*100:+.2f}%");st.metric("20-candle momentum",f"{s['momentum20']*100:+.2f}%");st.metric("ATR",price(s["atr"]))
+    with c:
+        st.markdown("**Moving averages**");st.metric("EMA 20",price(s["ema20"]));st.metric("EMA 50",price(s["ema50"]));st.metric("EMA 200",price(s["ema200"]))
+
+with tab2:
+    st.markdown('<div class="section">ORDER BOOK IMBALANCE</div>',unsafe_allow_html=True);x,y=st.columns([1.25,1])
+    with x:st.plotly_chart(obi_chart(s),use_container_width=True,config={"displaylogo":False})
+    with y:st.metric("Top 20 bid volume",f"{s['bid20']:,.3f}");st.metric("Top 20 ask volume",f"{s['ask20']:,.3f}");st.metric("Top 50 bid volume",f"{s['bid50']:,.3f}");st.metric("Top 50 ask volume",f"{s['ask50']:,.3f}")
+    st.markdown('<div class="section">TAKER / AGGRESSIVE FLOW</div>',unsafe_allow_html=True);fc=st.columns(4)
+    for c,lab,val in zip(fc,["Taker Buy","Taker Sell","Flow Ratio","Trades"],[f"{s['taker_buy']:,.3f}",f"{s['taker_sell']:,.3f}",f"{s['taker_flow_ratio']:+.4f}",f"{s['trade_count']:,}"]):
+        with c:st.metric(lab,val)
+    st.markdown('<div class="section">LIVE ORDER BOOK · TOP 20</div>',unsafe_allow_html=True);l,r=st.columns(2)
+    with l:bd=pd.DataFrame(bids[:20],columns=["Price","Quantity"]);bd["Price"]=bd["Price"].map(price);st.dataframe(bd,use_container_width=True,hide_index=True,height=470)
+    with r:ad=pd.DataFrame(asks[:20],columns=["Price","Quantity"]);ad["Price"]=ad["Price"].map(price);st.dataframe(ad,use_container_width=True,hide_index=True,height=470)
+
+with tab3:
+    st.markdown('<div class="section">XGBOOST DECISION CENTER</div>',unsafe_allow_html=True);ml=s["ml"];l,r=st.columns([1.05,1.45]);status_cls="good" if s["ml_available"] else "bad";status_txt="CONNECTED" if s["ml_available"] else "OFFLINE"
+    with l:
+        st.markdown(f"<div class='model-box'><div class='panel-title'>MODEL STATUS</div><div style='font-size:24px;font-weight:900'>XGBoost <span class='{status_cls}'>{status_txt}</span></div><div class='small' style='margin-top:8px'>{s['model_status']}</div></div>",unsafe_allow_html=True)
+        if ml and "error" in ml:st.error(ml["error"])
+        elif ml:
+            st.metric("ML direction",ml["direction"]);st.metric("ML confidence",f"{s['ml_confidence']*100:.2f}%")
+            probs=ml.get("probabilities",[]);classes=ml.get("classes",list(range(len(probs))))
+            for cl,p in zip(classes,probs):
+                st.markdown(f"**{pred_direction(cl)}** · {p*100:.2f}%");st.markdown(f"<div class='progress'><div style='width:{max(0,min(100,p*100)):.2f}%'></div></div>",unsafe_allow_html=True)
+    with r:
+        st.markdown("**Exact 7 features sent to the trained model**");rows=[{"Feature":n,"Live value":v} for n,v in zip(MODEL_FEATURES,s["ml_features"])];st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True);st.info("Dashboard uses the existing 7-feature XGBoost schema and does not retrain or reorder the model.")
+
+with tab4:
+    st.markdown('<div class="section">RECENT RESEARCH SIGNALS</div>',unsafe_allow_html=True);h=read_history()
+    if h.empty:st.info("No non-WAIT signals have been recorded yet.")
+    else:
+        cols=[c for c in ["timestamp","symbol","mode","direction","score","confidence","entry","stop_loss","target1","target2"] if c in h.columns];d=h[cols].tail(50).iloc[::-1].copy()
+        for c in ["entry","stop_loss","target1","target2"]:
+            if c in d:d[c]=d[c].map(price)
+        if "score" in d:d["score"]=d["score"].astype(float).round(3)
+        if "confidence" in d:d["confidence"]=d["confidence"].astype(float).round(1)
+        st.dataframe(d,use_container_width=True,hide_index=True,height=520);st.caption(f"Stored history: {len(h):,} rows")
+
+st.divider();a,b,c,d=st.columns(4)
+with a:st.caption(f"● Binance Futures · {symbol}")
+with b:st.caption(f"● Analysis · {mode['tf'].upper()}")
+with c:st.caption(f"● ML · {'Connected' if s['ml_available'] else 'Unavailable'}")
+with d:st.caption(f"● Updated · {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
