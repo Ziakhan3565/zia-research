@@ -1,243 +1,4790 @@
+from __future__ import annotations
+
+import os
+import json
+import pickle
 import warnings
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Any
+
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
+import requests
+
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import SGDClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, log_loss
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 
-class SwingQuantTradingEngine:
+# ============================================================
+# CONFIG
+# ============================================================
 
-  def __init__(self, T_window: int = 12, ml_lookback: int = 400):
-    """Initialized for 1-2 Hour Holding Time (Using 5-minute bar resolution).
+BINANCE_API = "https://api.binance.com/api/v3/klines"
 
-    T_window = 12 bars * 5 mins = 60 minutes (1 Hour lookback) ml_lookback =
-    Training lookback window
-    """
-    self.T_window = T_window
-    self.ml_lookback = ml_lookback
-    self.scaler = StandardScaler()
-    self.model = RandomForestClassifier(
-        n_estimators=150, max_depth=6, random_state=42, n_jobs=-1
-    )
+DEFAULT_SYMBOL = "BTCUSDT"
 
-  def compute_cross_ofi(
-      self, venues_data: Dict[str, pd.DataFrame], beta_weights: Dict[str, float]
-  ) -> pd.Series:
-    timestamps = list(next(iter(venues_data.values())).index)
-    cross_ofi_list = []
+MODEL_FILE = "research_lab_ml.pkl"
+SCALER_FILE = "research_lab_scaler.pkl"
+ML_META_FILE = "research_lab_ml_meta.json"
 
-    for t in range(1, len(timestamps)):
-      total_ofi = 0.0
-      for m, df in venues_data.items():
-        beta = beta_weights.get(m, 1.0)
-        curr, prev = df.iloc[t], df.iloc[t - 1]
+MIN_TRAIN_SAMPLES = 50
 
-        dv_b = (
-            curr['bid_v']
-            if curr['bid_p'] > prev['bid_p']
-            else (
-                curr['bid_v'] - prev['bid_v']
-                if curr['bid_p'] == prev['bid_p']
-                else -prev['bid_v']
+MODEL_VERSION = "RESEARCH_LAB_ML_V3"
+
+SUPPORTED_TIMEFRAMES = {
+    "MONTHLY": "1M",
+    "WEEKLY": "1w",
+    "DAILY": "1d",
+    "4H": "4h",
+    "1H": "1h",
+    "30M": "30m",
+    "15M": "15m",
+}
+
+
+# ============================================================
+# TRI LINE DATA
+# ============================================================
+
+@dataclass
+class TRILineLevels:
+
+    timeframe: str
+
+    open: float
+    high: float
+    low: float
+    close: float
+
+    body_high: float
+    body_low: float
+
+    body_50: float
+    upper_50: float
+    lower_50: float
+
+    candle_time: int
+
+
+# ============================================================
+# TRI LINE ENGINE
+# ============================================================
+
+class TRILineEngine:
+
+    def __init__(
+        self,
+        symbol: str = DEFAULT_SYMBOL,
+        enabled_timeframes: Optional[Dict[str, bool]] = None,
+        timeout: int = 10,
+    ):
+
+        self.symbol = str(symbol).upper().strip()
+        self.timeout = timeout
+
+        self.enabled = {
+            "MONTHLY": True,
+            "WEEKLY": True,
+            "DAILY": True,
+            "4H": True,
+            "1H": True,
+            "30M": True,
+            "15M": True,
+        }
+
+        if enabled_timeframes:
+            self.enabled.update(enabled_timeframes)
+
+    # ========================================================
+    # SYMBOL
+    # ========================================================
+
+    def set_symbol(self, symbol: str):
+
+        self.symbol = str(symbol).upper().strip()
+
+    # ========================================================
+    # GET KLINES
+    # ========================================================
+
+    def get_klines(
+        self,
+        interval: str,
+        limit: int = 100,
+    ):
+
+        params = {
+            "symbol": self.symbol,
+            "interval": interval,
+            "limit": int(limit),
+        }
+
+        response = requests.get(
+            BINANCE_API,
+            params=params,
+            timeout=self.timeout,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"Invalid Binance response: {data}"
+            )
+
+        return data
+
+    # ========================================================
+    # KLINES -> DATAFRAME
+    # ========================================================
+
+    def get_dataframe(
+        self,
+        interval: str,
+        limit: int = 200,
+    ):
+
+        data = self.get_klines(
+            interval,
+            limit,
+        )
+
+        rows = []
+
+        for candle in data:
+
+            if len(candle) < 6:
+                continue
+
+            rows.append({
+                "Time": int(candle[0]),
+                "Open": float(candle[1]),
+                "High": float(candle[2]),
+                "Low": float(candle[3]),
+                "Close": float(candle[4]),
+                "Volume": float(candle[5]),
+            })
+
+        return pd.DataFrame(rows)
+
+    # ========================================================
+    # PREVIOUS COMPLETED CANDLE
+    # ========================================================
+
+    def get_previous_candle(
+        self,
+        interval: str,
+    ):
+
+        candles = self.get_klines(
+            interval,
+            5,
+        )
+
+        if len(candles) < 2:
+            raise RuntimeError(
+                "Not enough candle data"
+            )
+
+        candle = candles[-2]
+
+        return {
+            "time": int(candle[0]),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4]),
+            "volume": float(candle[5]),
+        }
+
+    # ========================================================
+    # TRI FORMULAS
+    # ========================================================
+
+    def calculate_levels(
+        self,
+        timeframe: str,
+    ) -> TRILineLevels:
+
+        timeframe = str(timeframe).upper()
+
+        if timeframe not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"Unsupported timeframe: {timeframe}"
+            )
+
+        interval = SUPPORTED_TIMEFRAMES[timeframe]
+
+        candle = self.get_previous_candle(
+            interval
+        )
+
+        o = candle["open"]
+        h = candle["high"]
+        l = candle["low"]
+        c = candle["close"]
+
+        body_high = max(o, c)
+        body_low = min(o, c)
+
+        # 50% BODY
+        body_50 = (
+            body_high + body_low
+        ) / 2.0
+
+        # 50% UPPER WICK
+        upper_50 = (
+            h + body_high
+        ) / 2.0
+
+        # 50% LOWER WICK
+        lower_50 = (
+            l + body_low
+        ) / 2.0
+
+        return TRILineLevels(
+
+            timeframe=timeframe,
+
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+
+            body_high=body_high,
+            body_low=body_low,
+
+            body_50=body_50,
+            upper_50=upper_50,
+            lower_50=lower_50,
+
+            candle_time=candle["time"],
+        )
+
+    # ========================================================
+    # CURRENT PRICE
+    # ========================================================
+
+    def get_current_price(
+        self,
+        timeframe="15M",
+    ):
+
+        timeframe = str(
+            timeframe
+        ).upper()
+
+        interval = SUPPORTED_TIMEFRAMES[
+            timeframe
+        ]
+
+        candles = self.get_klines(
+            interval,
+            1,
+        )
+
+        if not candles:
+            raise RuntimeError(
+                "No price data"
+            )
+
+        return float(
+            candles[0][4]
+        )
+
+    # ========================================================
+    # ALL TRI LEVELS
+    # ========================================================
+
+    def calculate_all(self):
+
+        results = {}
+
+        for timeframe in SUPPORTED_TIMEFRAMES:
+
+            if not self.enabled.get(
+                timeframe,
+                False,
+            ):
+                continue
+
+            try:
+
+                results[timeframe] = (
+                    self.calculate_levels(
+                        timeframe
+                    )
+                )
+
+            except Exception as error:
+
+                results[timeframe] = {
+                    "error": str(error)
+                }
+
+        return results
+
+
+# ============================================================
+# TEN PAPER RESEARCH LAB
+# ============================================================
+
+class TenPaperResearchLab:
+
+    def __init__(
+        self,
+        target_vol=0.15,
+        tri_engine=None,
+        model_file=MODEL_FILE,
+        scaler_file=SCALER_FILE,
+        meta_file=ML_META_FILE,
+    ):
+
+        self.target_vol = float(
+            target_vol
+        )
+
+        self.tri_engine = (
+            tri_engine
+            if tri_engine is not None
+            else TRILineEngine()
+        )
+
+        self.model_file = model_file
+        self.scaler_file = scaler_file
+        self.meta_file = meta_file
+
+        # ====================================================
+        # TRADE MODES
+        # ====================================================
+
+        self.trade_modes = {
+
+            "15M": {
+                "confirmation": "15M",
+                "reference": [
+                    "1H",
+                    "4H",
+                ],
+            },
+
+            "1H": {
+                "confirmation": "1H",
+                "reference": [
+                    "DAILY",
+                    "WEEKLY",
+                ],
+            },
+
+            "4H": {
+                "confirmation": "4H",
+                "reference": [
+                    "WEEKLY",
+                    "MONTHLY",
+                ],
+            },
+        }
+
+        # ====================================================
+        # TRI SETTINGS
+        # ====================================================
+
+        self.tri_touch_tolerance = 0.0015
+
+        self.minimum_tri_rr = 2.0
+
+        # ====================================================
+        # FEATURES
+        # ====================================================
+
+        self.feature_names = [
+
+            "BOOK_IMB",
+
+            "TAKER_FLOW",
+
+            "QUANT_IMPLY",
+
+            "ADAPT_CONF",
+
+            "BAYESIAN",
+
+            "FOURIER_TREND",
+        ]
+
+        # ====================================================
+        # ML
+        # ====================================================
+
+        self.scaler = StandardScaler()
+
+        self.base_model = (
+            self._create_model()
+        )
+
+        self.ml_model = None
+
+        self.is_model_trained = False
+
+        self.ml_accuracy = 0.0
+
+        self.ml_logloss = 0.0
+
+        self.ml_samples = 0
+
+        self.last_training_time = None
+
+        # ====================================================
+        # RESEARCH WEIGHTS
+        # ====================================================
+
+        self.dynamic_weights = {
+
+            "BOOK_IMB": 0.25,
+
+            "TAKER_FLOW": 0.20,
+
+            "QUANT_IMPLY": 0.15,
+
+            "ADAPT_CONF": 0.15,
+
+            "BAYESIAN": 0.10,
+
+            "FOURIER_TREND": 0.15,
+        }
+
+        # ====================================================
+        # QUANT + ML
+        # ====================================================
+
+        self.quant_weight = 0.65
+
+        self.ml_weight = 0.35
+
+        # ====================================================
+        # SIGNAL THRESHOLDS
+        # ====================================================
+
+        self.long_threshold = 0.45
+
+        self.short_threshold = -0.45
+
+        self.strong_long_threshold = 0.70
+
+        self.strong_short_threshold = -0.70
+
+        # ====================================================
+        # ML DIRECTION THRESHOLDS
+        # ====================================================
+
+        self.ml_long_probability = 0.55
+
+        self.ml_strong_long_probability = 0.70
+
+        self.ml_short_probability = 0.45
+
+        self.ml_strong_short_probability = 0.30
+
+        # ====================================================
+        # HYSTERESIS
+        # ====================================================
+
+        self.last_signal = "WAIT"
+
+        self.cooldown_counter = 0
+
+        # ====================================================
+        # AUTO LOAD MODEL
+        # ====================================================
+
+        self.load_ml_model()
+
+    # ========================================================
+    # CREATE MODEL
+    # ========================================================
+
+    @staticmethod
+    def _create_model():
+
+        return SGDClassifier(
+
+            loss="log_loss",
+
+            penalty="l2",
+
+            alpha=0.0001,
+
+            max_iter=2000,
+
+            tol=1e-4,
+
+            random_state=42,
+
+            class_weight="balanced",
+        )
+
+    # ========================================================
+    # SAFE FLOAT
+    # ========================================================
+
+    @staticmethod
+    def safe_float(
+        value,
+        default=0.0,
+    ):
+
+        try:
+
+            value = float(value)
+
+            if np.isfinite(value):
+                return value
+
+        except Exception:
+            pass
+
+        return default
+
+    # ========================================================
+    # CLIP
+    # ========================================================
+
+    @staticmethod
+    def clip(
+        value,
+        low=-1.0,
+        high=1.0,
+    ):
+
+        return float(
+            np.clip(
+                value,
+                low,
+                high,
             )
         )
-        dv_a = (
-            -prev['ask_v']
-            if curr['ask_p'] > prev['ask_p']
-            else (
-                curr['ask_v'] - prev['ask_v']
-                if curr['ask_p'] == prev['ask_p']
-                else curr['ask_v']
+
+    # ========================================================
+    # NORMALIZE OHLC DATA
+    # ========================================================
+
+    @staticmethod
+    def normalize_dataframe(df):
+
+        if df is None:
+            return None
+
+        if not isinstance(
+            df,
+            pd.DataFrame,
+        ):
+            return None
+
+        if df.empty:
+            return df
+
+        rename_map = {}
+
+        for col in df.columns:
+
+            lower = str(col).lower()
+
+            if lower == "open":
+                rename_map[col] = "Open"
+
+            elif lower == "high":
+                rename_map[col] = "High"
+
+            elif lower == "low":
+                rename_map[col] = "Low"
+
+            elif lower == "close":
+                rename_map[col] = "Close"
+
+            elif lower == "volume":
+                rename_map[col] = "Volume"
+
+        result = df.rename(
+            columns=rename_map
+        ).copy()
+
+        for column in [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]:
+
+            if column in result.columns:
+
+                result[column] = pd.to_numeric(
+                    result[column],
+                    errors="coerce",
+                )
+
+        return result
+
+    # ========================================================
+    # ATR
+    # ========================================================
+
+    def calculate_atr(
+        self,
+        df,
+        period=14,
+    ):
+
+        df = self.normalize_dataframe(df)
+
+        if df is None or df.empty:
+            return 0.0
+
+        if "Close" not in df.columns:
+            return 0.0
+
+        if not all(
+            x in df.columns
+            for x in [
+                "High",
+                "Low",
+                "Close",
+            ]
+        ):
+
+            close = pd.to_numeric(
+                df["Close"],
+                errors="coerce",
+            )
+
+            close = close.dropna()
+
+            if close.empty:
+                return 0.0
+
+            volatility = (
+                close
+                .pct_change()
+                .rolling(period)
+                .std()
+                .iloc[-1]
+            )
+
+            price = self.safe_float(
+                close.iloc[-1]
+            )
+
+            return max(
+                self.safe_float(
+                    volatility
+                ) * price,
+                price * 0.001,
+            )
+
+        high = pd.to_numeric(
+            df["High"],
+            errors="coerce",
+        )
+
+        low = pd.to_numeric(
+            df["Low"],
+            errors="coerce",
+        )
+
+        close = pd.to_numeric(
+            df["Close"],
+            errors="coerce",
+        )
+
+        prev_close = close.shift(1)
+
+        tr = pd.concat(
+            [
+                high - low,
+
+                (
+                    high - prev_close
+                ).abs(),
+
+                (
+                    low - prev_close
+                ).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        atr = (
+            tr
+            .ewm(
+                alpha=1.0 / period,
+                adjust=False,
+                min_periods=period,
+            )
+            .mean()
+        )
+
+        value = atr.iloc[-1]
+
+        if not np.isfinite(value):
+
+            value = (
+                tr
+                .tail(period)
+                .mean()
+            )
+
+        return max(
+            self.safe_float(value),
+            0.0,
+        )
+
+    # ========================================================
+    # OBI SINGLE LEVEL
+    # ========================================================
+
+    def calculate_obi_level(
+        self,
+        bids,
+        asks,
+        levels,
+    ):
+
+        if not bids or not asks:
+            return 0.0
+
+        n = min(
+            int(levels),
+            len(bids),
+            len(asks),
+        )
+
+        if n <= 0:
+            return 0.0
+
+        bid_sum = 0.0
+
+        ask_sum = 0.0
+
+        for i in range(n):
+
+            try:
+
+                bid_size = max(
+                    self.safe_float(
+                        bids[i][1]
+                    ),
+                    0.0,
+                )
+
+                ask_size = max(
+                    self.safe_float(
+                        asks[i][1]
+                    ),
+                    0.0,
+                )
+
+            except Exception:
+                continue
+
+            weight = 1.0 / (
+                i + 1.0
+            )
+
+            bid_sum += (
+                bid_size * weight
+            )
+
+            ask_sum += (
+                ask_size * weight
+            )
+
+        denominator = (
+            bid_sum
+            + ask_sum
+            + 1e-12
+        )
+
+        return self.clip(
+            (
+                bid_sum
+                - ask_sum
+            )
+            / denominator
+        )
+
+    # ========================================================
+    # OBI MULTI LEVEL
+    # ========================================================
+
+    def calculate_multi_level_obi(
+        self,
+        bids,
+        asks,
+    ):
+
+        levels = {
+
+            5: 0.10,
+
+            10: 0.20,
+
+            20: 0.40,
+
+            50: 0.30,
+        }
+
+        values = {}
+
+        weights = {}
+
+        for level, weight in levels.items():
+
+            if (
+                len(bids) >= level
+                and len(asks) >= level
+            ):
+
+                values[level] = (
+                    self.calculate_obi_level(
+                        bids,
+                        asks,
+                        level,
+                    )
+                )
+
+                weights[level] = weight
+
+        if not values:
+
+            available = min(
+                len(bids),
+                len(asks),
+            )
+
+            if available <= 0:
+                return 0.0
+
+            return (
+                self.calculate_obi_level(
+                    bids,
+                    asks,
+                    available,
+                )
+            )
+
+        total_weight = sum(
+            weights.values()
+        )
+
+        final = 0.0
+
+        for level, value in values.items():
+
+            final += (
+                value
+                * weights[level]
+                / total_weight
+            )
+
+        return self.clip(final)
+
+    # ========================================================
+    # OBI DETAILS
+    # ========================================================
+
+    def calculate_obi_details(
+        self,
+        bids,
+        asks,
+    ):
+
+        result = {
+
+            "OBI_TOP5": 0.0,
+
+            "OBI_TOP10": 0.0,
+
+            "OBI_TOP20": 0.0,
+
+            "OBI_TOP50": 0.0,
+
+            "OBI_FINAL": 0.0,
+        }
+
+        if not bids or not asks:
+            return result
+
+        for level in [
+            5,
+            10,
+            20,
+            50,
+        ]:
+
+            result[
+                f"OBI_TOP{level}"
+            ] = (
+                self.calculate_obi_level(
+                    bids,
+                    asks,
+                    level,
+                )
+            )
+
+        result["OBI_FINAL"] = (
+            self.calculate_multi_level_obi(
+                bids,
+                asks,
             )
         )
 
-        ofi_m = dv_b - dv_a
-        total_ofi += beta * ofi_m
-      cross_ofi_list.append(total_ofi)
+        return result
 
-    return pd.Series(
-        [0.0] + cross_ofi_list, index=timestamps, name='Cross_OFI'
-    )
+    # ========================================================
+    # TAKER FLOW
+    # ========================================================
 
-  def compute_kyles_lambda(
-      self, net_vol: pd.Series, price_series: pd.Series
-  ) -> pd.Series:
-    delta_p = price_series.diff(self.T_window)
-    sum_net_vol = net_vol.rolling(window=self.T_window).sum()
-    cov = delta_p.rolling(window=self.T_window).cov(sum_net_vol)
-    var = sum_net_vol.rolling(window=self.T_window).var()
-    lam = cov / (var + 1e-8)
-    return lam.rename('Kyles_Lambda').fillna(0)
+    def calculate_taker_flow(
+        self,
+        trades,
+    ):
 
-  def compute_cvd_skew_features(
-      self, trade_df: pd.DataFrame, n: int = 12
-  ) -> pd.DataFrame:
-    trade_df['net_trade_vol'] = (
-        trade_df['v_market_buy'] - trade_df['v_market_sell']
-    )
-    trade_df['cvd'] = trade_df['net_trade_vol'].cumsum()
+        if trades is None:
+            return 0.0
 
-    ema_cvd = trade_df['cvd'].ewm(span=n, adjust=False).mean()
-    std_cvd = trade_df['cvd'].rolling(window=n).std().fillna(1e-8)
+        buy_volume = 0.0
 
-    trade_df['cvd_skew'] = (trade_df['cvd'] - ema_cvd) / std_cvd
-    trade_df['ema_10'] = trade_df['cvd_skew'].ewm(span=10, adjust=False).mean()
-    trade_df['ema_20'] = trade_df['cvd_skew'].ewm(span=20, adjust=False).mean()
+        sell_volume = 0.0
 
-    return trade_df
+        try:
 
-  def compute_basis_velocity(
-      self, perp_price: pd.Series, spot_price: pd.Series
-  ) -> Tuple[pd.Series, pd.Series]:
-    basis = perp_price - spot_price
-    basis_velocity = basis - basis.shift(self.T_window)
-    return (
-        basis.rename('Basis'),
-        basis_velocity.fillna(0).rename('Basis_Velocity'),
-    )
+            if isinstance(
+                trades,
+                pd.DataFrame,
+            ):
 
-  def feature_engineering_pipeline(
-      self,
-      venues_data: Dict[str, pd.DataFrame],
-      trade_df: pd.DataFrame,
-      beta_weights: Dict[str, float],
-  ) -> pd.DataFrame:
+                if trades.empty:
+                    return 0.0
+
+                side_col = None
+
+                qty_col = None
+
+                for col in [
+                    "side",
+                    "Side",
+                    "aggressor_side",
+                    "taker_side",
+                ]:
+
+                    if col in trades.columns:
+                        side_col = col
+                        break
+
+                for col in [
+                    "qty",
+                    "quantity",
+                    "volume",
+                    "size",
+                ]:
+
+                    if col in trades.columns:
+                        qty_col = col
+                        break
+
+                if (
+                    side_col is None
+                    or qty_col is None
+                ):
+                    return 0.0
+
+                rows = trades.tail(500)
+
+                for _, row in rows.iterrows():
+
+                    side = str(
+                        row[side_col]
+                    ).lower().strip()
+
+                    qty = max(
+                        self.safe_float(
+                            row[qty_col]
+                        ),
+                        0.0,
+                    )
+
+                    if side in [
+                        "buy",
+                        "b",
+                        "long",
+                    ]:
+
+                        buy_volume += qty
+
+                    elif side in [
+                        "sell",
+                        "s",
+                        "short",
+                    ]:
+
+                        sell_volume += qty
+
+            elif isinstance(
+                trades,
+                (list, tuple),
+            ):
+
+                for trade in trades[-500:]:
+
+                    if not isinstance(
+                        trade,
+                        dict,
+                    ):
+                        continue
+
+                    side = str(
+                        trade.get(
+                            "side",
+                            trade.get(
+                                "aggressor_side",
+                                "",
+                            ),
+                        )
+                    ).lower()
+
+                    qty = trade.get(
+                        "qty",
+                        trade.get(
+                            "quantity",
+                            trade.get(
+                                "volume",
+                                trade.get(
+                                    "size",
+                                    0.0,
+                                ),
+                            ),
+                        ),
+                    )
+
+                    qty = max(
+                        self.safe_float(qty),
+                        0.0,
+                    )
+
+                    if side in [
+                        "buy",
+                        "b",
+                        "long",
+                    ]:
+
+                        buy_volume += qty
+
+                    elif side in [
+                        "sell",
+                        "s",
+                        "short",
+                    ]:
+
+                        sell_volume += qty
+
+            total = (
+                buy_volume
+                + sell_volume
+                + 1e-12
+            )
+
+            return self.clip(
+                (
+                    buy_volume
+                    - sell_volume
+                )
+                / total
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ========================================================
+    # MICROPRICE
+    # ========================================================
+
+    def calculate_microprice(
+        self,
+        bids,
+        asks,
+    ):
+
+        if not bids or not asks:
+            return 0.0
+
+        try:
+
+            bid = self.safe_float(
+                bids[0][0]
+            )
+
+            ask = self.safe_float(
+                asks[0][0]
+            )
+
+            bid_size = max(
+                self.safe_float(
+                    bids[0][1]
+                ),
+                0.0,
+            )
+
+            ask_size = max(
+                self.safe_float(
+                    asks[0][1]
+                ),
+                0.0,
+            )
+
+            mid = (
+                bid + ask
+            ) / 2.0
+
+            spread = max(
+                ask - bid,
+                1e-12,
+            )
+
+            microprice = (
+                ask * bid_size
+                +
+                bid * ask_size
+            ) / (
+                bid_size
+                + ask_size
+                + 1e-12
+            )
+
+            return self.clip(
+                np.tanh(
+                    (
+                        microprice
+                        - mid
+                    )
+                    / spread
+                )
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ========================================================
+    # BAYESIAN
+    # ========================================================
+
+    def calculate_bayesian(
+        self,
+        book_imbalance,
+        performance_history=None,
+    ):
+
+        prior = 0.50
+
+        try:
+
+            if isinstance(
+                performance_history,
+                pd.DataFrame,
+            ):
+
+                col = None
+
+                for candidate in [
+                    "outcome",
+                    "result",
+                    "win",
+                    "target",
+                    "label",
+                ]:
+
+                    if candidate in (
+                        performance_history.columns
+                    ):
+
+                        col = candidate
+                        break
+
+                if col:
+
+                    values = pd.to_numeric(
+                        performance_history[col],
+                        errors="coerce",
+                    ).dropna()
+
+                    if len(values) >= 10:
+
+                        values = values.clip(
+                            0,
+                            1,
+                        )
+
+                        prior = (
+                            values.sum()
+                            + 1.0
+                        ) / (
+                            len(values)
+                            + 2.0
+                        )
+
+        except Exception:
+
+            prior = 0.50
+
+        prior = np.clip(
+            prior,
+            0.05,
+            0.95,
+        )
+
+        obi = np.clip(
+            self.safe_float(
+                book_imbalance
+            ),
+            -1,
+            1,
+        )
+
+        strength = (
+            0.50
+            + 0.45 * abs(obi)
+        )
+
+        if obi >= 0:
+            likelihood = strength
+        else:
+            likelihood = 1.0 - strength
+
+        numerator = (
+            likelihood * prior
+        )
+
+        denominator = (
+            numerator
+            +
+            (
+                1.0 - likelihood
+            )
+            *
+            (
+                1.0 - prior
+            )
+        )
+
+        posterior = (
+            numerator
+            /
+            (
+                denominator
+                + 1e-12
+            )
+        )
+
+        return self.clip(
+            (
+                posterior
+                - 0.5
+            )
+            * 2.0
+        )
+
+    # ========================================================
+    # FOURIER TREND
+    # ========================================================
+
+    def calculate_fourier(
+        self,
+        close,
+        atr,
+    ):
+
+        prices = np.asarray(
+            close,
+            dtype=float,
+        )
+
+        prices = prices[
+            np.isfinite(prices)
+        ]
+
+        if len(prices) < 16:
+            return 0.0
+
+        prices = prices[
+            -min(
+                64,
+                len(prices),
+            ):
+        ]
+
+        centered = (
+            prices
+            - np.mean(prices)
+        )
+
+        fft_values = np.fft.fft(
+            centered
+        )
+
+        n = len(
+            fft_values
+        )
+
+        keep = max(
+            2,
+            int(n * 0.10),
+        )
+
+        mask = np.zeros(
+            n,
+            dtype=bool,
+        )
+
+        mask[:keep] = True
+
+        mask[-keep:] = True
+
+        filtered = np.where(
+            mask,
+            fft_values,
+            0,
+        )
+
+        curve = np.real(
+            np.fft.ifft(
+                filtered
+            )
+        )
+
+        delta = (
+            curve[-1]
+            - curve[-2]
+        )
+
+        denominator = max(
+            self.safe_float(atr),
+            np.mean(prices) * 1e-6,
+            1e-12,
+        )
+
+        return self.clip(
+            np.tanh(
+                delta
+                / denominator
+            )
+        )
+
+    # ========================================================
+    # MOMENTUM
+    # ========================================================
+
+    def calculate_momentum(
+        self,
+        close,
+    ):
+
+        try:
+
+            close = pd.Series(
+                close,
+                dtype=float,
+            ).dropna()
+
+            if len(close) < 10:
+                return 0.0
+
+            fast = (
+                close
+                .ewm(
+                    span=5,
+                    adjust=False,
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            slow = (
+                close
+                .ewm(
+                    span=13,
+                    adjust=False,
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            denominator = max(
+                abs(slow),
+                1e-12,
+            )
+
+            return self.clip(
+                np.tanh(
+                    (
+                        fast
+                        - slow
+                    )
+                    / denominator
+                    * 100
+                )
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ========================================================
+    # FEATURE EXTRACTION
+    # ========================================================
+
+    def extract_features(
+        self,
+        df,
+        bids,
+        asks,
+        trades=None,
+        performance_history=None,
+    ):
+
+        results = {
+            feature: 0.0
+            for feature in self.feature_names
+        }
+
+        df = self.normalize_dataframe(
+            df
+        )
+
+        if (
+            df is None
+            or df.empty
+            or "Close" not in df.columns
+            or not bids
+            or not asks
+        ):
+
+            return results
+
+        try:
+
+            close = pd.to_numeric(
+                df["Close"],
+                errors="coerce",
+            ).ffill().bfill()
+
+            if close.empty:
+                return results
+
+            current_price = self.safe_float(
+                close.iloc[-1]
+            )
+
+            atr = self.calculate_atr(
+                df,
+                14,
+            )
+
+            atr = max(
+                atr,
+                current_price * 0.0001,
+                1e-12,
+            )
+
+            # ------------------------------------------------
+            # BOOK IMBALANCE
+            # ------------------------------------------------
+
+            results["BOOK_IMB"] = (
+                self.calculate_multi_level_obi(
+                    bids,
+                    asks,
+                )
+            )
+
+            # ------------------------------------------------
+            # TAKER FLOW
+            # ------------------------------------------------
+
+            results["TAKER_FLOW"] = (
+                self.calculate_taker_flow(
+                    trades
+                )
+            )
+
+            # ------------------------------------------------
+            # MICROPRICE
+            # ------------------------------------------------
+
+            results["QUANT_IMPLY"] = (
+                self.calculate_microprice(
+                    bids,
+                    asks,
+                )
+            )
+
+            # ------------------------------------------------
+            # ADAPTIVE TREND
+            # ------------------------------------------------
+
+            ema20 = (
+                close
+                .ewm(
+                    span=20,
+                    adjust=False,
+                )
+                .mean()
+            )
+
+            ema50 = (
+                close
+                .ewm(
+                    span=50,
+                    adjust=False,
+                )
+                .mean()
+            )
+
+            trend = (
+                ema20.iloc[-1]
+                - ema50.iloc[-1]
+            ) / atr
+
+            results["ADAPT_CONF"] = (
+                self.clip(
+                    np.tanh(
+                        trend / 3.0
+                    )
+                )
+            )
+
+            # ------------------------------------------------
+            # BAYESIAN
+            # ------------------------------------------------
+
+            results["BAYESIAN"] = (
+                self.calculate_bayesian(
+                    results["BOOK_IMB"],
+                    performance_history,
+                )
+            )
+
+            # ------------------------------------------------
+            # FOURIER
+            # ------------------------------------------------
+
+            results["FOURIER_TREND"] = (
+                self.calculate_fourier(
+                    close.values,
+                    atr,
+                )
+            )
+
+            # ------------------------------------------------
+            # CLEAN
+            # ------------------------------------------------
+
+            for feature in self.feature_names:
+
+                results[feature] = (
+                    self.clip(
+                        self.safe_float(
+                            results[feature]
+                        )
+                    )
+                )
+
+            return results
+
+        except Exception:
+
+            return {
+                feature: 0.0
+                for feature in self.feature_names
+            }
+
+    # ========================================================
+    # FEATURE MATRIX
+    # ========================================================
+
+    def _feature_matrix(
+        self,
+        feature_data,
+    ):
+
+        X = pd.DataFrame(
+            feature_data
+        )
+
+        for feature in self.feature_names:
+
+            if feature not in X.columns:
+
+                X[feature] = 0.0
+
+        X = X[
+            self.feature_names
+        ].apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+
+        X = X.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        X = X.fillna(0.0)
+
+        X = X.clip(
+            -1.0,
+            1.0,
+        )
+
+        return X
+
+    # ========================================================
+    # ML TRAINING
+    # ========================================================
+
+    def train_ml(
+        self,
+        feature_data,
+        labels,
+        save=True,
+    ):
+
+        try:
+
+            X = self._feature_matrix(
+                feature_data
+            )
+
+            y = pd.Series(
+                labels
+            ).reset_index(
+                drop=True
+            )
+
+            X = X.reset_index(
+                drop=True
+            )
+
+            if len(X) != len(y):
+                return False
+
+            y = pd.to_numeric(
+                y,
+                errors="coerce",
+            )
+
+            valid = y.notna()
+
+            X = X.loc[valid]
+
+            y = (
+                y.loc[valid]
+                .astype(int)
+            )
+
+            if len(X) < MIN_TRAIN_SAMPLES:
+                return False
+
+            if y.nunique() < 2:
+                return False
+
+            # ------------------------------------------------
+            # CHRONOLOGICAL SPLIT
+            # ------------------------------------------------
+
+            split = int(
+                len(X) * 0.80
+            )
+
+            if split < 30:
+                return False
+
+            X_train = X.iloc[
+                :split
+            ]
+
+            y_train = y.iloc[
+                :split
+            ]
+
+            X_test = X.iloc[
+                split:
+            ]
+
+            y_test = y.iloc[
+                split:
+            ]
+
+            if (
+                y_train.nunique() < 2
+                or y_test.nunique() < 2
+            ):
+
+                return False
+
+            # ------------------------------------------------
+            # SCALER
+            # ------------------------------------------------
+
+            scaler = StandardScaler()
+
+            X_train_scaled = (
+                scaler.fit_transform(
+                    X_train
+                )
+            )
+
+            X_test_scaled = (
+                scaler.transform(
+                    X_test
+                )
+            )
+
+            # ------------------------------------------------
+            # MODEL
+            # ------------------------------------------------
+
+            model = (
+                self._create_model()
+            )
+
+            model.fit(
+                X_train_scaled,
+                y_train,
+            )
+
+            # ------------------------------------------------
+            # CALIBRATION
+            # ------------------------------------------------
+
+            final_model = model
+
+            try:
+
+                calibrated = (
+                    CalibratedClassifierCV(
+                        model,
+                        method="sigmoid",
+                        cv="prefit",
+                    )
+                )
+
+                calibrated.fit(
+                    X_test_scaled,
+                    y_test,
+                )
+
+                final_model = calibrated
+
+            except Exception:
+
+                final_model = model
+
+            # ------------------------------------------------
+            # TEST
+            # ------------------------------------------------
+
+            predictions = (
+                final_model.predict(
+                    X_test_scaled
+                )
+            )
+
+            probabilities = (
+                final_model.predict_proba(
+                    X_test_scaled
+                )[:, 1]
+            )
+
+            accuracy = accuracy_score(
+                y_test,
+                predictions,
+            )
+
+            try:
+
+                loss_value = log_loss(
+                    y_test,
+                    probabilities,
+                    labels=[0, 1],
+                )
+
+            except Exception:
+
+                loss_value = 0.0
+
+            # ------------------------------------------------
+            # ACCEPT
+            # ------------------------------------------------
+
+            self.scaler = scaler
+
+            self.base_model = model
+
+            self.ml_model = final_model
+
+            self.is_model_trained = True
+
+            self.ml_accuracy = float(
+                accuracy
+            )
+
+            self.ml_logloss = float(
+                loss_value
+            )
+
+            self.ml_samples = int(
+                len(X)
+            )
+
+            self.last_training_time = (
+                pd.Timestamp.utcnow()
+                .isoformat()
+            )
+
+            if save:
+
+                self.save_ml_model()
+
+            return True
+
+        except Exception as error:
+
+            print(
+                f"[ML TRAIN ERROR] {error}"
+            )
+
+            return False
+
+    # ========================================================
+    # TRAIN DATAFRAME
+    # ========================================================
+
+    def train_from_dataframe(
+        self,
+        df,
+        label_column="label",
+        save=True,
+    ):
+
+        if df is None or df.empty:
+            return False
+
+        if label_column not in df.columns:
+            return False
+
+        feature_data = df[
+            [
+                x
+                for x in self.feature_names
+                if x in df.columns
+            ]
+        ].copy()
+
+        labels = df[
+            label_column
+        ]
+
+        return self.train_ml(
+            feature_data,
+            labels,
+            save=save,
+        )
+
+    # ========================================================
+    # ML PREDICTION
+    # ========================================================
+
+    def predict_ml(
+        self,
+        features,
+    ):
+
+        if (
+            not self.is_model_trained
+            or self.ml_model is None
+        ):
+
+            return {
+
+                "probability_up": 0.50,
+
+                "probability_down": 0.50,
+
+                "score": 0.0,
+
+                "direction": "NEUTRAL",
+
+                "strength": "NONE",
+
+                "trained": False,
+            }
+
+        try:
+
+            X = np.array(
+                [
+                    self.safe_float(
+                        features.get(
+                            name,
+                            0.0,
+                        )
+                    )
+                    for name in self.feature_names
+                ],
+                dtype=float,
+            ).reshape(
+                1,
+                -1,
+            )
+
+            X = np.nan_to_num(
+                X,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            X = np.clip(
+                X,
+                -1.0,
+                1.0,
+            )
+
+            X_scaled = (
+                self.scaler.transform(
+                    X
+                )
+            )
+
+            probabilities = (
+                self.ml_model
+                .predict_proba(
+                    X_scaled
+                )[0]
+            )
+
+            classes = list(
+                self.ml_model.classes_
+            )
+
+            if 1 in classes:
+
+                up_index = classes.index(
+                    1
+                )
+
+                probability_up = float(
+                    probabilities[
+                        up_index
+                    ]
+                )
+
+            else:
+
+                probability_up = 0.50
+
+            probability_up = float(
+                np.clip(
+                    probability_up,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            probability_down = (
+                1.0
+                - probability_up
+            )
+
+            ml_score = (
+                probability_up
+                - 0.50
+            ) * 2.0
+
+            ml_score = self.clip(
+                ml_score
+            )
+
+            if (
+                probability_up
+                >= self.ml_strong_long_probability
+            ):
+
+                direction = "LONG"
+
+                strength = "STRONG"
+
+            elif (
+                probability_up
+                >= self.ml_long_probability
+            ):
+
+                direction = "LONG"
+
+                strength = "NORMAL"
+
+            elif (
+                probability_up
+                <= self.ml_strong_short_probability
+            ):
+
+                direction = "SHORT"
+
+                strength = "STRONG"
+
+            elif (
+                probability_up
+                <= self.ml_short_probability
+            ):
+
+                direction = "SHORT"
+
+                strength = "NORMAL"
+
+            else:
+
+                direction = "NEUTRAL"
+
+                strength = "NONE"
+
+            return {
+
+                "probability_up":
+                    probability_up,
+
+                "probability_down":
+                    probability_down,
+
+                "score":
+                    ml_score,
+
+                "direction":
+                    direction,
+
+                "strength":
+                    strength,
+
+                "trained":
+                    True,
+            }
+
+        except Exception:
+
+            return {
+
+                "probability_up": 0.50,
+
+                "probability_down": 0.50,
+
+                "score": 0.0,
+
+                "direction": "NEUTRAL",
+
+                "strength": "NONE",
+
+                "trained": False,
+            }
+
+    # ========================================================
+    # SAVE ML
+    # ========================================================
+
+    def save_ml_model(
+        self,
+    ):
+
+        if (
+            not self.is_model_trained
+            or self.ml_model is None
+        ):
+
+            return False
+
+        try:
+
+            payload = {
+
+                "model":
+                    self.ml_model,
+
+                "base_model":
+                    self.base_model,
+
+                "features":
+                    self.feature_names,
+
+                "version":
+                    MODEL_VERSION,
+            }
+
+            with open(
+                self.model_file,
+                "wb",
+            ) as file:
+
+                pickle.dump(
+                    payload,
+                    file,
+                )
+
+            with open(
+                self.scaler_file,
+                "wb",
+            ) as file:
+
+                pickle.dump(
+                    self.scaler,
+                    file,
+                )
+
+            metadata = {
+
+                "version":
+                    MODEL_VERSION,
+
+                "features":
+                    self.feature_names,
+
+                "samples":
+                    self.ml_samples,
+
+                "accuracy":
+                    self.ml_accuracy,
+
+                "logloss":
+                    self.ml_logloss,
+
+                "trained":
+                    self.is_model_trained,
+
+                "last_training_time":
+                    self.last_training_time,
+            }
+
+            with open(
+                self.meta_file,
+                "w",
+                encoding="utf-8",
+            ) as file:
+
+                json.dump(
+                    metadata,
+                    file,
+                    indent=2,
+                )
+
+            return True
+
+        except Exception as error:
+
+            print(
+                f"[ML SAVE ERROR] {error}"
+            )
+
+            return False
+
+    # ========================================================
+    # LOAD ML
+    # ========================================================
+
+    def load_ml_model(
+        self,
+    ):
+
+        if not os.path.exists(
+            self.model_file
+        ):
+
+            return False
+
+        if not os.path.exists(
+            self.scaler_file
+        ):
+
+            return False
+
+        try:
+
+            with open(
+                self.model_file,
+                "rb",
+            ) as file:
+
+                payload = pickle.load(
+                    file
+                )
+
+            with open(
+                self.scaler_file,
+                "rb",
+            ) as file:
+
+                scaler = pickle.load(
+                    file
+                )
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+
+                return False
+
+            saved_features = payload.get(
+                "features",
+                [],
+            )
+
+            if list(
+                saved_features
+            ) != list(
+                self.feature_names
+            ):
+
+                return False
+
+            self.ml_model = (
+                payload.get(
+                    "model"
+                )
+            )
+
+            self.base_model = (
+                payload.get(
+                    "base_model",
+                    self._create_model(),
+                )
+            )
+
+            self.scaler = scaler
+
+            self.is_model_trained = (
+                self.ml_model is not None
+            )
+
+            if os.path.exists(
+                self.meta_file
+            ):
+
+                try:
+
+                    with open(
+                        self.meta_file,
+                        "r",
+                        encoding="utf-8",
+                    ) as file:
+
+                        metadata = json.load(
+                            file
+                        )
+
+                    self.ml_accuracy = (
+                        self.safe_float(
+                            metadata.get(
+                                "accuracy",
+                                0.0,
+                            )
+                        )
+                    )
+
+                    self.ml_logloss = (
+                        self.safe_float(
+                            metadata.get(
+                                "logloss",
+                                0.0,
+                            )
+                        )
+                    )
+
+                    self.ml_samples = int(
+                        metadata.get(
+                            "samples",
+                            0,
+                        )
+                    )
+
+                    self.last_training_time = (
+                        metadata.get(
+                            "last_training_time"
+                        )
+                    )
+
+                except Exception:
+                    pass
+
+            return self.is_model_trained
+
+        except Exception as error:
+
+            print(
+                f"[ML LOAD ERROR] {error}"
+            )
+
+            self.ml_model = None
+
+            self.is_model_trained = False
+
+            return False
+
+    # ========================================================
+    # OUTCOME LABEL
+    # ========================================================
+
+    @staticmethod
+    def outcome_to_label(
+        outcome,
+    ):
+
+        text = str(
+            outcome
+        ).upper().strip()
+
+        if text in [
+            "WIN",
+            "WON",
+            "TP",
+            "TP1",
+            "TP2",
+            "PROFIT",
+            "LONG_WIN",
+            "SHORT_WIN",
+            "1",
+            "TRUE",
+        ]:
+
+            return 1
+
+        if text in [
+            "LOSS",
+            "LOST",
+            "SL",
+            "STOP",
+            "STOPLOSS",
+            "LOSS_TRADE",
+            "0",
+            "FALSE",
+        ]:
+
+            return 0
+
+        return None
+
+    # ========================================================
+    # TRAIN FROM FEEDBACK
+    # ========================================================
+
+    def train_from_feedback(
+        self,
+        history,
+        save=True,
+    ):
+
+        if history is None:
+            return False
+
+        if isinstance(
+            history,
+            str,
+        ):
+
+            if not os.path.exists(
+                history
+            ):
+
+                return False
+
+            try:
+
+                history = pd.read_csv(
+                    history
+                )
+
+            except Exception:
+
+                return False
+
+        if isinstance(
+            history,
+            list,
+        ):
+
+            history = pd.DataFrame(
+                history
+            )
+
+        if not isinstance(
+            history,
+            pd.DataFrame,
+        ):
+
+            return False
+
+        if history.empty:
+            return False
+
+        feature_rows = []
+
+        labels = []
+
+        for _, row in history.iterrows():
+
+            outcome = row.get(
+                "outcome",
+                row.get(
+                    "result",
+                    None,
+                ),
+            )
+
+            label = (
+                self.outcome_to_label(
+                    outcome
+                )
+            )
+
+            if label is None:
+                continue
+
+            features = {}
+
+            for feature in self.feature_names:
+
+                if feature in row.index:
+
+                    features[feature] = (
+                        self.safe_float(
+                            row[feature]
+                        )
+                    )
+
+                elif (
+                    f"F_{feature}"
+                    in row.index
+                ):
+
+                    features[feature] = (
+                        self.safe_float(
+                            row[
+                                f"F_{feature}"
+                            ]
+                        )
+                    )
+
+                else:
+
+                    features[feature] = 0.0
+
+            feature_rows.append(
+                features
+            )
+
+            labels.append(
+                label
+            )
+
+        if len(feature_rows) < MIN_TRAIN_SAMPLES:
+            return False
+
+        return self.train_ml(
+            feature_rows,
+            labels,
+            save=save,
+        )
+
+    # ========================================================
+    # TRI LEVELS
+    # ========================================================
+
+    def get_tri_levels(
+        self,
+        timeframes,
+    ):
+
+        result = {}
+
+        for timeframe in timeframes:
+
+            try:
+
+                result[timeframe] = (
+                    self.tri_engine
+                    .calculate_levels(
+                        timeframe
+                    )
+                )
+
+            except Exception:
+
+                result[timeframe] = None
+
+        return result
+
+    # ========================================================
+    # ALL TRI LINE PRICES
+    # ========================================================
+
+    def get_line_prices(
+        self,
+        levels,
+    ):
+
+        prices = []
+
+        for _, data in levels.items():
+
+            if data is None:
+                continue
+
+            if isinstance(
+                data,
+                dict,
+            ):
+                continue
+
+            prices.extend(
+                [
+                    float(
+                        data.body_50
+                    ),
+
+                    float(
+                        data.upper_50
+                    ),
+
+                    float(
+                        data.lower_50
+                    ),
+                ]
+            )
+
+        return sorted(
+            set(
+                p
+                for p in prices
+                if p > 0
+            )
+        )
+
+    # ========================================================
+    # TRI LINE DISTANCE
+    # ========================================================
+
+    def line_distance(
+        self,
+        price,
+        line,
+    ):
+
+        price = self.safe_float(
+            price
+        )
+
+        line = self.safe_float(
+            line
+        )
+
+        if line <= 0:
+            return 999.0
+
+        return (
+            abs(
+                price - line
+            )
+            / line
+        )
+
+    # ========================================================
+    # TRI TOUCH
+    # ========================================================
+
+    def line_touch(
+        self,
+        price,
+        line,
+    ):
+
+        return (
+            self.line_distance(
+                price,
+                line,
+            )
+            <= self.tri_touch_tolerance
+        )
+
+    # ========================================================
+    # FIND CLOSEST TRI LINE
+    # ========================================================
+
+    def find_closest_tri_line(
+        self,
+        price,
+        levels,
+    ):
+
+        closest = None
+
+        closest_distance = float(
+            "inf"
+        )
+
+        for timeframe, data in levels.items():
+
+            if data is None:
+                continue
+
+            if isinstance(
+                data,
+                dict,
+            ):
+                continue
+
+            line_map = {
+
+                "BODY_50":
+                    data.body_50,
+
+                "UPPER_50":
+                    data.upper_50,
+
+                "LOWER_50":
+                    data.lower_50,
+            }
+
+            for line_name, line_price in (
+                line_map.items()
+            ):
+
+                line_price = (
+                    self.safe_float(
+                        line_price
+                    )
+                )
+
+                if line_price <= 0:
+                    continue
+
+                distance = (
+                    self.line_distance(
+                        price,
+                        line_price,
+                    )
+                )
+
+                if distance < closest_distance:
+
+                    closest_distance = distance
+
+                    closest = {
+
+                        "timeframe":
+                            timeframe,
+
+                        "line_name":
+                            line_name,
+
+                        "price":
+                            line_price,
+
+                        "distance":
+                            distance,
+
+                        "touched":
+                            distance
+                            <= self.tri_touch_tolerance,
+                    }
+
+        return closest
+
+    # ========================================================
+    # NEXT TRI TARGET
+    # ========================================================
+
+    def next_tri_line(
+        self,
+        price,
+        direction,
+        levels,
+    ):
+
+        lines = (
+            self.get_line_prices(
+                levels
+            )
+        )
+
+        if direction == "LONG":
+
+            higher = [
+                x
+                for x in lines
+                if x > price
+            ]
+
+            if higher:
+                return min(higher)
+
+        elif direction == "SHORT":
+
+            lower = [
+                x
+                for x in lines
+                if x < price
+            ]
+
+            if lower:
+                return max(lower)
+
+        return None
+
+    # ========================================================
+    # SECOND TRI TARGET
+    # ========================================================
+
+    def second_tri_target(
+        self,
+        price,
+        direction,
+        levels,
+    ):
+
+        lines = (
+            self.get_line_prices(
+                levels
+            )
+        )
+
+        if direction == "LONG":
+
+            higher = sorted(
+                [
+                    x
+                    for x in lines
+                    if x > price
+                ]
+            )
+
+            if len(higher) >= 2:
+                return higher[1]
+
+        elif direction == "SHORT":
+
+            lower = sorted(
+                [
+                    x
+                    for x in lines
+                if x < price
+                ],
+                reverse=True,
+            )
+
+            if len(lower) >= 2:
+                return lower[1]
+
+        return None
+
+    # ========================================================
+    # TRI SETUP
+    # ========================================================
+
+    def calculate_tri_setup(
+        self,
+        trade_mode,
+        current_price,
+        confirmation_score,
+        ml_probability,
+        df,
+    ):
+
+        result = {
+
+            "trade_mode":
+                trade_mode,
+
+            "tri_signal":
+                "NEUTRAL",
+
+            "tri_touched":
+                False,
+
+            "tri_timeframe":
+                None,
+
+            "tri_line":
+                None,
+
+            "tri_line_name":
+                None,
+
+            "next_tri_target":
+                None,
+
+            "second_tri_target":
+                None,
+
+            "tri_stop_loss":
+                None,
+
+            "tri_rr":
+                0.0,
+
+            "tri_reason":
+                "NO_SETUP",
+        }
+
+        if (
+            trade_mode
+            not in self.trade_modes
+        ):
+
+            return result
+
+        references = (
+            self.trade_modes[
+                trade_mode
+            ]["reference"]
+        )
+
+        levels = (
+            self.get_tri_levels(
+                references
+            )
+        )
+
+        closest = (
+            self.find_closest_tri_line(
+                current_price,
+                levels,
+            )
+        )
+
+        if closest is None:
+
+            result[
+                "tri_reason"
+            ] = "NO_REFERENCE_LINE"
+
+            return result
+
+        timeframe = (
+            closest["timeframe"]
+        )
+
+        line_name = (
+            closest["line_name"]
+        )
+
+        line_price = (
+            closest["price"]
+        )
+
+        touched = (
+            closest["touched"]
+        )
+
+        result[
+            "tri_timeframe"
+        ] = timeframe
+
+        result[
+            "tri_line"
+        ] = float(
+            line_price
+        )
+
+        result[
+            "tri_line_name"
+        ] = line_name
+
+        result[
+            "tri_touched"
+        ] = bool(
+            touched
+        )
+
+        if not touched:
+
+            result[
+                "tri_reason"
+            ] = (
+                "WAITING_FOR_"
+                + timeframe
+                + "_"
+                + line_name
+            )
+
+            return result
+
+        # ====================================================
+        # CONFIRMATION
+        # ====================================================
+
+        long_confirmation = (
+            confirmation_score >= 0.20
+            and ml_probability >= 0.52
+        )
+
+        short_confirmation = (
+            confirmation_score <= -0.20
+            and ml_probability <= 0.48
+        )
+
+        if long_confirmation:
+
+            direction = "LONG"
+
+        elif short_confirmation:
+
+            direction = "SHORT"
+
+        else:
+
+            result[
+                "tri_reason"
+            ] = "TRI_TOUCHED_BUT_CONFIRMATION_FAILED"
+
+            return result
+
+        # ====================================================
+        # TARGET
+        # ====================================================
+
+        target = (
+            self.next_tri_line(
+                current_price,
+                direction,
+                levels,
+            )
+        )
+
+        if target is None:
+
+            result[
+                "tri_reason"
+            ] = "NO_NEXT_TRI_LINE"
+
+            return result
+
+        second_target = (
+            self.second_tri_target(
+                current_price,
+                direction,
+                levels,
+            )
+        )
+
+        # ====================================================
+        # ATR STOP
+        # ====================================================
+
+        atr = max(
+            self.calculate_atr(
+                df,
+                14,
+            ),
+            current_price * 0.0005,
+        )
+
+        max_risk = (
+            current_price * 0.006
+        )
+
+        risk_distance = min(
+            atr,
+            max_risk,
+        )
+
+        if direction == "LONG":
+
+            stop = (
+                current_price
+                - risk_distance
+            )
+
+            reward = (
+                target
+                - current_price
+            )
+
+            risk = (
+                current_price
+                - stop
+            )
+
+        else:
+
+            stop = (
+                current_price
+                + risk_distance
+            )
+
+            reward = (
+                current_price
+                - target
+            )
+
+            risk = (
+                stop
+                - current_price
+            )
+
+        if risk <= 0:
+
+            result[
+                "tri_reason"
+            ] = "INVALID_RISK"
+
+            return result
+
+        rr = (
+            reward / risk
+        )
+
+        result[
+            "tri_rr"
+        ] = float(rr)
+
+        if rr < self.minimum_tri_rr:
+
+            result[
+                "tri_reason"
+            ] = "RR_BELOW_1_TO_2"
+
+            return result
+
+        result.update({
+
+            "tri_signal":
+                direction,
+
+            "tri_touched":
+                True,
+
+            "tri_timeframe":
+                timeframe,
+
+            "tri_line":
+                float(line_price),
+
+            "tri_line_name":
+                line_name,
+
+            "next_tri_target":
+                float(target),
+
+            "second_tri_target":
+                (
+                    float(second_target)
+                    if second_target is not None
+                    else None
+                ),
+
+            "tri_stop_loss":
+                float(stop),
+
+            "tri_rr":
+                float(rr),
+
+            "tri_reason":
+                "TRI_LINE_TOUCH_CONFIRMED",
+        })
+
+        return result
+
+    # ========================================================
+    # SL TP
+    # ========================================================
+
+    def calculate_sl_tp(
+        self,
+        df,
+        current_price,
+        direction,
+        tri_setup,
+    ):
+
+        atr = max(
+            self.calculate_atr(
+                df,
+                14,
+            ),
+            current_price * 0.0005,
+        )
+
+        max_risk = (
+            current_price
+            * 0.006
+        )
+
+        risk = min(
+            atr,
+            max_risk,
+        )
+
+        if direction not in [
+            "LONG",
+            "SHORT",
+        ]:
+
+            return (
+                round(
+                    current_price - risk,
+                    4,
+                ),
+
+                round(
+                    current_price + risk * 2,
+                    4,
+                ),
+            )
+
+        if (
+            tri_setup
+            and tri_setup.get(
+                "tri_signal"
+            ) == direction
+            and tri_setup.get(
+                "next_tri_target"
+            ) is not None
+        ):
+
+            stop = self.safe_float(
+                tri_setup.get(
+                    "tri_stop_loss"
+                )
+            )
+
+            target = self.safe_float(
+                tri_setup.get(
+                    "next_tri_target"
+                )
+            )
+
+            if direction == "LONG":
+
+                stop = max(
+                    stop,
+                    current_price
+                    - max_risk,
+                )
+
+            else:
+
+                stop = min(
+                    stop,
+                    current_price
+                    + max_risk,
+                )
+
+            return (
+
+                round(
+                    float(stop),
+                    4,
+                ),
+
+                round(
+                    float(target),
+                    4,
+                ),
+            )
+
+        if direction == "LONG":
+
+            stop = (
+                current_price
+                - risk
+            )
+
+            target = (
+                current_price
+                + 2.0 * risk
+            )
+
+        else:
+
+            stop = (
+                current_price
+                + risk
+            )
+
+            target = (
+                current_price
+                - 2.0 * risk
+            )
+
+        return (
+
+            round(
+                float(stop),
+                4,
+            ),
+
+            round(
+                float(target),
+                4,
+            ),
+        )
+
+    # ========================================================
+    # SIGNAL CLASSIFICATION
+    # ========================================================
+
+    def classify_signal(
+        self,
+        final_score,
+        tri_signal,
+        ml_probability,
+    ):
+
+        final_score = self.safe_float(
+            final_score
+        )
+
+        ml_probability = self.safe_float(
+            ml_probability,
+            0.50,
+        )
+
+        # ----------------------------------------------------
+        # STRONG LONG
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            >= self.strong_long_threshold
+            and ml_probability
+            >= self.ml_strong_long_probability
+        ):
+
+            return "STRONG LONG"
+
+        # ----------------------------------------------------
+        # STRONG SHORT
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            <= self.strong_short_threshold
+            and ml_probability
+            <= self.ml_strong_short_probability
+        ):
+
+            return "STRONG SHORT"
+
+        # ----------------------------------------------------
+        # TRI CONFIRMED LONG
+        # ----------------------------------------------------
+
+        if (
+            tri_signal == "LONG"
+            and final_score >= 0.20
+        ):
+
+            return "LONG"
+
+        # ----------------------------------------------------
+        # TRI CONFIRMED SHORT
+        # ----------------------------------------------------
+
+        if (
+            tri_signal == "SHORT"
+            and final_score <= -0.20
+        ):
+
+            return "SHORT"
+
+        # ----------------------------------------------------
+        # NORMAL LONG
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            >= self.long_threshold
+        ):
+
+            return "LONG"
+
+        # ----------------------------------------------------
+        # NORMAL SHORT
+        # ----------------------------------------------------
+
+        if (
+            final_score
+            <= self.short_threshold
+        ):
+
+            return "SHORT"
+
+        return "WAIT"
+
+    # ========================================================
+    # HYSTERESIS
+    # ========================================================
+
+    def apply_hysteresis(
+        self,
+        signal,
+    ):
+
+        # Do not block first useful signal
+        if self.last_signal in [
+            "WAIT",
+            "NEUTRAL",
+        ]:
+
+            self.last_signal = signal
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Strong signals immediately pass
+        if signal in [
+            "STRONG LONG",
+            "STRONG SHORT",
+        ]:
+
+            self.last_signal = signal
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Same signal
+        if signal == self.last_signal:
+
+            self.cooldown_counter = 2
+
+            return signal
+
+        # Counter
+        if self.cooldown_counter > 0:
+
+            self.cooldown_counter -= 1
+
+            return self.last_signal
+
+        self.last_signal = signal
+
+        self.cooldown_counter = 2
+
+        return signal
+
+    # ========================================================
+    # MAIN SIGNAL ENGINE
+    # ========================================================
+
+    def calculate_all_signals(
+        self,
+        df,
+        bids,
+        asks,
+        current_inventory=0,
+        performance_history=None,
+        trades=None,
+        trade_mode="15M",
+    ):
+
+        trade_mode = str(
+            trade_mode
+        ).upper()
+
+        if (
+            trade_mode
+            not in self.trade_modes
+        ):
+
+            trade_mode = "15M"
+
+        df = self.normalize_dataframe(
+            df
+        )
+
+        # ====================================================
+        # FEATURES
+        # ====================================================
+
+        features = (
+            self.extract_features(
+                df,
+                bids,
+                asks,
+                trades,
+                performance_history,
+            )
+        )
+
+        # ====================================================
+        # QUANT SCORE
+        # ====================================================
+
+        vector = np.array(
+            [
+                features[name]
+                for name in self.feature_names
+            ],
+            dtype=float,
+        )
+
+        weights = np.array(
+            [
+                self.dynamic_weights[name]
+                for name in self.feature_names
+            ],
+            dtype=float,
+        )
+
+        quant_score = float(
+            np.dot(
+                vector,
+                weights,
+            )
+        )
+
+        quant_score = self.clip(
+            quant_score
+        )
+
+        # ====================================================
+        # ML
+        # ====================================================
+
+        ml = self.predict_ml(
+            features
+        )
+
+        ml_probability = (
+            ml["probability_up"]
+        )
+
+        ml_score = (
+            ml["score"]
+        )
+
+        ml_direction = (
+            ml["direction"]
+        )
+
+        # ====================================================
+        # FINAL SCORE
+        # ====================================================
+
+        if self.is_model_trained:
+
+            final_score = (
+                self.quant_weight
+                * quant_score
+                +
+                self.ml_weight
+                * ml_score
+            )
+
+        else:
+
+            final_score = quant_score
+
+        final_score = self.clip(
+            final_score
+        )
+
+        # ====================================================
+        # PRICE
+        # ====================================================
+
+        current_price = 0.0
+
+        if (
+            df is not None
+            and not df.empty
+            and "Close" in df.columns
+        ):
+
+            current_price = (
+                self.safe_float(
+                    df["Close"].iloc[-1]
+                )
+            )
+
+        # ====================================================
+        # TRI SETUP
+        # ====================================================
+
+        tri_setup = (
+            self.calculate_tri_setup(
+                trade_mode,
+                current_price,
+                quant_score,
+                ml_probability,
+                df,
+            )
+        )
+
+        # ====================================================
+        # CLASSIFY
+        # ====================================================
+
+        raw_signal = (
+            self.classify_signal(
+                final_score,
+                tri_setup[
+                    "tri_signal"
+                ],
+                ml_probability,
+            )
+        )
+
+        # ====================================================
+        # TRI DIRECTION FILTER
+        # ====================================================
+
+        tri_signal = (
+            tri_setup[
+                "tri_signal"
+            ]
+        )
+
+        if tri_signal in [
+            "LONG",
+            "SHORT",
+        ]:
+
+            if raw_signal in [
+                "LONG",
+                "STRONG LONG",
+            ]:
+
+                if tri_signal != "LONG":
+
+                    raw_signal = "WAIT"
+
+            elif raw_signal in [
+                "SHORT",
+                "STRONG SHORT",
+            ]:
+
+                if tri_signal != "SHORT":
+
+                    raw_signal = "WAIT"
+
+            elif raw_signal == "WAIT":
+
+                if (
+                    abs(final_score)
+                    >= 0.20
+                ):
+
+                    raw_signal = (
+                        tri_signal
+                    )
+
+        # ====================================================
+        # HYSTERESIS
+        # ====================================================
+
+        signal = (
+            self.apply_hysteresis(
+                raw_signal
+            )
+        )
+
+        # ====================================================
+        # DIRECTION
+        # ====================================================
+
+        if signal in [
+            "LONG",
+            "STRONG LONG",
+        ]:
+
+            direction = "LONG"
+
+        elif signal in [
+            "SHORT",
+            "STRONG SHORT",
+        ]:
+
+            direction = "SHORT"
+
+        else:
+
+            direction = "NEUTRAL"
+
+        # ====================================================
+        # SL / TP
+        # ====================================================
+
+        stop_loss, take_profit = (
+            self.calculate_sl_tp(
+                df,
+                current_price,
+                direction,
+                tri_setup,
+            )
+        )
+
+        # ====================================================
+        # CONFIDENCE
+        # ====================================================
+
+        confidence = (
+            abs(final_score)
+            * 100.0
+        )
+
+        # ML confidence contribution
+        if self.is_model_trained:
+
+            ml_confidence = (
+                abs(
+                    ml_probability
+                    - 0.50
+                )
+                * 200.0
+            )
+
+            confidence = (
+                confidence * 0.70
+                +
+                ml_confidence * 0.30
+            )
+
+        confidence = float(
+            np.clip(
+                confidence,
+                0,
+                100,
+            )
+        )
+
+        # ====================================================
+        # SIGNAL QUALITY
+        # ====================================================
+
+        if signal in [
+            "STRONG LONG",
+            "STRONG SHORT",
+        ]:
+
+            signal_quality = "A"
+
+        elif signal in [
+            "LONG",
+            "SHORT",
+        ]:
+
+            signal_quality = "B"
+
+        else:
+
+            signal_quality = "WAIT"
+
+        # ====================================================
+        # RISK/REWARD
+        # ====================================================
+
+        rr = 0.0
+
+        if direction == "LONG":
+
+            risk = (
+                current_price
+                - stop_loss
+            )
+
+            reward = (
+                take_profit
+                - current_price
+            )
+
+            if risk > 0:
+
+                rr = reward / risk
+
+        elif direction == "SHORT":
+
+            risk = (
+                stop_loss
+                - current_price
+            )
+
+            reward = (
+                current_price
+                - take_profit
+            )
+
+            if risk > 0:
+
+                rr = reward / risk
+
+        # ====================================================
+        # OBI DETAILS
+        # ====================================================
+
+        obi_details = (
+            self.calculate_obi_details(
+                bids,
+                asks,
+            )
+        )
+
+        # ====================================================
+        # ML STATUS
+        # ====================================================
+
+        if self.is_model_trained:
+
+            ml_status = "TRAINED"
+
+        else:
+
+            ml_status = "NOT_TRAINED"
+
+        # ====================================================
+        # REASON
+        # ====================================================
+
+        if signal in [
+            "STRONG LONG",
+            "LONG",
+        ]:
+
+            reason = (
+                "BULLISH_RESEARCH_CONFIRMATION"
+            )
+
+        elif signal in [
+            "STRONG SHORT",
+            "SHORT",
+        ]:
+
+            reason = (
+                "BEARISH_RESEARCH_CONFIRMATION"
+            )
+
+        else:
+
+            reason = (
+                tri_setup.get(
+                    "tri_reason",
+                    "WAITING_FOR_CONFIRMATION",
+                )
+            )
+
+        # ====================================================
+        # RETURN
+        # ====================================================
+
+        payload = {
+
+            # -----------------------------------------------
+            # SIGNAL
+            # -----------------------------------------------
+
+            "intent":
+                signal,
+
+            "direction":
+                direction,
+
+            "signal":
+                signal,
+
+            "raw_signal":
+                raw_signal,
+
+            "signal_quality":
+                signal_quality,
+
+            "reason":
+                reason,
+
+            # -----------------------------------------------
+            # SCORES
+            # -----------------------------------------------
+
+            "score":
+                final_score,
+
+            "final_score":
+                final_score,
+
+            "quant_score":
+                quant_score,
+
+            # -----------------------------------------------
+            # ML
+            # -----------------------------------------------
+
+            "ml_probability":
+                ml_probability,
+
+            "ml_probability_up":
+                ml_probability,
+
+            "ml_probability_down":
+                ml[
+                    "probability_down"
+                ],
+
+            "ml_score":
+                ml_score,
+
+            "ml_direction":
+                ml_direction,
+
+            "ml_strength":
+                ml.get(
+                    "strength",
+                    "NONE",
+                ),
+
+            "ml_trained":
+                self.is_model_trained,
+
+            "ml_status":
+                ml_status,
+
+            "ml_accuracy":
+                self.ml_accuracy,
+
+            "ml_logloss":
+                self.ml_logloss,
+
+            "ml_samples":
+                self.ml_samples,
+
+            # -----------------------------------------------
+            # CONFIDENCE
+            # -----------------------------------------------
+
+            "confidence":
+                confidence,
+
+            # -----------------------------------------------
+            # PRICE
+            # -----------------------------------------------
+
+            "current_price":
+                current_price,
+
+            "entry":
+                current_price,
+
+            "stop_loss":
+                stop_loss,
+
+            "take_profit":
+                take_profit,
+
+            "tp1":
+                take_profit,
+
+            "tp2":
+                tri_setup.get(
+                    "second_tri_target"
+                ),
+
+            "risk_reward":
+                float(rr),
+
+            # -----------------------------------------------
+            # MODE
+            # -----------------------------------------------
+
+            "trade_mode":
+                trade_mode,
+
+            # -----------------------------------------------
+            # TRI
+            # -----------------------------------------------
+
+            "tri_signal":
+                tri_setup[
+                    "tri_signal"
+                ],
+
+            "tri_touched":
+                tri_setup[
+                    "tri_touched"
+                ],
+
+            "tri_timeframe":
+                tri_setup[
+                    "tri_timeframe"
+                ],
+
+            "tri_line":
+                tri_setup[
+                    "tri_line"
+                ],
+
+            "tri_line_name":
+                tri_setup[
+                    "tri_line_name"
+                ],
+
+            "next_tri_target":
+                tri_setup[
+                    "next_tri_target"
+                ],
+
+            "second_tri_target":
+                tri_setup[
+                    "second_tri_target"
+                ],
+
+            "tri_stop_loss":
+                tri_setup[
+                    "tri_stop_loss"
+                ],
+
+            "tri_rr":
+                tri_setup[
+                    "tri_rr"
+                ],
+
+            "tri_reason":
+                tri_setup[
+                    "tri_reason"
+                ],
+
+            # -----------------------------------------------
+            # OBI
+            # -----------------------------------------------
+
+            "obi_top5":
+                obi_details[
+                    "OBI_TOP5"
+                ],
+
+            "obi_top10":
+                obi_details[
+                    "OBI_TOP10"
+                ],
+
+            "obi_top20":
+                obi_details[
+                    "OBI_TOP20"
+                ],
+
+            "obi_top50":
+                obi_details[
+                    "OBI_TOP50"
+                ],
+
+            "obi_final":
+                obi_details[
+                    "OBI_FINAL"
+                ],
+
+            # -----------------------------------------------
+            # WEIGHTS
+            # -----------------------------------------------
+
+            "quant_weight":
+                self.quant_weight,
+
+            "ml_weight":
+                self.ml_weight,
+
+            # -----------------------------------------------
+            # FEATURES
+            # -----------------------------------------------
+
+            "features":
+                features,
+
+            "feature_data":
+                features,
+
+            "weights":
+                self.dynamic_weights,
+
+            # -----------------------------------------------
+            # INVENTORY
+            # -----------------------------------------------
+
+            "current_inventory":
+                current_inventory,
+        }
+
+        return (
+            features,
+            payload,
+            self.dynamic_weights,
+        )
+
+
+# ============================================================
+# POWER TRADING RISK ENGINE
+# ============================================================
+
+class PowerTradingRiskEngine:
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def safe_float(
+        value,
+        default=0.0,
+    ):
+
+        try:
+
+            value = float(value)
+
+            if np.isfinite(value):
+                return value
+
+        except Exception:
+            pass
+
+        return default
+
+    # ========================================================
+    # RISK METRICS
+    # ========================================================
+
+    def calculate_risk_metrics(
+        self,
+        liquidation_volumes,
+        displayed_vol,
+        cancelled_vol,
+        time_exists,
+        obs_window,
+        open_interest,
+        leverage,
+        volatility,
+    ):
+
+        liquidation_volumes = np.asarray(
+            liquidation_volumes,
+            dtype=float,
+        )
+
+        liquidation_volumes = (
+            liquidation_volumes[
+                np.isfinite(
+                    liquidation_volumes
+                )
+            ]
+        )
+
+        displayed_vol = max(
+            self.safe_float(
+                displayed_vol
+            ),
+            0.0,
+        )
+
+        cancelled_vol = max(
+            self.safe_float(
+                cancelled_vol
+            ),
+            0.0,
+        )
+
+        time_exists = max(
+            self.safe_float(
+                time_exists
+            ),
+            0.0,
+        )
+
+        obs_window = max(
+            self.safe_float(
+                obs_window
+            ),
+            1e-8,
+        )
+
+        open_interest = max(
+            self.safe_float(
+                open_interest
+            ),
+            0.0,
+        )
+
+        leverage = max(
+            self.safe_float(
+                leverage
+            ),
+            0.0,
+        )
+
+        volatility = max(
+            self.safe_float(
+                volatility
+            ),
+            0.0,
+        )
+
+        # ====================================================
+        # LIQUIDATION
+        # ====================================================
+
+        if len(
+            liquidation_volumes
+        ):
+
+            total_ltz = float(
+                np.sum(
+                    liquidation_volumes
+                )
+            )
+
+            max_ltz = float(
+                np.max(
+                    liquidation_volumes
+                )
+            )
+
+        else:
+
+            total_ltz = 0.0
+
+            max_ltz = 0.0
+
+        ltz_score = (
+            max_ltz
+            /
+            (
+                total_ltz
+                + 1e-12
+            )
+        ) * 100.0
+
+        ltz_score = float(
+            np.clip(
+                ltz_score,
+                0,
+                100,
+            )
+        )
+
+        # ====================================================
+        # SPOOF
+        # ====================================================
+
+        spoof_ratio = (
+            cancelled_vol
+            /
+            (
+                displayed_vol
+                + 1e-12
+            )
+        )
+
+        persistence = np.clip(
+            time_exists
+            /
+            obs_window,
+            0,
+            1,
+        )
+
+        spoof_score = (
+            spoof_ratio
+            *
+            (
+                1
+                - persistence
+            )
+            * 100.0
+        )
+
+        spoof_score = float(
+            np.clip(
+                spoof_score,
+                0,
+                100,
+            )
+        )
+
+        # ====================================================
+        # SQUEEZE
+        # ====================================================
+
+        liquidation_intensity = (
+            total_ltz
+            /
+            (
+                total_ltz
+                + displayed_vol
+                + 1e-12
+            )
+        )
+
+        leverage_factor = np.clip(
+            leverage / 20.0,
+            0,
+            5,
+        )
+
+        volatility_factor = np.clip(
+            volatility,
+            0,
+            1,
+        )
+
+        squeeze_risk = (
+            liquidation_intensity
+            * leverage_factor
+            * volatility_factor
+            * 100.0
+        )
+
+        squeeze_risk = float(
+            np.clip(
+                squeeze_risk,
+                0,
+                100,
+            )
+        )
+
+        # ====================================================
+        # FINAL RISK
+        # ====================================================
+
+        market_risk = (
+
+            0.40
+            * ltz_score
+
+            +
+
+            0.25
+            * spoof_score
+
+            +
+
+            0.35
+            * squeeze_risk
+        )
+
+        market_risk = float(
+            np.clip(
+                market_risk,
+                0,
+                100,
+            )
+        )
+
+        if market_risk >= 75:
+
+            risk_level = "EXTREME"
+
+        elif market_risk >= 55:
+
+            risk_level = "HIGH"
+
+        elif market_risk >= 30:
+
+            risk_level = "MEDIUM"
+
+        else:
+
+            risk_level = "LOW"
+
+        return {
+
+            "LTZ_Score":
+                ltz_score,
+
+            "Spoof_Score":
+                spoof_score,
+
+            "Squeeze_Risk":
+                squeeze_risk,
+
+            "Market_Risk":
+                market_risk,
+
+            "Risk_Level":
+                risk_level,
+        }
+
+
+# ============================================================
+# INTEGRATED RESEARCH + RISK ENGINE
+# ============================================================
+
+class IntegratedTradingEngine:
+
+    def __init__(
+        self,
+        symbol=DEFAULT_SYMBOL,
+    ):
+
+        self.symbol = str(
+            symbol
+        ).upper()
+
+        self.tri_engine = (
+            TRILineEngine(
+                symbol=self.symbol
+            )
+        )
+
+        self.research = (
+            TenPaperResearchLab(
+                tri_engine=self.tri_engine
+            )
+        )
+
+        self.risk = (
+            PowerTradingRiskEngine()
+        )
+
+    # ========================================================
+    # ANALYZE
+    # ========================================================
+
+    def analyze(
+        self,
+        df,
+        bids,
+        asks,
+        trades=None,
+        performance_history=None,
+        trade_mode="15M",
+        current_inventory=0,
+    ):
+
+        (
+            features,
+            signal,
+            weights,
+        ) = self.research.calculate_all_signals(
+
+            df=df,
+
+            bids=bids,
+
+            asks=asks,
+
+            trades=trades,
+
+            performance_history=(
+                performance_history
+            ),
+
+            trade_mode=trade_mode,
+
+            current_inventory=(
+                current_inventory
+            ),
+        )
+
+        return {
+
+            # =================================================
+            # SIGNAL
+            # =================================================
+
+            "SIGNAL":
+                signal["signal"],
+
+            "DIRECTION":
+                signal["direction"],
+
+            "RAW_SIGNAL":
+                signal["raw_signal"],
+
+            "SIGNAL_QUALITY":
+                signal["signal_quality"],
+
+            "REASON":
+                signal["reason"],
+
+            # =================================================
+            # SCORES
+            # =================================================
+
+            "SCORE":
+                signal["score"],
+
+            "FINAL_SCORE":
+                signal["final_score"],
+
+            "QUANT_SCORE":
+                signal["quant_score"],
+
+            # =================================================
+            # CONFIDENCE
+            # =================================================
+
+            "CONFIDENCE":
+                signal["confidence"],
+
+            # =================================================
+            # ML
+            # =================================================
+
+            "ML_PROBABILITY":
+                signal["ml_probability"],
+
+            "ML_PROBABILITY_UP":
+                signal[
+                    "ml_probability_up"
+                ],
+
+            "ML_PROBABILITY_DOWN":
+                signal[
+                    "ml_probability_down"
+                ],
+
+            "ML_SCORE":
+                signal["ml_score"],
+
+            "ML_DIRECTION":
+                signal["ml_direction"],
+
+            "ML_STRENGTH":
+                signal["ml_strength"],
+
+            "ML_TRAINED":
+                signal["ml_trained"],
+
+            "ML_STATUS":
+                signal["ml_status"],
+
+            "ML_ACCURACY":
+                signal["ml_accuracy"],
+
+            "ML_LOGLOSS":
+                signal["ml_logloss"],
+
+            "ML_SAMPLES":
+                signal["ml_samples"],
+
+            # =================================================
+            # PRICE
+            # =================================================
+
+            "CURRENT_PRICE":
+                signal["current_price"],
+
+            "ENTRY":
+                signal["entry"],
+
+            "STOP_LOSS":
+                signal["stop_loss"],
+
+            "TAKE_PROFIT":
+                signal["take_profit"],
+
+            "TP1":
+                signal["tp1"],
+
+            "TP2":
+                signal["tp2"],
+
+            "RISK_REWARD":
+                signal["risk_reward"],
+
+            # =================================================
+            # MODE
+            # =================================================
+
+            "TRADE_MODE":
+                signal["trade_mode"],
+
+            # =================================================
+            # TRI
+            # =================================================
+
+            "TRI_SIGNAL":
+                signal["tri_signal"],
+
+            "TRI_TOUCHED":
+                signal["tri_touched"],
+
+            "TRI_TIMEFRAME":
+                signal["tri_timeframe"],
+
+            "TRI_LINE":
+                signal["tri_line"],
+
+            "TRI_LINE_NAME":
+                signal["tri_line_name"],
+
+            "NEXT_TRI_TARGET":
+                signal["next_tri_target"],
+
+            "SECOND_TRI_TARGET":
+                signal["second_tri_target"],
+
+            "TRI_STOP_LOSS":
+                signal["tri_stop_loss"],
+
+            "TRI_RR":
+                signal["tri_rr"],
+
+            "TRI_REASON":
+                signal["tri_reason"],
+
+            # =================================================
+            # OBI
+            # =================================================
+
+            "OBI_TOP5":
+                signal["obi_top5"],
+
+            "OBI_TOP10":
+                signal["obi_top10"],
+
+            "OBI_TOP20":
+                signal["obi_top20"],
+
+            "OBI_TOP50":
+                signal["obi_top50"],
+
+            "OBI_FINAL":
+                signal["obi_final"],
+
+            # =================================================
+            # FEATURES
+            # =================================================
+
+            "FEATURES":
+                features,
+
+            "FEATURE_DATA":
+                signal["feature_data"],
+
+            # =================================================
+            # WEIGHTS
+            # =================================================
+
+            "WEIGHTS":
+                weights,
+
+            "QUANT_WEIGHT":
+                signal["quant_weight"],
+
+            "ML_WEIGHT":
+                signal["ml_weight"],
+        }
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 80)
+
     print(
-        '[INFO] Processing features for 1-2 Hour Swing Horizon (5m Resolution)...'
+        "RESEARCH LAB - ML + TRI + OBI ENGINE V3"
     )
 
-    cross_ofi = self.compute_cross_ofi(venues_data, beta_weights)
-    trade_features = self.compute_cvd_skew_features(trade_df)
-    agg_price = list(venues_data.values())[0]['bid_p']
-    kyles_lam = self.compute_kyles_lambda(
-        trade_features['net_trade_vol'], agg_price
+    print("=" * 80)
+
+    tri_engine = (
+        TRILineEngine(
+            symbol="BTCUSDT"
+        )
     )
 
-    perp_p = trade_df.get('perp_price', agg_price * 1.001)
-    spot_p = trade_df.get('spot_price', agg_price)
-    basis, basis_vel = self.compute_basis_velocity(perp_p, spot_p)
+    research_lab = (
+        TenPaperResearchLab(
+            tri_engine=tri_engine
+        )
+    )
 
-    feature_df = pd.DataFrame(index=trade_features.index)
-    feature_df['Cross_OFI'] = cross_ofi
-    feature_df['Kyles_Lambda'] = kyles_lam
-    feature_df['CVD'] = trade_features['cvd']
-    feature_df['CVD_Skew'] = trade_features['cvd_skew']
-    feature_df['EMA_10'] = trade_features['ema_10']
-    feature_df['EMA_20'] = trade_features['ema_20']
-    feature_df['Basis'] = basis
-    feature_df['Basis_Velocity'] = basis_vel
-    feature_df['Close_Price'] = agg_price
+    risk_engine = (
+        PowerTradingRiskEngine()
+    )
 
-    # Target definition for 1-2 hour horizon (checking price 12 bars ahead ~ 1 hour)
-    horizon_bars = 12
-    future_returns = agg_price.shift(-horizon_bars) - agg_price
-    feature_df['Target'] = np.where(future_returns > 0, 1, 0)
+    integrated = (
+        IntegratedTradingEngine(
+            symbol="BTCUSDT"
+        )
+    )
 
-    return feature_df.dropna()
+    print()
 
-  def walk_forward_training_with_targets(self, feature_df: pd.DataFrame):
-    print('[INFO] Starting Walk-Forward Training & Target Generation Loop...')
+    print(
+        "Symbol:",
+        integrated.symbol
+    )
 
-    X = feature_df.drop(columns=['Target', 'Close_Price'])
-    prices = feature_df['Close_Price']
-    y = feature_df['Target']
+    print()
 
-    n_samples = len(X)
-    predictions = []
-    actuals = []
-    trade_signals = []
+    print(
+        "Research Features:"
+    )
 
-    for i in range(self.ml_lookback, n_samples - 12):
-      X_train = X.iloc[i - self.ml_lookback : i]
-      y_train = y.iloc[i - self.ml_lookback : i]
-      X_test = X.iloc[[i]]
+    for feature in (
+        research_lab.feature_names
+    ):
 
-      X_train_scaled = self.scaler.fit_transform(X_train)
-      X_test_scaled = self.scaler.transform(X_test)
+        print(
+            "  -",
+            feature
+        )
 
-      self.model.fit(X_train_scaled, y_train)
-      pred = self.model.predict(X_test_scaled)[0]
+    print()
 
-      current_price = prices.iloc[i]
+    print(
+        "TRI Trade Modes:"
+    )
 
-      # Dynamic Target & Risk Management Setup (Risk-Reward Ratio 1:2)
-      if pred == 1:  # Long Signal
-        take_profit = current_price * 1.015  # +1.5% Target
-        stop_loss = current_price * 0.995  # -0.5% Stop Loss
-        signal_type = 'LONG'
-      else:  # Short Signal
-        take_profit = current_price * 0.985  # -1.5% Target
-        stop_loss = current_price * 1.005  # +0.5% Stop Loss
-        signal_type = 'SHORT'
+    print(
+        "  15M -> 1H + 4H"
+    )
 
-      predictions.append(pred)
-      actuals.append(y.iloc[i])
-      trade_signals.append({
-          'Timestamp': X.index[i],
-          'Signal': signal_type,
-          'Entry_Price': current_price,
-          'Take_Profit': take_profit,
-          'Stop_Loss': stop_loss,
-      })
+    print(
+        "  1H  -> DAILY + WEEKLY"
+    )
 
-    acc = accuracy_score(actuals, predictions)
-    print('\n================ SWING STRATEGY PERFORMANCE ================')
-    print(f'Holding Window Target: 1 Hour (5m x 12 bars)')
-    print(f'Model Accuracy: {acc * 100:.2f}%')
-    print('------------------------------------------------------------')
-    print(pd.DataFrame(trade_signals).tail(5))  print last 5 generated signals
-    print('============================================================')
+    print(
+        "  4H  -> WEEKLY + MONTHLY"
+    )
 
-    return trade_signals
+    print()
 
+    print(
+        "TRI Lines:"
+    )
 
-# ==========================================
-# SIMULATION ENTRY POINT (5-Min Bars)
-# ==========================================
-if __name__ == '__main__':
-  np.random.seed(42)
-  # 5-minute frequency simulation for swing horizons
-  time_index = pd.date_range(start='2026-08-01', periods=1500, freq='5min')
+    print(
+        "  BODY_50"
+    )
 
-  venues_mock = {
-      'MEXC': pd.DataFrame(
-          {
-              'bid_p': 60000 + np.cumsum(np.random.randn(1500) * 15),
-              'ask_p': 60002 + np.cumsum(np.random.randn(1500) * 15),
-              'bid_v': np.random.randint(50, 500, size=1500),
-              'ask_v': np.random.randint(50, 500, size=1500),
-          },
-          index=time_index,
-      ),
-      'Binance': pd.DataFrame(
-          {
-              'bid_p': 59998 + np.cumsum(np.random.randn(1500) * 15),
-              'ask_p': 60000 + np.cumsum(np.random.randn(1500) * 15),
-              'bid_v': np.random.randint(50, 500, size=1500),
-              'ask_v': np.random.randint(50, 500, size=1500),
-          },
-          index=time_index,
-      ),
-  }
+    print(
+        "  UPPER_50"
+    )
 
-  trade_mock = pd.DataFrame(
-      {
-          'v_market_buy': np.random.randint(20, 200, size=1500),
-          'v_market_sell': np.random.randint(20, 200, size=1500),
-          'perp_price': 60010 + np.cumsum(np.random.randn(1500) * 15),
-          'spot_price': 60000 + np.cumsum(np.random.randn(1500) * 15),
-      },
-      index=time_index,
-  )
+    print(
+        "  LOWER_50"
+    )
 
-  beta_weights_config = {'MEXC': 0.55, 'Binance': 0.45}
+    print()
 
-  engine = SwingQuantTradingEngine(T_window=12, ml_lookback=300)
-  processed_features = engine.feature_engineering_pipeline(
-      venues_mock, trade_mock, beta_weights_config
-  )
-  engine.walk_forward_training_with_targets(processed_features)
+    print(
+        "Signal Types:"
+    )
+
+    print(
+        "  STRONG LONG"
+    )
+
+    print(
+        "  LONG"
+    )
+
+    print(
+        "  WAIT"
+    )
+
+    print(
+        "  SHORT"
+    )
+
+    print(
+        "  STRONG SHORT"
+    )
+
+    print()
+
+    print(
+        "ML Trained:",
+        research_lab.is_model_trained
+    )
+
+    print(
+        "ML Accuracy:",
+        round(
+            research_lab.ml_accuracy
+            * 100,
+            2,
+        ),
+        "%"
+    )
+
+    print(
+        "ML Samples:",
+        research_lab.ml_samples
+    )
+
+    print()
+
+    print(
+        "Quant Weight:",
+        research_lab.quant_weight
+    )
+
+    print(
+        "ML Weight:",
+        research_lab.ml_weight
+    )
+
+    print()
+
+    print(
+        "LONG Threshold:",
+        research_lab.long_threshold
+    )
+
+    print(
+        "STRONG LONG Threshold:",
+        research_lab.strong_long_threshold
+    )
+
+    print(
+        "SHORT Threshold:",
+        research_lab.short_threshold
+    )
+
+    print(
+        "STRONG SHORT Threshold:",
+        research_lab.strong_short_threshold
+    )
+
+    print()
+
+    print(
+        "Minimum TRI RR:",
+        research_lab.minimum_tri_rr
+    )
+
+    print()
+
+    print(
+        "Model:",
+        research_lab.model_file
+    )
+
+    print(
+        "Scaler:",
+        research_lab.scaler_file
+    )
+
+    print()
+
+    print(
+        "Research Lab ready."
+    )
+
+    print("=" * 80)
