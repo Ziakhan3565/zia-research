@@ -116,10 +116,10 @@ replacement = '''    with tabs[6]:
         st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
                     '<div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • new signals are saved automatically • live P&L</div>',
                     unsafe_allow_html=True)
-        rows = auto_rows
+        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]
+        rows.sort(key=lambda r: r["pnl_pct"], reverse=True)
         longs = sum(1 for r in rows if r["signal"] == "LONG")
-        shorts = sum(1 for r in rows if r["signal"] == "SHORT")
-        waits = sum(1 for r in rows if r["signal"] == "WAIT")'''
+        shorts = sum(1 for r in rows if r["signal"] == "SHORT")'''
 if start not in s:
     raise SystemExit("scanner marker not found")
 s = s.replace(start, replacement, 1)
@@ -157,5 +157,9 @@ s = s.replace(
     '        h = read_csv(SIGNAL_FILE)\n        if not h.empty and "timeframe" in h.columns:\n            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]\n        t = read_csv(TRADE_FILE)',
     1
 )
+
+# Ensure the auto scanner list is signal-only and never references the old price-change field.
+s = s.replace('        rows = auto_rows\n', '        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]\n', 1)
+s = s.replace('            chg_cls = "good" if r["change"] >= 0 else "bad"\n', '            chg_cls = "good" if r["pnl_pct"] >= 0 else "bad"\n', 1)
 
 p.write_text(s, encoding="utf-8")
