@@ -3,14 +3,14 @@ name: Fix history and smooth refresh
 on:
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/fix-history-smooth-refresh.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   patch:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,11 +23,56 @@ jobs:
           p = Path('dashboard.py')
           s = p.read_text(encoding='utf-8')
 
-          old = '@st.fragment(run_every="1s")\ndef live_engine():'
-          new = '@st.fragment(run_every="2s")\ndef live_engine():'
-          if old not in s:
-              raise SystemExit('live_engine decorator not found')
-          s = s.replace(old, new, 1)
+          # 15-second fragment cadence: only the live engine fragment reruns,
+          # not the browser page, so the user does not see a hard refresh.
+          s = s.replace('@st.fragment(run_every="1s")', '@st.fragment(run_every="15s")', 1)
+          s = s.replace('@st.fragment(run_every="2s")', '@st.fragment(run_every="15s")', 1)
+          s = s.replace('@st.fragment(run_every="5s")', '@st.fragment(run_every="15s")', 1)
+
+          # Add BUY/SELL markers to the chart for the selected coin. Signals
+          # remain LONG/SHORT internally; the chart uses trading terminology.
+          marker_block = r'''
+    # Per-coin signal markers: BTC signals appear on BTC charts, XRP signals on
+    # XRP charts, etc. Markers are sourced from the same saved signal journal.
+    try:
+        signal_hist = load_signal_history()
+        if not signal_hist.empty and {"symbol", "signal", "timestamp", "price"}.issubset(signal_hist.columns):
+            sh = signal_hist[signal_hist["symbol"].astype(str) == str(symbol)].copy()
+            if not sh.empty:
+                sh["_time"] = pd.to_datetime(sh["timestamp"], utc=True, errors="coerce")
+                sh["_price"] = pd.to_numeric(sh["price"], errors="coerce")
+                sh = sh.dropna(subset=["_time", "_price"])
+                sh = sh[(sh["_time"] >= view["Time"].min()) & (sh["_time"] <= view["Time"].max())]
+                if not sh.empty:
+                    sh["_label"] = sh["signal"].astype(str).str.upper().map({"LONG": "BUY", "SHORT": "SELL"}).fillna(sh["signal"].astype(str).str.upper())
+                    for label in ["BUY", "SELL"]:
+                        part = sh[sh["_label"] == label]
+                        if part.empty:
+                            continue
+                        timeframes = part["timeframe"].astype(str).tolist() if "timeframe" in part.columns else [tf] * len(part)
+                        fig.add_trace(go.Scatter(
+                            x=part["_time"],
+                            y=part["_price"],
+                            mode="markers+text",
+                            name=f"{label} SIGNAL",
+                            text=[f"{label} • {t}" for t in timeframes],
+                            textposition="top center" if label == "BUY" else "bottom center",
+                            textfont=dict(size=10, color="#edf3fb"),
+                            marker=dict(size=12,
+                                        symbol="triangle-up" if label == "BUY" else "triangle-down",
+                                        color="#42dda0" if label == "BUY" else "#ff7184",
+                                        line=dict(width=1, color="#080d14")),
+                            hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
+                        ))
+    except Exception:
+        pass
+'''
+
+          needle = '    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)'
+          if marker_block.strip() not in s:
+              if needle not in s:
+                  raise SystemExit('signal chart insertion point not found')
+              s = s.replace(needle, marker_block + '\n' + needle, 1)
 
           old = '<div class="live"><span class="dot"></span>LIVE • SILENT 1S</div>'
           new = '<div class="live"><span class="dot"></span>LIVE • SILENT</div>'
@@ -38,12 +83,6 @@ jobs:
           new = 'st.write(f"Engine: `{elapsed:.0f} ms` • silent live cycle")'
           if old in s:
               s = s.replace(old, new, 1)
-
-          old = '''    with tabs[5]:\n        if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):\n            save_signal(symbol, tf, price, signal, confidence, prob, f, rscore)\n            st.success("Signal saved")\n        h = read_csv(SIGNAL_FILE)'''
-          new = '''    with tabs[5]:\n        hcol1, hcol2 = st.columns([3, 1])\n        with hcol1:\n            if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):\n                save_signal(symbol, tf, price, signal, confidence, prob, f, rscore, mlstat, pred, mlscore)\n                st.success("Signal saved")\n        with hcol2:\n            if st.button("🗑 CLEAR HISTORY", use_container_width=True, key="clear_signal_history_btn"):\n                try:\n                    if SIGNAL_FILE.exists():\n                        SIGNAL_FILE.unlink()\n                    st.session_state.auto_scan_rows_map = {}\n                    st.session_state.auto_scan_cursor = 0\n                    st.session_state.active_signal = None\n                    st.session_state.active_signal_started = None\n                    st.session_state.active_signal_key = None\n                    st.session_state.active_signal_confidence = None\n                    st.session_state.active_signal_combined = None\n                    st.success("Signal history cleared")\n                except Exception as exc:\n                    st.error(f"Could not clear signal history: {exc}")\n        h = read_csv(SIGNAL_FILE)'''
-          if old not in s:
-              raise SystemExit('signal history UI block not found')
-          s = s.replace(old, new, 1)
 
           p.write_text(s, encoding='utf-8')
           PY
@@ -59,6 +98,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Add clear signal history and smoother silent refresh"
+            git commit -m "Make dashboard refresh silent and show per-coin signal markers"
             git push
           fi
