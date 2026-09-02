@@ -573,7 +573,7 @@ if "active_signal_combined" not in st.session_state:
 
 st.markdown('<div class="hero"><div><div class="brand">ZIA <b>RESEARCH</b></div>'
             '<div class="micro">QUANT MARKET INTELLIGENCE • LIVE ML • ORDER FLOW • MULTI-MARKET SCANNER</div></div>'
-            '<div class="live"><span class="dot"></span>LIVE • SILENT 1S</div></div>', unsafe_allow_html=True)
+            '<div class="live"><span class="dot"></span>LIVE • SILENT</div></div>', unsafe_allow_html=True)
 
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1.3])
 with c1:
@@ -596,7 +596,7 @@ st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
             f'<div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every="2s")
 def live_engine():
     cycle_started = time.perf_counter()
 
@@ -798,7 +798,7 @@ def live_engine():
             st.write(f"Candles: `{source}`")
             st.write(f"Order book: `{bsrc}`")
             st.write(f"Connection: `{cstat} / {bstat}`")
-            st.write(f"Engine: `{elapsed:.0f} ms` • silent 1s cycle")
+            st.write(f"Engine: `{elapsed:.0f} ms` • silent live cycle")
             st.write(f"Updated: `{datetime.now().strftime('%H:%M:%S')}`")
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -846,9 +846,26 @@ def live_engine():
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tabs[5]:
-        if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):
-            save_signal(symbol, tf, price, signal, confidence, prob, f, rscore)
-            st.success("Signal saved")
+        hcol1, hcol2 = st.columns([3, 1])
+        with hcol1:
+            if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):
+                save_signal(symbol, tf, price, signal, confidence, prob, f, rscore, mlstat, pred, mlscore)
+                st.success("Signal saved")
+        with hcol2:
+            if st.button("🗑 CLEAR HISTORY", use_container_width=True, key="clear_signal_history_btn"):
+                try:
+                    if SIGNAL_FILE.exists():
+                        SIGNAL_FILE.unlink()
+                    st.session_state.auto_scan_rows_map = {}
+                    st.session_state.auto_scan_cursor = 0
+                    st.session_state.active_signal = None
+                    st.session_state.active_signal_started = None
+                    st.session_state.active_signal_key = None
+                    st.session_state.active_signal_confidence = None
+                    st.session_state.active_signal_combined = None
+                    st.success("Signal history cleared")
+                except Exception as exc:
+                    st.error(f"Could not clear signal history: {exc}")
         h = read_csv(SIGNAL_FILE)
         if not h.empty and "timeframe" in h.columns:
             h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]
