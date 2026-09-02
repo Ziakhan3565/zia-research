@@ -23,27 +23,29 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('dashboard.py')
           text = path.read_text(encoding='utf-8')
           original = text
 
-          # Only rerun the Streamlit fragment. This avoids a browser/page
-          # reload, so the terminal remains visually continuous.
-          import re
-          text = re.sub(r'@st\.fragment\(run_every="[0-9]+s"\)\n(?=def live_engine\(\):)',
-                        '@st.fragment(run_every="15s")\n', text, count=1)
+          # Seamless fragment refresh: no browser/page reload or white/black flash.
+          text = re.sub(
+              r'@st\.fragment\(run_every="[0-9]+s"\)\n(?=def live_engine\(\):)',
+              '@st.fragment(run_every="15s")\n',
+              text,
+              count=1,
+          )
 
-          # Keep the complete automatic signal loop focused on the requested
-          # trading timeframes. The scanner state persists between fragment
-          # refreshes, so history contains signals from every tracked coin and
-          # all three requested timeframes without selecting a coin first.
-          text = text.replace('AUTO_SCAN_TFS = ("15M", "1H", "4H")',
-                              'AUTO_SCAN_TFS = ("15M", "1H", "4H")')
+          # Keep automatic scanning limited to the requested timeframes and all tracked coins.
+          text = text.replace(
+              'AUTO_SCAN_TFS = ("15M", "1H", "4H")',
+              'AUTO_SCAN_TFS = ("15M", "1H", "4H")',
+          )
 
-          marker_block = r'''
-    # Draw every saved signal for the selected coin directly on its chart.
-    # LONG/SHORT remain the engine values; the chart shows user-facing BUY/SELL.
+          # Put every saved signal for the selected coin directly on its chart.
+          marker_block = '''    # Saved BUY/SELL markers for this coin. Engine LONG/SHORT values are
+    # translated to user-facing BUY/SELL labels without changing signal logic.
     try:
         signal_hist = load_signal_history()
         required = {"symbol", "signal", "timestamp", "price"}
@@ -68,42 +70,40 @@ jobs:
                         text=[f"{label} • {x}" for x in tfs],
                         textposition="top center" if label == "BUY" else "bottom center",
                         textfont=dict(size=10, color="#edf3fb"),
-                        marker=dict(size=12,
-                                    symbol="triangle-up" if label == "BUY" else "triangle-down",
-                                    color="#42dda0" if label == "BUY" else "#ff7184",
-                                    line=dict(width=1, color="#080d14")),
+                        marker=dict(
+                            size=12,
+                            symbol="triangle-up" if label == "BUY" else "triangle-down",
+                            color="#42dda0" if label == "BUY" else "#ff7184",
+                            line=dict(width=1, color="#080d14"),
+                        ),
                         hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
                     ))
     except Exception:
         pass
 '''
-
           needle = '    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)'
-          if marker_block.strip() not in text:
+          if 'Saved BUY/SELL markers for this coin.' not in text:
               if needle not in text:
                   raise SystemExit('Chart insertion point not found; refusing partial patch.')
               text = text.replace(needle, marker_block + '\n' + needle, 1)
 
-          # Signal History must always show the complete automatic universe:
-          # every saved 15M, 1H and 4H signal, across all coins, newest first.
-          old = '''        h = read_csv(SIGNAL_FILE)
-        if not h.empty and "timeframe" in h.columns:
-            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]'''
-          new = '''        h = read_csv(SIGNAL_FILE)
-        if not h.empty and "timeframe" in h.columns:
-            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)].copy()
-            if "timestamp" in h.columns:
-                h["_sort_time"] = pd.to_datetime(h["timestamp"], utc=True, errors="coerce")
-                h = h.sort_values("_sort_time", ascending=False, na_position="last").drop(columns=["_sort_time"], errors="ignore")'''
+          # Add a reusable live PNL calculator for the signal journal.
+          pnl_func = '''\n\ndef live_signal_history_view(h):\n    """Return signal history with live mark-to-market PNL and active status.\n\n    Only 15M/1H/4H signals are considered. The latest signal per coin/timeframe\n    is the active one while its configured validity window is still running.\n    PNL is calculated from the saved signal price to the current market price.\n    """\n    if h is None or h.empty:\n        return h, {"active": 0, "profit": 0.0, "loss": 0.0, "total": 0.0}\n    out = h.copy()\n    if "timeframe" in out.columns:\n        out = out[out["timeframe"].astype(str).isin(AUTO_SCAN_TFS)].copy()\n    if out.empty:\n        return out, {"active": 0, "profit": 0.0, "loss": 0.0, "total": 0.0}\n\n    out["_ts"] = pd.to_datetime(out.get("timestamp"), utc=True, errors="coerce")\n    out["_entry"] = pd.to_numeric(out.get("price"), errors="coerce")\n    prices = live_prices()\n    now = datetime.now(timezone.utc)\n    out["LIVE PNL"] = np.nan\n    out["PNL STATUS"] = "EXPIRED"\n\n    # Only the latest saved signal for each coin/timeframe can be active.\n    latest_idx = {}\n    for idx, row in out.sort_values("_ts").iterrows():\n        key = (str(row.get("symbol", "")), str(row.get("timeframe", "")))\n        latest_idx[key] = idx\n\n    profit = loss = 0.0\n    active = 0\n    for idx, row in out.iterrows():\n        symbol_key = str(row.get("symbol", ""))\n        tf_key = str(row.get("timeframe", ""))\n        signal = str(row.get("signal", "")).upper()\n        ts = row.get("_ts")\n        entry = num(row.get("_entry"))\n        current = num(prices.get(symbol_key), 0.0)\n        validity = signal_validity_minutes(tf_key)\n        is_active = (\n            idx == latest_idx.get((symbol_key, tf_key))\n            and signal in ("LONG", "SHORT")\n            and pd.notna(ts)\n            and validity > 0\n            and (now - ts.to_pydatetime()) < timedelta(minutes=validity)\n            and entry > 0\n            and current > 0\n        )\n        if is_active:\n            pnl = live_signal_pnl(entry, current, signal)\n            out.at[idx, "LIVE PNL"] = pnl\n            out.at[idx, "PNL STATUS"] = "LIVE PROFIT" if pnl >= 0 else "LIVE LOSS"\n            active += 1\n            if pnl >= 0:\n                profit += pnl\n            else:\n                loss += pnl\n\n    out = out.sort_values("_ts", ascending=False, na_position="last")\n    out = out.drop(columns=["_ts", "_entry"], errors="ignore")\n    return out, {"active": active, "profit": profit, "loss": loss, "total": profit + loss}\n'''
+          if 'def live_signal_history_view(h):' not in text:
+              needle_func = '\ndef trade_pnl_stats(t):'
+              if needle_func not in text:
+                  raise SystemExit('Signal PNL insertion point not found.')
+              text = text.replace(needle_func, pnl_func + needle_func, 1)
+
+          # Replace the Signal History table block with all-coin 15M/1H/4H live PNL.
+          old = '''        h = read_csv(SIGNAL_FILE)\n        if not h.empty and "timeframe" in h.columns:\n            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]\n        t = read_csv(TRADE_FILE)\n        if not h.empty:\n            st.dataframe(h.tail(80).iloc[::-1], use_container_width=True, hide_index=True)\n            st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)\n        else:\n            st.info("No saved signals yet.")'''
+          new = '''        h = read_csv(SIGNAL_FILE)\n        h, live_pnl = live_signal_history_view(h)\n\n        # Live PNL summary stays at the top of Signal History.\n        cards([\n            ("LIVE PROFIT", f"+{live_pnl['profit']:.2f}%", f"{live_pnl['active']} active signals", "good"),\n            ("LIVE LOSS", f"{live_pnl['loss']:.2f}%", "active signal drawdown", "bad"),\n            ("TOTAL LIVE PNL", f"{live_pnl['total']:+.2f}%", "profit + loss across active 15M/1H/4H", "good" if live_pnl['total'] >= 0 else "bad"),\n            ("ACTIVE", str(live_pnl['active']), "latest signal per coin/timeframe", "cyan"),\n        ])\n\n        t = read_csv(TRADE_FILE)\n        if not h.empty:\n            st.dataframe(h.head(120), use_container_width=True, hide_index=True)\n            st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)\n        else:\n            st.info("No saved 15M / 1H / 4H signals yet.")'''
           if old in text:
               text = text.replace(old, new, 1)
+          elif 'TOTAL LIVE PNL' not in text:
+              raise SystemExit('Signal History table block not found; refusing partial patch.')
 
-          if text != original:
-              path.write_text(text, encoding='utf-8')
-              print('Dashboard patched successfully.')
-          else:
-              print('Dashboard already contains requested UX changes.')
-          PY
+          # Keep all requested timeframes and newest signals first in Signal History.\n          if text != original:\n              path.write_text(text, encoding='utf-8')\n              print('Dashboard patched successfully.')\n          else:\n              print('Dashboard already contains requested UX changes.')\n          PY
 
       - name: Validate Python syntax
         run: python -m py_compile dashboard.py
@@ -116,6 +116,6 @@ jobs:
           if git diff --cached --quiet; then
             echo 'No dashboard changes to commit.'
           else
-            git commit -m 'Use seamless 15s refresh and complete signal chart history'
+            git commit -m 'Add live PNL to complete signal history'
             git push
           fi
