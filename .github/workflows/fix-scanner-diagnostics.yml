@@ -1,0 +1,67 @@
+name: Fix scanner diagnostics
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix scanner diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+
+          # Fix the scanner's undefined ML variables and return the full diagnostic state.
+          old = '''    pred, prob, _, _ = ml_predict(f)\n    strict = tf_key == "15M"\n    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold, strict=strict)'''
+          new = '''    pred, prob, mlstat, feature_count = ml_predict(f)\n    strict = tf_key == "15M"\n    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold, strict=strict)'''
+          if old not in s:
+              raise SystemExit('scan_symbol target not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,\n            "ml_status": mlstat, "ml_features": feature_count}'''
+          new = '''            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,\n            "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,\n            "ml_score": mlscore, "research_scores": rs}'''
+          if old not in s:
+              raise SystemExit('scan return target not found')
+          s = s.replace(old, new, 1)
+
+          # Preserve diagnostics when an automatically locked signal is written to the scanner map.
+          old = '''                "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),\n                "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),\n                "ml_features": snap.get("ml_features", 0)}'''
+          new = '''                "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),\n                "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),\n                "ml_features": snap.get("ml_features", 0), "research_score": snap.get("research_score", 0.0),\n                "ml_score": snap.get("ml_score", 0.0)}'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          # Scanner row: show all required diagnostics, including Research Lab score.
+          old = '''                f'<div style="width:12%">OBI {r["obi20"]:+.3f}</div>'\n                f'<div style="width:12%">OFI {r.get("ofi", 0.0):+.3f}</div>'\n                f'<div style="width:16%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'\n                f'<div style="width:12%">conf {r["confidence"]:.1f}%</div>'\n                f'<div style="width:10%">lock {timer}</div>'\n                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'\n'''
+          new = '''                f'<div style="width:10%">OBI20 {r["obi20"]:+.3f}</div>'\n                f'<div style="width:10%">OBI50 {r.get("obi50", 0.0):+.3f}</div>'\n                f'<div style="width:10%">OFI {r.get("ofi", 0.0):+.3f}</div>'\n                f'<div style="width:19%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'\n                f'<div style="width:13%">RESEARCH {r.get("research_score", 0.0):+.3f}</div>'\n                f'<div style="width:10%">conf {r["confidence"]:.1f}%</div>'\n                f'<div style="width:9%">lock {timer}</div>'\n                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'\n'''
+          if old not in s:
+              raise SystemExit('scanner UI target not found')
+          s = s.replace(old, new, 1)
+
+          # Add the full diagnostic set to the scanner panel header/legend.
+          old = '''    st.markdown('<div class="panel"><b>AUTO MULTI-MARKET SCANNER</b>', unsafe_allow_html=True)'''
+          new = '''    st.markdown('<div class="panel"><b>AUTO MULTI-MARKET SCANNER</b><div class="section-sub">Every signal row includes ML status/probability • OBI20/OBI50 • OFI • Research Lab composite score • confidence • live P&L • lock timer</div>', unsafe_allow_html=True)'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+      - name: Validate
+        run: python -m py_compile dashboard.py
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dashboard.py
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'Fix scanner ML OBI OFI and research scores'
+          git push
