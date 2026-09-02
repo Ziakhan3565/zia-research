@@ -24,15 +24,13 @@ jobs:
           # Fix the scanner's undefined ML variables and return the full diagnostic state.
           old = '''    pred, prob, _, _ = ml_predict(f)\n    strict = tf_key == "15M"\n    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold, strict=strict)'''
           new = '''    pred, prob, mlstat, feature_count = ml_predict(f)\n    strict = tf_key == "15M"\n    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold, strict=strict)'''
-          if old not in s:
-              raise SystemExit('scan_symbol target not found')
-          s = s.replace(old, new, 1)
+          if old in s:
+              s = s.replace(old, new, 1)
 
           old = '''            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,\n            "ml_status": mlstat, "ml_features": feature_count}'''
           new = '''            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,\n            "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,\n            "ml_score": mlscore, "research_scores": rs}'''
-          if old not in s:
-              raise SystemExit('scan return target not found')
-          s = s.replace(old, new, 1)
+          if old in s:
+              s = s.replace(old, new, 1)
 
           # Preserve diagnostics when an automatically locked signal is written to the scanner map.
           old = '''                "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),\n                "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),\n                "ml_features": snap.get("ml_features", 0)}'''
@@ -43,15 +41,112 @@ jobs:
           # Scanner row: show all required diagnostics, including Research Lab score.
           old = '''                f'<div style="width:12%">OBI {r["obi20"]:+.3f}</div>'\n                f'<div style="width:12%">OFI {r.get("ofi", 0.0):+.3f}</div>'\n                f'<div style="width:16%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'\n                f'<div style="width:12%">conf {r["confidence"]:.1f}%</div>'\n                f'<div style="width:10%">lock {timer}</div>'\n                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'\n'''
           new = '''                f'<div style="width:10%">OBI20 {r["obi20"]:+.3f}</div>'\n                f'<div style="width:10%">OBI50 {r.get("obi50", 0.0):+.3f}</div>'\n                f'<div style="width:10%">OFI {r.get("ofi", 0.0):+.3f}</div>'\n                f'<div style="width:19%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'\n                f'<div style="width:13%">RESEARCH {r.get("research_score", 0.0):+.3f}</div>'\n                f'<div style="width:10%">conf {r["confidence"]:.1f}%</div>'\n                f'<div style="width:9%">lock {timer}</div>'\n                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'\n'''
-          if old not in s:
-              raise SystemExit('scanner UI target not found')
-          s = s.replace(old, new, 1)
+          if old in s:
+              s = s.replace(old, new, 1)
 
           # Add the full diagnostic set to the scanner panel header/legend.
           old = '''    st.markdown('<div class="panel"><b>AUTO MULTI-MARKET SCANNER</b>', unsafe_allow_html=True)'''
           new = '''    st.markdown('<div class="panel"><b>AUTO MULTI-MARKET SCANNER</b><div class="section-sub">Every signal row includes ML status/probability • OBI20/OBI50 • OFI • Research Lab composite score • confidence • live P&L • lock timer</div>', unsafe_allow_html=True)'''
           if old in s:
               s = s.replace(old, new, 1)
+
+          # Automatic all-market signal loop. UI remains untouched; only the
+          # backend scan cadence changes from one pair at a time to all 36 pairs.
+          start = s.index('@st.fragment(run_every="2s")\ndef live_engine():')
+          marker = '    df, source, cstat, _ = candles(symbol, TFS[tf], 650)'
+          mid = s.index(marker, start)
+          old = s[start:mid]
+          new = '''@st.fragment(run_every="2s")\ndef live_engine():
+    cycle_started = time.perf_counter()
+
+    # Automatic backend scanner: every interval, scan every tracked coin on
+    # ONLY 15M / 1H / 4H and save fresh directional signals automatically.
+    scan_clock = time.time()
+    auto_rows_map = st.session_state.get("auto_scan_rows_map", {})
+    if not isinstance(auto_rows_map, dict):
+        auto_rows_map = {}
+    last_scan = float(st.session_state.get("auto_scan_last", 0.0))
+
+    if scan_clock - last_scan >= AUTO_SCAN_INTERVAL_SECONDS:
+        try:
+            for tf_key in AUTO_SCAN_TFS:
+                for symbol_key in SYMBOLS:
+                    snap = scan_symbol(symbol_key, tf_key, threshold)
+                    active = recover_active_signal(symbol_key, tf_key)
+
+                    if active:
+                        signal = active["signal"]
+                        confidence = active["confidence"]
+                        started = active["started"]
+                        rec = latest_saved_signal(symbol_key, tf_key)
+                        entry_price = rec["entry_price"] if rec else snap["price"]
+                    elif snap["signal"] in ("LONG", "SHORT"):
+                        signal = snap["signal"]
+                        confidence = snap["confidence"]
+                        started = datetime.now(timezone.utc)
+                        save_signal(
+                            symbol_key, tf_key, snap["price"], signal, confidence,
+                            snap.get("ml_probability"), snap["features"],
+                            snap.get("research_score", 0.0), snap.get("ml_status", ""),
+                            snap.get("ml_pred"), snap.get("ml_score", 0.0)
+                        )
+                        rec = latest_saved_signal(symbol_key, tf_key)
+                        entry_price = rec["entry_price"] if rec else snap["price"]
+                    else:
+                        signal = "WAIT"
+                        confidence = snap["confidence"]
+                        started = None
+                        entry_price = 0.0
+
+                    pnl_pct = live_signal_pnl(entry_price, snap["price"], signal)
+                    validity = signal_validity_minutes(tf_key)
+                    remaining = 0
+                    if started and validity:
+                        remaining = max(
+                            0,
+                            int((started + timedelta(minutes=validity) - datetime.now(timezone.utc)).total_seconds())
+                        )
+
+                    auto_rows_map[f"{symbol_key}:{tf_key}"] = {
+                        "symbol": symbol_key,
+                        "timeframe": tf_key,
+                        "price": snap["price"],
+                        "signal": signal,
+                        "confidence": confidence,
+                        "entry_price": entry_price,
+                        "pnl_pct": pnl_pct,
+                        "remaining_sec": remaining,
+                        "obi20": snap["obi20"],
+                        "obi5": snap.get("obi5", 0.0),
+                        "obi10": snap.get("obi10", 0.0),
+                        "obi50": snap.get("obi50", 0.0),
+                        "ofi": snap.get("ofi", 0.0),
+                        "ml_pred": snap.get("ml_pred"),
+                        "ml_probability": snap.get("ml_probability"),
+                        "ml_status": snap.get("ml_status", "—"),
+                        "ml_features": snap.get("ml_features", 0),
+                        "research_score": snap.get("research_score", 0.0),
+                        "ml_score": snap.get("ml_score", 0.0),
+                    }
+
+            st.session_state.auto_scan_rows_map = auto_rows_map
+            st.session_state.auto_scan_last = scan_clock
+        except Exception:
+            # Keep the last complete scanner snapshot if one market fails.
+            st.session_state.auto_scan_last = scan_clock
+
+    auto_rows = list(st.session_state.get("auto_scan_rows_map", {}).values())
+    prices_live = live_prices()
+    for row in auto_rows:
+        current = prices_live.get(row.get("symbol"))
+        if current and row.get("signal") in ("LONG", "SHORT"):
+            row["price"] = current
+            row["pnl_pct"] = live_signal_pnl(row.get("entry_price", 0.0), current, row.get("signal"))
+
+'''
+          if old == new:
+              raise SystemExit('Automatic loop is already applied')
+          s = s[:start] + new + s[mid:]
 
           p.write_text(s, encoding='utf-8')
       - name: Validate
