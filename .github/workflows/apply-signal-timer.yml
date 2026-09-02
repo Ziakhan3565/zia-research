@@ -1,0 +1,44 @@
+name: Apply signal timer UI fix
+
+on:
+  push:
+    branches: [signal-timer-ui]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch dashboard timer
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path("dashboard.py")
+          s = p.read_text(encoding="utf-8")
+
+          old_css = '''.signal-meta{font-size:10px;color:var(--muted);margin-top:7px;letter-spacing:1px}\n'''
+          new_css = '''.signal-meta{font-size:10px;color:var(--muted);margin-top:7px;letter-spacing:1px}\n.signal-timer{display:inline-block;margin-top:9px;padding:6px 12px;border:1px solid #2b4054;border-radius:999px;background:#071019;color:#65d7ff;font-size:11px;font-weight:950;letter-spacing:.8px}\n.signal-timer.live{border-color:#277b59;background:#071810;color:#42dda0;box-shadow:0 0 16px rgba(66,221,160,.08)}\n.signal-timer.expired{border-color:#705e30;color:#f3c86a}\n'''
+          if old_css not in s:
+              raise SystemExit("signal CSS anchor not found")
+          s = s.replace(old_css, new_css, 1)
+
+          old = '''    mltext = f"{prob * 100:.2f}%" if prob is not None else "—"\n\n    st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'\n                f'<div class="signal-main {sigcolor}">{signal}</div>'\n                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div></div>',\n                unsafe_allow_html=True)\n'''
+          new = '''    mltext = f"{prob * 100:.2f}%" if prob is not None else "—"\n\n    # Visible countdown for the locked signal. The fragment refreshes every\n    # second, so this timer counts down live without changing the signal.\n    lock_started = st.session_state.get("active_signal_started")\n    lock_remaining = 0\n    timer_text = "NO ACTIVE TIMER"\n    timer_class = ""\n    if validity and signal in ("LONG", "SHORT") and lock_started:\n        lock_remaining = max(0, int((lock_started + timedelta(minutes=validity) - now).total_seconds()))\n        mm, ss = divmod(lock_remaining, 60)\n        hh, mm = divmod(mm, 60)\n        countdown = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"\n        timer_text = f"⏱ SIGNAL LOCK • {countdown} REMAINING • FIXED {validity} MIN"\n        timer_class = "live" if lock_remaining > 0 else "expired"\n    elif validity:\n        timer_text = f"⏱ NO ACTIVE LOCK • NEXT SIGNAL WINDOW {validity} MIN"\n\n    st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'\n                f'<div class="signal-main {sigcolor}">{signal}</div>'\n                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div>'\n                f'<div class="signal-timer {timer_class}">{timer_text}</div></div>',\n                unsafe_allow_html=True)\n'''
+          if old not in s:
+              raise SystemExit("signal rendering anchor not found")
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding="utf-8")
+      - name: Commit timer UI fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.py
+          git commit -m "Add visible signal validity countdown" || exit 0
+          git push
