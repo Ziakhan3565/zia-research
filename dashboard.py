@@ -798,18 +798,16 @@ def live_engine():
         st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
                     '<div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • new signals are saved automatically • live P&L</div>',
                     unsafe_allow_html=True)
-        rows = auto_rows
+        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]
         longs = sum(1 for r in rows if r["signal"] == "LONG")
         shorts = sum(1 for r in rows if r["signal"] == "SHORT")
-        waits = sum(1 for r in rows if r["signal"] == "WAIT")
         cards([("LONG SIGNALS", str(longs), "bullish across all coins", "good"),
                ("SHORT SIGNALS", str(shorts), "bearish across scan", "bad"),
-               ("WAITING", str(waits), "no clear edge", "amber"),
                ("SCANNED", str(len(rows)), "symbols this cycle", "cyan")])
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         for r in rows:
             pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short" if r["signal"] == "SHORT" else "pill-wait"
-            chg_cls = "good" if r["change"] >= 0 else "bad"
+            chg_cls = "good" if r["pnl_pct"] >= 0 else "bad"
             st.markdown(
                 f'<div class="scan-row">'
                 f'<div style="width:13%;font-weight:900">{r["symbol"]}</div>'
