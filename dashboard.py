@@ -63,6 +63,9 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg);color:var(--tx
 .signal-wait{border-color:#705e30}
 .signal-main{font-size:clamp(34px,4vw,58px);font-weight:1000;letter-spacing:-2px;line-height:1}
 .signal-meta{font-size:10px;color:var(--muted);margin-top:7px;letter-spacing:1px}
+.signal-timer{display:inline-block;margin-top:9px;padding:6px 12px;border:1px solid #2b4054;border-radius:999px;background:#071019;color:#65d7ff;font-size:11px;font-weight:950;letter-spacing:.8px}
+.signal-timer.live{border-color:#277b59;background:#071810;color:#42dda0;box-shadow:0 0 16px rgba(66,221,160,.08)}
+.signal-timer.expired{border-color:#705e30;color:#f3c86a}
 .tri-strip{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 9px}
 .tri-chip{border:1px solid var(--line);background:#0a1119;border-radius:9px;padding:6px 9px;font-size:9px;font-weight:900;letter-spacing:.5px}
 .tri-chip span{color:var(--cyan)}
@@ -523,9 +526,26 @@ def live_engine():
     sigcolor = "good" if signal == "LONG" else "bad" if signal == "SHORT" else "amber"
     mltext = f"{prob * 100:.2f}%" if prob is not None else "—"
 
+    # Visible countdown for the locked signal. The fragment refreshes every
+    # second, so this timer counts down live without changing the signal.
+    lock_started = st.session_state.get("active_signal_started")
+    lock_remaining = 0
+    timer_text = "NO ACTIVE TIMER"
+    timer_class = ""
+    if validity and signal in ("LONG", "SHORT") and lock_started:
+        lock_remaining = max(0, int((lock_started + timedelta(minutes=validity) - now).total_seconds()))
+        mm, ss = divmod(lock_remaining, 60)
+        hh, mm = divmod(mm, 60)
+        countdown = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        timer_text = f"⏱ SIGNAL LOCK • {countdown} REMAINING • FIXED {validity} MIN"
+        timer_class = "live" if lock_remaining > 0 else "expired"
+    elif validity:
+        timer_text = f"⏱ NO ACTIVE LOCK • NEXT SIGNAL WINDOW {validity} MIN"
+
     st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'
                 f'<div class="signal-main {sigcolor}">{signal}</div>'
-                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div></div>',
+                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div>'
+                f'<div class="signal-timer {timer_class}">{timer_text}</div></div>',
                 unsafe_allow_html=True)
 
     cards([
