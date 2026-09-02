@@ -30,6 +30,69 @@ jobs:
                         'elapsed = (time.perf_counter() - cycle_started) * 1000', 1)
           p.write_text(s, encoding='utf-8')
 
+      - name: Make refresh silent and add chart signal markers
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+          original = s
+
+          # The dashboard uses a Streamlit fragment, so this refreshes only
+          # the live engine region rather than hard-refreshing the whole page.
+          # 15 seconds is the requested silent refresh cadence.
+          s = s.replace('@st.fragment(run_every="2s")', '@st.fragment(run_every="15s")', 1)
+
+          marker_block = r'''
+    # Map saved signals to the selected coin's chart. LONG is displayed as BUY
+    # and SHORT as SELL; the engine's internal signal names remain unchanged.
+    try:
+        signal_hist = load_signal_history()
+        if not signal_hist.empty and {"symbol", "signal", "timestamp", "price"}.issubset(signal_hist.columns):
+            sh = signal_hist[signal_hist["symbol"].astype(str) == str(symbol)].copy()
+            if not sh.empty:
+                sh["_time"] = pd.to_datetime(sh["timestamp"], utc=True, errors="coerce")
+                sh["_price"] = pd.to_numeric(sh["price"], errors="coerce")
+                sh = sh.dropna(subset=["_time", "_price"])
+                sh = sh[(sh["_time"] >= view["Time"].min()) & (sh["_time"] <= view["Time"].max())]
+                if not sh.empty:
+                    sh["_label"] = sh["signal"].astype(str).str.upper().map({"LONG": "BUY", "SHORT": "SELL"}).fillna(sh["signal"].astype(str).str.upper())
+                    for label in ["BUY", "SELL"]:
+                        part = sh[sh["_label"] == label]
+                        if part.empty:
+                            continue
+                        timeframes = part["timeframe"].astype(str).tolist() if "timeframe" in part.columns else [tf] * len(part)
+                        fig.add_trace(go.Scatter(
+                            x=part["_time"],
+                            y=part["_price"],
+                            mode="markers+text",
+                            name=f"{label} SIGNAL",
+                            text=[f"{label} • {t}" for t in timeframes],
+                            textposition="top center" if label == "BUY" else "bottom center",
+                            textfont=dict(size=10, color="#edf3fb"),
+                            marker=dict(size=12,
+                                        symbol="triangle-up" if label == "BUY" else "triangle-down",
+                                        color="#42dda0" if label == "BUY" else "#ff7184",
+                                        line=dict(width=1, color="#080d14")),
+                            hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
+                        ))
+    except Exception:
+        pass
+'''
+
+          needle = '    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)'
+          if marker_block.strip() not in s:
+              if needle not in s:
+                  raise SystemExit('Expected chart insertion point not found; refusing partial patch.')
+              s = s.replace(needle, marker_block + '\n' + needle, 1)
+
+          if s != original:
+              p.write_text(s, encoding='utf-8')
+              print('Dashboard UX changes applied.')
+          else:
+              print('Dashboard UX changes already present.')
+
       - name: Commit fix
         shell: bash
         run: |
@@ -40,5 +103,5 @@ jobs:
             echo 'Dashboard already fixed.'
             exit 0
           fi
-          git commit -m 'Fix silent dashboard live engine timer'
+          git commit -m 'Make dashboard refresh silent and show per-coin signal markers'
           git push
