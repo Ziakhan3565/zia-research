@@ -364,6 +364,60 @@ def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
     return True
 
 
+def trade_pnl_stats(t):
+    """Return closed-trade P&L percentages for the Overview dashboard.
+
+    Prefer an existing percentage P&L column. If it is not present, derive
+    percentage return from entry/exit prices and the trade direction.
+    """
+    if t is None or t.empty or "result" not in t.columns:
+        return {"wins": 0, "losses": 0, "win_pnl": 0.0, "loss_pnl": 0.0, "net_pnl": 0.0}
+
+    df = t.copy()
+    result = df["result"].astype(str).str.upper().str.strip()
+
+    pct_col = next((c for c in [
+        "pnl_pct", "pnl_percent", "profit_pct", "profit_percent",
+        "return_pct", "pnl_percentage", "P&L %", "P&L%"
+    ] if c in df.columns), None)
+
+    pct = pd.Series(np.nan, index=df.index, dtype=float)
+    if pct_col:
+        pct = pd.to_numeric(df[pct_col], errors="coerce")
+        # Some journals store decimal returns (0.012 = 1.2%).
+        if pct.abs().dropna().median() <= 1.0:
+            pct = pct * 100.0
+    else:
+        entry_col = next((c for c in ["entry_price", "entry", "open_price", "Entry Price"] if c in df.columns), None)
+        exit_col = next((c for c in ["exit_price", "exit", "close_price", "Exit Price"] if c in df.columns), None)
+        side_col = next((c for c in ["side", "direction", "signal", "Side"] if c in df.columns), None)
+        if entry_col and exit_col:
+            entry = pd.to_numeric(df[entry_col], errors="coerce")
+            exit_ = pd.to_numeric(df[exit_col], errors="coerce")
+            raw = (exit_ - entry) / entry.replace(0, np.nan) * 100.0
+            if side_col:
+                side = df[side_col].astype(str).str.upper()
+                pct = np.where(side.str.contains("SHORT"), -raw, raw)
+                pct = pd.Series(pct, index=df.index, dtype=float)
+            else:
+                pct = raw
+
+    # Normalize by result so wins are positive and losses negative even if
+    # the source journal stores absolute P&L percentages.
+    pct = pd.to_numeric(pct, errors="coerce")
+    win_mask = result.eq("WIN") & pct.notna()
+    loss_mask = result.eq("LOSS") & pct.notna()
+    win_pnl = float(pct[win_mask].abs().sum())
+    loss_pnl = -float(pct[loss_mask].abs().sum())
+    return {
+        "wins": int(result.eq("WIN").sum()),
+        "losses": int(result.eq("LOSS").sum()),
+        "win_pnl": win_pnl,
+        "loss_pnl": loss_pnl,
+        "net_pnl": win_pnl + loss_pnl,
+    }
+
+
 def recover_active_signal(symbol, tf):
     validity = signal_validity_minutes(tf)
     if not validity:
@@ -557,6 +611,17 @@ def live_engine():
         ("DATA", source, f"book {bsrc}", "cyan"),
     ])
 
+    # P&L summary is calculated from the closed trades journal and refreshed
+    # with the live dashboard. Winning P&L is positive, losing P&L negative.
+    trade_df = read_csv(TRADE_FILE)
+    pnl = trade_pnl_stats(trade_df)
+    cards([
+        ("WIN P&L", f"+{pnl['win_pnl']:.2f}%", f"{pnl['wins']} winning trades", "good"),
+        ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", f"{pnl['losses']} losing trades", "bad"),
+        ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "closed trades total", "good" if pnl['net_pnl'] >= 0 else "bad"),
+        ("CLOSED", str(pnl['wins'] + pnl['losses']), "resolved trades", "cyan"),
+    ])
+
     tabs = st.tabs(["⌂ OVERVIEW", "◈ CHART", "◌ ORDER FLOW", "🧠 ML LAB", "🔬 RESEARCH LAB", "▣ SIGNALS", "⌖ SCANNER"])
 
     with tabs[0]:
@@ -633,12 +698,15 @@ def live_engine():
             st.info("No saved signals yet.")
         if not t.empty and "result" in t.columns:
             rr = t.result.astype(str).str.upper()
-            wins = int((rr == "WIN").sum())
-            losses = int((rr == "LOSS").sum())
+            wins = pnl["wins"]
+            losses = pnl["losses"]
             total = wins + losses
             wr = wins / total * 100 if total else 0
             cards([("CLOSED", str(total), "resolved trades", "cyan"), ("WINS", str(wins), "winning trades", "good"),
                    ("LOSSES", str(losses), "losing trades", "bad"), ("WIN RATE", f"{wr:.1f}%", "closed trade rate", "violet")])
+            cards([("WIN P&L", f"+{pnl['win_pnl']:.2f}%", "sum of winning trade P&L", "good"),
+                   ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", "sum of losing trade P&L", "bad"),
+                   ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "wins + losses", "good" if pnl['net_pnl'] >= 0 else "bad")])
 
     with tabs[6]:
         st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
