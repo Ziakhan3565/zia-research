@@ -462,9 +462,9 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
     df, source, _, _ = candles(symbol, TFS[tf_key], 120)
     bids, asks, *_ = orderbook(symbol)
     f = features(df, bids, asks)
-    pred, prob, _, _ = ml_predict(f)
+    pred, prob, mlstat, feature_count = ml_predict(f)
     strict = tf_key == "15M"
-    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold, strict=strict)
+    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold, strict=strict)
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
@@ -472,7 +472,8 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
             "confidence": confidence, "combined": combined, "obi20": f["obi_20"],
             "obi5": f["obi_5"], "obi10": f["obi_10"], "obi50": f["obi_50"],
             "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,
-            "ml_status": mlstat, "ml_features": feature_count}
+            "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,
+            "ml_score": mlscore, "research_scores": rs}
 
 
 
@@ -644,7 +645,8 @@ def live_engine():
                 "obi10": snap.get("obi10", 0.0), "obi50": snap.get("obi50", 0.0),
                 "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),
                 "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),
-                "ml_features": snap.get("ml_features", 0)}
+                "ml_features": snap.get("ml_features", 0), "research_score": snap.get("research_score", 0.0),
+                "ml_score": snap.get("ml_score", 0.0)}
             st.session_state.auto_scan_rows_map = auto_rows_map
             st.session_state.auto_scan_cursor = cursor + 1
             st.session_state.auto_scan_last = scan_clock
@@ -887,11 +889,13 @@ def live_engine():
                 f'<div style="width:9%;font-weight:900">{r["timeframe"]}</div>'
                 f'<div style="width:13%">${r["price"]:,.4f}</div>'
                 f'<div style="width:13%" class="{pnl_cls}">{r["pnl_pct"]:+.2f}% P&L</div>'
-                f'<div style="width:12%">OBI {r["obi20"]:+.3f}</div>'
-                f'<div style="width:12%">OFI {r.get("ofi", 0.0):+.3f}</div>'
-                f'<div style="width:16%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'
-                f'<div style="width:12%">conf {r["confidence"]:.1f}%</div>'
-                f'<div style="width:10%">lock {timer}</div>'
+                f'<div style="width:10%">OBI20 {r["obi20"]:+.3f}</div>'
+                f'<div style="width:10%">OBI50 {r.get("obi50", 0.0):+.3f}</div>'
+                f'<div style="width:10%">OFI {r.get("ofi", 0.0):+.3f}</div>'
+                f'<div style="width:19%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'
+                f'<div style="width:13%">RESEARCH {r.get("research_score", 0.0):+.3f}</div>'
+                f'<div style="width:10%">conf {r["confidence"]:.1f}%</div>'
+                f'<div style="width:9%">lock {timer}</div>'
                 f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
                 f'</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
