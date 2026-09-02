@@ -25,6 +25,8 @@ MODEL_FILE = ROOT / "xgboost_obi_model.pkl"
 SIGNAL_FILE = ROOT / "saved_signals.csv"
 TRADE_FILE = ROOT / "trade_history.csv"
 
+SIGNAL_VALIDITY_MINUTES = {"15M": 30, "1H": 120, "4H": 180}
+
 FUTURES = ["https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
 SPOT = ["https://api.binance.com", "https://api1.binance.com"]
 DATA = ["https://data-api.binance.vision"]
@@ -321,11 +323,68 @@ def read_csv(path):
         return pd.DataFrame()
 
 
+def signal_validity_minutes(tf):
+    return SIGNAL_VALIDITY_MINUTES.get(tf, 0)
+
+
+def load_signal_history():
+    try:
+        if not SIGNAL_FILE.exists():
+            return pd.DataFrame()
+        return pd.read_csv(SIGNAL_FILE)
+    except Exception:
+        return pd.DataFrame()
+
+
 def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
-    row = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "timeframe": tf, "price": price,
+    if sig not in ("LONG", "SHORT"):
+        return False
+    now = datetime.now(timezone.utc)
+    hist = load_signal_history()
+    if not hist.empty:
+        try:
+            h = hist[(hist["symbol"].astype(str) == symbol) & (hist["timeframe"].astype(str) == tf)]
+            if not h.empty:
+                last = h.iloc[-1]
+                last_ts = pd.to_datetime(last["timestamp"], utc=True, errors="coerce")
+                if pd.notna(last_ts) and last.get("signal") == sig:
+                    validity = signal_validity_minutes(tf)
+                    if validity and (now - last_ts.to_pydatetime()) < timedelta(minutes=validity):
+                        return False
+        except Exception:
+            pass
+    row = {"timestamp": now.isoformat(), "symbol": symbol, "timeframe": tf, "price": price,
            "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",
-           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs}
+           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs,
+           "validity_minutes": signal_validity_minutes(tf)}
     pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)
+    return True
+
+
+def recover_active_signal(symbol, tf):
+    validity = signal_validity_minutes(tf)
+    if not validity:
+        return None
+    hist = load_signal_history()
+    if hist.empty:
+        return None
+    try:
+        h = hist[(hist["symbol"].astype(str) == symbol) & (hist["timeframe"].astype(str) == tf)]
+        if h.empty:
+            return None
+        row = h.iloc[-1]
+        if row.get("signal") not in ("LONG", "SHORT"):
+            return None
+        ts = pd.to_datetime(row["timestamp"], utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        age = datetime.now(timezone.utc) - ts.to_pydatetime()
+        if age < timedelta(minutes=validity):
+            return {"signal": row["signal"], "started": ts.to_pydatetime(),
+                    "confidence": num(row.get("confidence"), 0), "combined": 0.0}
+    except Exception:
+        return None
+    return None
 
 
 @st.cache_data(ttl=3.0, show_spinner=False)
@@ -411,28 +470,38 @@ def live_engine():
     confidence = raw_confidence
     combined = raw_combined
 
-    # A 15M signal is locked for 30 minutes from the moment it is accepted.
-    # Live 1-second recalculation continues, but the displayed directional
-    # signal does not flip on every microstructure update during the window.
-    if strict_15m:
-        key = f"{symbol}:15M"
-        started_at = st.session_state.active_signal_started
-        active = st.session_state.active_signal
-        same_key = st.session_state.active_signal_key == key
-        expired = started_at is None or (now - started_at) >= timedelta(minutes=30)
+    validity = signal_validity_minutes(tf)
+    if validity:
+        key = f"{symbol}:{tf}"
+        started_at = st.session_state.get("active_signal_started")
+        active = st.session_state.get("active_signal")
+        same_key = st.session_state.get("active_signal_key") == key
+        expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))
 
-        if not same_key or expired:
+        if not same_key:
+            recovered = recover_active_signal(symbol, tf)
+            if recovered:
+                active = recovered["signal"]
+                started_at = recovered["started"]
+                st.session_state.active_signal_confidence = recovered["confidence"]
+                st.session_state.active_signal_combined = recovered["combined"]
+            else:
+                active = None
+                started_at = None
+            st.session_state.active_signal_key = key
+            st.session_state.active_signal = active
+            st.session_state.active_signal_started = started_at
+            expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))
+
+        if expired:
+            active = None
             st.session_state.active_signal = None
             st.session_state.active_signal_started = None
-            st.session_state.active_signal_key = key
-            st.session_state.active_signal_confidence = None
-            st.session_state.active_signal_combined = None
-            active = None
 
-        if active in ("LONG", "SHORT") and not expired and same_key:
+        if active in ("LONG", "SHORT") and not expired:
             signal = active
-            confidence = float(st.session_state.active_signal_confidence or raw_confidence)
-            combined = float(st.session_state.active_signal_combined or raw_combined)
+            confidence = float(st.session_state.get("active_signal_confidence") or raw_confidence)
+            combined = float(st.session_state.get("active_signal_combined") or raw_combined)
         elif raw_signal in ("LONG", "SHORT"):
             st.session_state.active_signal = raw_signal
             st.session_state.active_signal_started = now
@@ -442,6 +511,9 @@ def live_engine():
             signal = raw_signal
             confidence = raw_confidence
             combined = raw_combined
+
+        save_signal(symbol, tf, num(df.Close.iloc[-1]) if not df.empty else 0,
+                    signal, confidence, prob, f, rscore)
 
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
