@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Patch dashboard
-        shell: python
+        shell: python {0}
         run: |
           from pathlib import Path
 
@@ -132,7 +132,6 @@ def auto_scan_once(threshold=0.20):
               raise SystemExit("scanner block marker not found")
           s = s.replace(start, replacement, 1)
 
-          # Replace the summary-count duplication left by the old scanner block.
           old_counts = '''        longs = sum(1 for r in rows if r["signal"] == "LONG")\n        shorts = sum(1 for r in rows if r["signal"] == "SHORT")\n        waits = sum(1 for r in rows if r["signal"] == "WAIT")\n        cards([("LONG SIGNALS", str(longs), "bullish across scan", "good"),'''
           new_counts = '''        cards([("LONG SIGNALS", str(longs), "bullish across all coins", "good"),'''
           if old_counts in s:
