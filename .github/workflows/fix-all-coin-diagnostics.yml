@@ -1,0 +1,82 @@
+name: Fix all-coin diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/fix-all-coin-diagnostics.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch dashboard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+
+          old = 'def save_signal(symbol, tf, price, sig, conf, pr, f, rs):'
+          new = 'def save_signal(symbol, tf, price, sig, conf, pr, f, rs, ml_status="", ml_pred=None, ml_score=0.0):'
+          if old not in s:
+              raise SystemExit('save_signal signature pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    row = {"timestamp": now.isoformat(), "symbol": symbol, "timeframe": tf, "price": price,\n           "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",\n           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs,\n           "validity_minutes": signal_validity_minutes(tf)}'''
+          new = '''    row = {"timestamp": now.isoformat(), "symbol": symbol, "timeframe": tf, "price": price,\n           "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",\n           "ml_status": ml_status, "ml_prediction": ml_pred if ml_pred is not None else "",\n           "ml_score": ml_score, "obi5": f.get("obi_5", 0.0), "obi10": f.get("obi_10", 0.0),\n           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"],\n           "research_score": rs, "validity_minutes": signal_validity_minutes(tf)}'''
+          if old not in s:
+              raise SystemExit('signal journal row pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            "ml_score": mlscore, "research_scores": rs}\n'''
+          new = '''            "ml_score": mlscore, "research_scores": rs, "features": f}\n'''
+          if old not in s:
+              raise SystemExit('scan_symbol return pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '''save_signal(symbol_key, tf_key, snap["price"], signal, confidence, None,\n                            {"obi_20": snap["obi20"], "obi_50": 0.0, "taker_flow_ratio": 0.0}, 0.0)'''
+          new = '''save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),\n                            snap["features"], snap.get("research_score", 0.0),\n                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))'''
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'expected 2 auto-save patterns, found {count}')
+          s = s.replace(old, new)
+
+          old = '        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]\n'
+          new = '        rows = list(auto_rows)\n'
+          if old not in s:
+              raise SystemExit('scanner active-only pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '        rows.sort(key=lambda r: r["pnl_pct"], reverse=True)\n'
+          new = '        rows.sort(key=lambda r: (r["signal"] not in ("LONG", "SHORT"), -r["pnl_pct"]))\n'
+          if old not in s:
+              raise SystemExit('scanner sort pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short"\n'
+          new = '            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short" if r["signal"] == "SHORT" else ""\n'
+          if old not in s:
+              raise SystemExit('scanner pill pattern not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        st.markdown('</div>', unsafe_allow_html=True)\n\n    st.caption(f"ZIA Research • {symbol} • {tf} • silent live engine • {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")'''
+          new = '''        st.markdown('</div>', unsafe_allow_html=True)\n        st.caption("Every scanner row is live: ML probability/status, OBI20/OBI50, OFI, Research score, confidence and signal lock. WAIT rows are also shown so every tracked coin/timeframe is visible.")\n\n    st.caption(f"ZIA Research • {symbol} • {tf} • silent live engine • {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")'''
+          if old not in s:
+              raise SystemExit('scanner footer pattern not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+          python -m py_compile dashboard.py
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dashboard.py
+          git diff --cached --quiet || git commit -m 'Fix all-coin live diagnostics in scanner and signal journal'
+          git push
