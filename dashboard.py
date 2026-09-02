@@ -351,7 +351,7 @@ def load_signal_history():
         return pd.DataFrame()
 
 
-def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
+def save_signal(symbol, tf, price, sig, conf, pr, f, rs, ml_status="", ml_pred=None, ml_score=0.0):
     if sig not in ("LONG", "SHORT"):
         return False
     now = datetime.now(timezone.utc)
@@ -370,8 +370,10 @@ def save_signal(symbol, tf, price, sig, conf, pr, f, rs):
             pass
     row = {"timestamp": now.isoformat(), "symbol": symbol, "timeframe": tf, "price": price,
            "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",
-           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs,
-           "validity_minutes": signal_validity_minutes(tf)}
+           "ml_status": ml_status, "ml_prediction": ml_pred if ml_pred is not None else "",
+           "ml_score": ml_score, "obi5": f.get("obi_5", 0.0), "obi10": f.get("obi_10", 0.0),
+           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"],
+           "research_score": rs, "validity_minutes": signal_validity_minutes(tf)}
     pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)
     return True
 
@@ -473,7 +475,7 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
             "obi5": f["obi_5"], "obi10": f["obi_10"], "obi50": f["obi_50"],
             "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,
             "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,
-            "ml_score": mlscore, "research_scores": rs}
+            "ml_score": mlscore, "research_scores": rs, "features": f}
 
 
 
@@ -525,8 +527,9 @@ def auto_scan_once(threshold=0.20):
                 signal = snap["signal"]
                 confidence = snap["confidence"]
                 started = datetime.now(timezone.utc)
-                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, None,
-                            {"obi_20": snap["obi20"], "obi_50": 0.0, "taker_flow_ratio": 0.0}, 0.0)
+                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),
+                            snap["features"], snap.get("research_score", 0.0),
+                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
                 rec = latest_saved_signal(symbol_key, tf_key)
                 entry_price = rec["entry_price"] if rec else snap["price"]
             else:
@@ -624,8 +627,9 @@ def live_engine():
                 signal = snap["signal"]
                 confidence = snap["confidence"]
                 started = datetime.now(timezone.utc)
-                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, None,
-                            {"obi_20": snap["obi20"], "obi_50": 0.0, "taker_flow_ratio": 0.0}, 0.0)
+                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),
+                            snap["features"], snap.get("research_score", 0.0),
+                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
                 rec = latest_saved_signal(symbol_key, tf_key)
                 entry_price = rec["entry_price"] if rec else snap["price"]
             else:
@@ -870,8 +874,8 @@ def live_engine():
         st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
                     '<div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • signals are saved automatically • live P&L</div>',
                     unsafe_allow_html=True)
-        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]
-        rows.sort(key=lambda r: r["pnl_pct"], reverse=True)
+        rows = list(auto_rows)
+        rows.sort(key=lambda r: (r["signal"] not in ("LONG", "SHORT"), -r["pnl_pct"]))
         longs = sum(1 for r in rows if r["signal"] == "LONG")
         shorts = sum(1 for r in rows if r["signal"] == "SHORT")
         cards([("LONG SIGNALS", str(longs), "active across all coins", "good"),
@@ -879,7 +883,7 @@ def live_engine():
                ("ACTIVE", str(len(rows)), "automatic signals", "cyan")])
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         for r in rows:
-            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short"
+            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short" if r["signal"] == "SHORT" else ""
             pnl_cls = "good" if r["pnl_pct"] >= 0 else "bad"
             mins, secs = divmod(max(0, int(r["remaining_sec"])), 60)
             timer = f"{mins:02d}:{secs:02d}" if mins < 60 else f"{mins // 60:02d}:{mins % 60:02d}"
@@ -899,6 +903,7 @@ def live_engine():
                 f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
                 f'</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
+        st.caption("Every scanner row is live: ML probability/status, OBI20/OBI50, OFI, Research score, confidence and signal lock. WAIT rows are also shown so every tracked coin/timeframe is visible.")
 
     st.caption(f"ZIA Research • {symbol} • {tf} • silent live engine • {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
