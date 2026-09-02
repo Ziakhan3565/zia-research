@@ -1,0 +1,25 @@
+name: Apply automatic scanner patch
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: auto-signal-scanner-v2
+      - name: Patch dashboard
+        run: python .github/auto_scanner_patch.py
+      - name: Commit dashboard patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.py
+          git diff --cached --quiet || git commit -m "feat: auto scan 15M 1H 4H signals with live pnl"
+          git push origin HEAD:auto-signal-scanner-v2
