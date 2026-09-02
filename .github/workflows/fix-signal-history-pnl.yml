@@ -1,0 +1,62 @@
+name: Fix signal history and live P&L
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch dashboard backend only
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+
+          # Make signal-history P&L calculate from saved LONG/SHORT signals.
+          marker = '''def trade_pnl_stats(t):\n'''
+          if 'def signal_history_pnl_stats(' not in s:
+              fn = '''def signal_history_pnl_stats(hist):\n    """Live P&L summary for saved LONG/SHORT signal history."""\n    if hist is None or hist.empty or "signal" not in hist.columns:\n        return {"active": 0, "wins": 0, "losses": 0, "open_pnl": 0.0, "realized_pnl": 0.0, "total_pnl": 0.0}\n    h = hist.copy()\n    h["signal"] = h["signal"].astype(str).str.upper().str.strip()\n    h = h[h["signal"].isin(["LONG", "SHORT"])].copy()\n    if h.empty:\n        return {"active": 0, "wins": 0, "losses": 0, "open_pnl": 0.0, "realized_pnl": 0.0, "total_pnl": 0.0}\n    prices = live_prices()\n    open_pnl = 0.0\n    wins = losses = 0\n    for _, row in h.iterrows():\n        entry = num(row.get("price"))\n        symbol_key = str(row.get("symbol", ""))\n        side = str(row.get("signal", ""))\n        current = prices.get(symbol_key, entry)\n        pnl = live_signal_pnl(entry, current, side)\n        validity = signal_validity_minutes(str(row.get("timeframe", "")))\n        ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")\n        active = bool(pd.notna(ts) and validity and (datetime.now(timezone.utc) - ts.to_pydatetime()) < timedelta(minutes=validity))\n        if active:\n            open_pnl += pnl\n        elif pnl > 0:\n            wins += 1\n        elif pnl < 0:\n            losses += 1\n    return {"active": int(sum(1 for _, row in h.iterrows() if signal_validity_minutes(str(row.get("timeframe", ""))) and pd.notna(pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")) and (datetime.now(timezone.utc) - pd.to_datetime(row.get("timestamp"), utc=True).to_pydatetime()) < timedelta(minutes=signal_validity_minutes(str(row.get("timeframe", ""))))),\n            "wins": wins, "losses": losses, "open_pnl": open_pnl, "realized_pnl": 0.0, "total_pnl": open_pnl}\n\n\n'''
+              s = s.replace(marker, fn + marker, 1)
+
+          # Main scanner: save the signal independently of selected coin and
+          # keep scanner state synchronized with saved_signals.csv.
+          old = '''            elif snap["signal"] in ("LONG", "SHORT"):\n                signal = snap["signal"]\n                confidence = snap["confidence"]\n                started = datetime.now(timezone.utc)\n                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),\n                            snap["features"], snap.get("research_score", 0.0),\n                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))\n                rec = latest_saved_signal(symbol_key, tf_key)\n                entry_price = rec["entry_price"] if rec else snap["price"]\n'''
+          new = '''            elif snap["signal"] in ("LONG", "SHORT"):\n                signal = snap["signal"]\n                confidence = snap["confidence"]\n                started = datetime.now(timezone.utc)\n                # Always journal a fresh direction. save_signal() itself\n                # prevents duplicate same-direction records during validity.\n                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),\n                            snap["features"], snap.get("research_score", 0.0),\n                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))\n                rec = latest_saved_signal(symbol_key, tf_key)\n                entry_price = rec["entry_price"] if rec else snap["price"]\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          # Add a compact saved-signal P&L block at the top, using the same
+          # existing cards() component so the dashboard structure stays intact.
+          old = '''    trade_df = read_csv(TRADE_FILE)\n    pnl = trade_pnl_stats(trade_df)\n    cards([\n        ("WIN P&L", f"+{pnl['win_pnl']:.2f}%", f"{pnl['wins']} winning trades", "good"),\n        ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", f"{pnl['losses']} losing trades", "bad"),\n        ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "closed trades total", "good" if pnl['net_pnl'] >= 0 else "bad"),\n        ("CLOSED", str(pnl['wins'] + pnl['losses']), "resolved trades", "cyan"),\n    ])\n'''
+          new = '''    trade_df = read_csv(TRADE_FILE)\n    pnl = trade_pnl_stats(trade_df)\n    signal_hist = load_signal_history()\n    signal_pnl = signal_history_pnl_stats(signal_hist)\n    cards([\n        ("SIGNAL P&L", f"{signal_pnl['total_pnl']:+.2f}%", f"{signal_pnl['active']} active saved signals", "good" if signal_pnl['total_pnl'] >= 0 else "bad"),\n        ("ACTIVE SIGNALS", str(signal_pnl['active']), "15M / 1H / 4H saved", "cyan"),\n        ("SIGNAL WINS", str(signal_pnl['wins']), "positive expired signals", "good"),\n        ("SIGNAL LOSSES", str(signal_pnl['losses']), "negative expired signals", "bad"),\n    ])\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          # Signal History tab: refresh from disk and show live P&L columns.
+          old = '''        h = read_csv(SIGNAL_FILE)\n        if not h.empty and "timeframe" in h.columns:\n            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]\n        t = read_csv(TRADE_FILE)\n        if not h.empty:\n            st.dataframe(h.tail(80).iloc[::-1], use_container_width=True, hide_index=True)\n            st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)\n        else:\n            st.info("No saved signals yet.")\n'''
+          new = '''        h = read_csv(SIGNAL_FILE)\n        if not h.empty and "timeframe" in h.columns:\n            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)].copy()\n        t = read_csv(TRADE_FILE)\n        if not h.empty:\n            prices_hist = live_prices()\n            h["LIVE P&L %"] = h.apply(lambda r: live_signal_pnl(num(r.get("price")), prices_hist.get(str(r.get("symbol")), num(r.get("price"))), str(r.get("signal"))), axis=1)\n            h["STATUS"] = h.apply(lambda r: "ACTIVE" if signal_validity_minutes(str(r.get("timeframe"))) and pd.notna(pd.to_datetime(r.get("timestamp"), utc=True, errors="coerce")) and (datetime.now(timezone.utc) - pd.to_datetime(r.get("timestamp"), utc=True).to_pydatetime()) < timedelta(minutes=signal_validity_minutes(str(r.get("timeframe")))) else "EXPIRED", axis=1)\n            st.dataframe(h.tail(80).iloc[::-1], use_container_width=True, hide_index=True)\n            st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)\n        else:\n            st.info("No saved signals yet.")\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+      - name: Validate
+        run: python -m py_compile dashboard.py
+      - name: Commit and remove patch workflow
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dashboard.py
+          git rm .github/workflows/fix-signal-history-pnl.yml
+          git commit -m 'Fix saved signal history and live signal P&L'
+          git push
