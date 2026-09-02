@@ -28,8 +28,6 @@ TRADE_FILE = ROOT / "trade_history.csv"
 SIGNAL_VALIDITY_MINUTES = {"15M": 30, "1H": 120, "4H": 180}
 AUTO_SCAN_TFS = ("15M", "1H", "4H")
 AUTO_SCAN_INTERVAL_SECONDS = 10
-AUTO_SCAN_TFS = ("15M", "1H", "4H")
-AUTO_SCAN_INTERVAL_SECONDS = 10
 
 FUTURES = ["https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
 SPOT = ["https://api.binance.com", "https://api1.binance.com"]
