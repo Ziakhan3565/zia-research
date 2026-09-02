@@ -1,0 +1,42 @@
+name: Apply signal stability fix
+
+on:
+  push:
+    branches:
+      - signal-stability-history-fix
+
+permissions:
+  contents: write
+
+jobs:
+  patch-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch dashboard signal engine
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text()
+          s = s.replace('SIGNAL_FILE = ROOT / "saved_signals.csv"\nTRADE_FILE = ROOT / "trade_history.csv"', 'SIGNAL_FILE = ROOT / "saved_signals.csv"\nTRADE_FILE = ROOT / "trade_history.csv"\n\nSIGNAL_VALIDITY_MINUTES = {"15M": 30, "1H": 120, "4H": 180}')
+          old = '''def save_signal(symbol, tf, price, sig, conf, pr, f, rs):\n    row = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "timeframe": tf, "price": price,\n           "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",\n           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs}\n    pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)\n'''
+          new = '''def signal_validity_minutes(tf):\n    return SIGNAL_VALIDITY_MINUTES.get(tf, 0)\n\n\ndef load_signal_history():\n    try:\n        if not SIGNAL_FILE.exists():\n            return pd.DataFrame()\n        return pd.read_csv(SIGNAL_FILE)\n    except Exception:\n        return pd.DataFrame()\n\n\ndef save_signal(symbol, tf, price, sig, conf, pr, f, rs):\n    if sig not in ("LONG", "SHORT"):\n        return False\n    now = datetime.now(timezone.utc)\n    hist = load_signal_history()\n    if not hist.empty:\n        try:\n            h = hist[(hist["symbol"].astype(str) == symbol) & (hist["timeframe"].astype(str) == tf)]\n            if not h.empty:\n                last = h.iloc[-1]\n                last_ts = pd.to_datetime(last["timestamp"], utc=True, errors="coerce")\n                if pd.notna(last_ts) and last.get("signal") == sig:\n                    validity = signal_validity_minutes(tf)\n                    if validity and (now - last_ts.to_pydatetime()) < timedelta(minutes=validity):\n                        return False\n        except Exception:\n            pass\n    row = {"timestamp": now.isoformat(), "symbol": symbol, "timeframe": tf, "price": price,\n           "signal": sig, "confidence": conf, "ml_probability": pr if pr is not None else "",\n           "obi20": f["obi_20"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"], "research_score": rs,\n           "validity_minutes": signal_validity_minutes(tf)}\n    pd.DataFrame([row]).to_csv(SIGNAL_FILE, mode="a", header=not SIGNAL_FILE.exists(), index=False)\n    return True\n\n\ndef recover_active_signal(symbol, tf):\n    validity = signal_validity_minutes(tf)\n    if not validity:\n        return None\n    hist = load_signal_history()\n    if hist.empty:\n        return None\n    try:\n        h = hist[(hist["symbol"].astype(str) == symbol) & (hist["timeframe"].astype(str) == tf)]\n        if h.empty:\n            return None\n        row = h.iloc[-1]\n        if row.get("signal") not in ("LONG", "SHORT"):\n            return None\n        ts = pd.to_datetime(row["timestamp"], utc=True, errors="coerce")\n        if pd.isna(ts):\n            return None\n        age = datetime.now(timezone.utc) - ts.to_pydatetime()\n        if age < timedelta(minutes=validity):\n            return {"signal": row["signal"], "started": ts.to_pydatetime(),\n                    "confidence": num(row.get("confidence"), 0), "combined": 0.0}\n    except Exception:\n        return None\n    return None\n'''
+          if old not in s:
+              raise SystemExit('save_signal block not found')
+          s = s.replace(old, new)
+          start = s.index('    now = datetime.now(timezone.utc)\n    signal = raw_signal', s.index('def live_engine():'))
+          end = s.index('\n    price = num(df.Close.iloc[-1]) if not df.empty else 0', start)
+          replacement = '''    now = datetime.now(timezone.utc)\n    signal = raw_signal\n    confidence = raw_confidence\n    combined = raw_combined\n\n    validity = signal_validity_minutes(tf)\n    if validity:\n        key = f"{symbol}:{tf}"\n        started_at = st.session_state.get("active_signal_started")\n        active = st.session_state.get("active_signal")\n        same_key = st.session_state.get("active_signal_key") == key\n        expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))\n\n        if not same_key:\n            recovered = recover_active_signal(symbol, tf)\n            if recovered:\n                active = recovered["signal"]\n                started_at = recovered["started"]\n                st.session_state.active_signal_confidence = recovered["confidence"]\n                st.session_state.active_signal_combined = recovered["combined"]\n            else:\n                active = None\n                started_at = None\n            st.session_state.active_signal_key = key\n            st.session_state.active_signal = active\n            st.session_state.active_signal_started = started_at\n            expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))\n\n        if expired:\n            active = None\n            st.session_state.active_signal = None\n            st.session_state.active_signal_started = None\n\n        if active in ("LONG", "SHORT") and not expired:\n            signal = active\n            confidence = float(st.session_state.get("active_signal_confidence") or raw_confidence)\n            combined = float(st.session_state.get("active_signal_combined") or raw_combined)\n        elif raw_signal in ("LONG", "SHORT"):\n            st.session_state.active_signal = raw_signal\n            st.session_state.active_signal_started = now\n            st.session_state.active_signal_key = key\n            st.session_state.active_signal_confidence = raw_confidence\n            st.session_state.active_signal_combined = raw_combined\n            signal = raw_signal\n            confidence = raw_confidence\n            combined = raw_combined\n\n        save_signal(symbol, tf, num(df.Close.iloc[-1]) if not df.empty else 0,\n                    signal, confidence, prob, f, rscore)\n'''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+      - name: Validate dashboard syntax
+        run: python -m py_compile dashboard.py
+      - name: Commit dashboard fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.py
+          git commit -m "Fix multi-timeframe signal stability and auto history" || exit 0
+          git push
