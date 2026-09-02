@@ -4,7 +4,6 @@ import re
 p = Path("dashboard.py")
 s = p.read_text(encoding="utf-8")
 
-# 1) Scanner scope and cadence.
 s = s.replace(
     'SIGNAL_VALIDITY_MINUTES = {"15M": 30, "1H": 120, "4H": 180}\n',
     'SIGNAL_VALIDITY_MINUTES = {"15M": 30, "1H": 120, "4H": 180}\n'
@@ -13,7 +12,6 @@ s = s.replace(
     1,
 )
 
-# 2) Add live P&L and automatic all-market scan helpers before STATE.
 if "def latest_saved_signal(" not in s:
     marker = '\n\n# ------------------------------------------------------------\n# STATE\n# ------------------------------------------------------------\n'
     helpers = r'''
@@ -82,7 +80,6 @@ def auto_scan_once(threshold=0.20):
             remaining = 0
             if started and validity:
                 remaining = max(0, int((started + timedelta(minutes=validity) - datetime.now(timezone.utc)).total_seconds()))
-
             rows.append({"symbol": symbol_key, "timeframe": tf_key, "price": snap["price"],
                          "signal": signal, "confidence": confidence, "entry_price": entry_price,
                          "pnl_pct": pnl_pct, "remaining_sec": remaining, "obi20": snap["obi20"]})
@@ -92,15 +89,11 @@ def auto_scan_once(threshold=0.20):
         raise SystemExit("STATE marker not found")
     s = s.replace(marker, helpers + marker, 1)
 
-# 3) Run the background scanner from the existing 1-second fragment, but only
-# perform the expensive all-coin scan every 10 seconds.
 if 'st.session_state.auto_scan_rows = auto_scan_once(threshold)' not in s:
     old = '    started = time.perf_counter()\n    df, source, cstat, _ = candles(symbol, TFS[tf], 650)'
     new = '''    started = time.perf_counter()
 
     # Automatic multi-market scanner: all tracked coins, ONLY 15M / 1H / 4H.
-    # New directional signals are saved automatically and active signals stay
-    # locked by the existing 30m/120m/180m validity rules.
     scan_clock = time.time()
     last_scan = st.session_state.get("auto_scan_last", 0.0)
     if scan_clock - last_scan >= AUTO_SCAN_INTERVAL_SECONDS:
@@ -116,7 +109,6 @@ if 'st.session_state.auto_scan_rows = auto_scan_once(threshold)' not in s:
         raise SystemExit("live_engine marker not found")
     s = s.replace(old, new, 1)
 
-# 4) Restrict the Signals journal to the same three automatic timeframes.
 if 'isin(AUTO_SCAN_TFS)' not in s:
     s = s.replace(
         '        h = read_csv(SIGNAL_FILE)\n        t = read_csv(TRADE_FILE)',
@@ -124,39 +116,38 @@ if 'isin(AUTO_SCAN_TFS)' not in s:
         1,
     )
 
-# 5) Replace only the scanner tab; keep all other dashboard sections unchanged.
 scanner_pattern = re.compile(r'    with tabs\[6\]:\n.*?\n    st\.caption\(', re.S)
-scanner = '''    with tabs[6]:
-        st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
-                    '<div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • signals are saved automatically • live P&L</div>',
+scanner = """    with tabs[6]:
+        st.markdown('<div class=\"panel\"><b>MULTI-MARKET SCANNER</b>'
+                    '<div class=\"section-sub\">Automatic all-coin scanner • ONLY 15M / 1H / 4H • signals are saved automatically • live P&L</div>',
                     unsafe_allow_html=True)
-        rows = [r for r in auto_rows if r["signal"] in ("LONG", "SHORT")]
-        rows.sort(key=lambda r: r["pnl_pct"], reverse=True)
-        longs = sum(1 for r in rows if r["signal"] == "LONG")
-        shorts = sum(1 for r in rows if r["signal"] == "SHORT")
+        rows = [r for r in auto_rows if r[\"signal\"] in (\"LONG\", \"SHORT\")]
+        rows.sort(key=lambda r: r[\"pnl_pct\"], reverse=True)
+        longs = sum(1 for r in rows if r[\"signal\"] == \"LONG\")
+        shorts = sum(1 for r in rows if r[\"signal\"] == \"SHORT\")
         cards([("LONG SIGNALS", str(longs), "active across all coins", "good"),
                ("SHORT SIGNALS", str(shorts), "active across all coins", "bad"),
                ("ACTIVE", str(len(rows)), "automatic signals", "cyan")])
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        st.markdown(\"<div style='height:6px'></div>\", unsafe_allow_html=True)
         for r in rows:
-            pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short"
-            pnl_cls = "good" if r["pnl_pct"] >= 0 else "bad"
-            mins, secs = divmod(max(0, int(r["remaining_sec"])), 60)
-            timer = f"{mins:02d}:{secs:02d}" if mins < 60 else f"{mins // 60:02d}:{mins % 60:02d}"
+            pill_cls = \"pill-long\" if r[\"signal\"] == \"LONG\" else \"pill-short\"
+            pnl_cls = \"good\" if r[\"pnl_pct\"] >= 0 else \"bad\"
+            mins, secs = divmod(max(0, int(r[\"remaining_sec\"])), 60)
+            timer = f\"{mins:02d}:{secs:02d}\" if mins < 60 else f\"{mins // 60:02d}:{mins % 60:02d}\"
             st.markdown(
-                f'<div class="scan-row">'
-                f'<div style="width:13%;font-weight:900">{r["symbol"]}</div>'
-                f'<div style="width:9%;font-weight:900">{r["timeframe"]}</div>'
-                f'<div style="width:13%">${r["price"]:,.4f}</div>'
-                f'<div style="width:13%" class="{pnl_cls}">{r["pnl_pct"]:+.2f}% P&L</div>'
-                f'<div style="width:12%">OBI {r["obi20"]:+.3f}</div>'
-                f'<div style="width:14%">conf {r["confidence"]:.1f}%</div>'
-                f'<div style="width:10%">lock {timer}</div>'
-                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
+                f'<div class=\"scan-row\">'
+                f'<div style=\"width:13%;font-weight:900\">{r[\"symbol\"]}</div>'
+                f'<div style=\"width:9%;font-weight:900\">{r[\"timeframe\"]}</div>'
+                f'<div style=\"width:13%\">${r[\"price\"]:,.4f}</div>'
+                f'<div style=\"width:13%\" class=\"{pnl_cls}\">{r[\"pnl_pct\"]:+.2f}% P&L</div>'
+                f'<div style=\"width:12%\">OBI {r[\"obi20\"]:+.3f}</div>'
+                f'<div style=\"width:14%\">conf {r[\"confidence\"]:.1f}%</div>'
+                f'<div style=\"width:10%\">lock {timer}</div>'
+                f'<div style=\"width:13%;text-align:right\"><span class=\"pill {pill_cls}\">{r[\"signal\"]}</span></div>'
                 f'</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    st.caption('''
+    st.caption("""
 if not scanner_pattern.search(s):
     raise SystemExit("scanner tab marker not found")
 s = scanner_pattern.sub(scanner, s, count=1)
