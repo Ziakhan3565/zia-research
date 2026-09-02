@@ -1,0 +1,44 @@
+name: Fix dashboard live engine
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix-dashboard:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fix timer variable collision
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+          old = 'def live_engine():\n    started = time.perf_counter()'
+          new = 'def live_engine():\n    cycle_started = time.perf_counter()'
+          if old in s:
+              s = s.replace(old, new, 1)
+          s = s.replace('elapsed = (time.perf_counter() - started) * 1000',
+                        'elapsed = (time.perf_counter() - cycle_started) * 1000', 1)
+          p.write_text(s, encoding='utf-8')
+
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dashboard.py
+          if git diff --cached --quiet; then
+            echo 'Dashboard already fixed.'
+            exit 0
+          fi
+          git commit -m 'Fix silent dashboard live engine timer'
+          git push
