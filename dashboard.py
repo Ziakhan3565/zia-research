@@ -150,6 +150,16 @@ def orderbook(symbol):
         return np.empty((0, 2)), np.empty((0, 2)), source, status, host
 
 
+@st.cache_data(ttl=0.8, show_spinner=False)
+def live_prices():
+    raw, _, _ = api(FUTURES, "/fapi/v1/ticker/price", {})
+    if not isinstance(raw, list):
+        raw, _, _ = api(SPOT, "/api/v3/ticker/price", {})
+    if not isinstance(raw, list):
+        return {}
+    return {str(x.get("symbol")): num(x.get("price")) for x in raw if isinstance(x, dict) and x.get("symbol")}
+
+
 def obi(bids, asks, k):
     if len(bids) == 0 or len(asks) == 0:
         return 0., 0., 0.
@@ -459,7 +469,10 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
     return {"symbol": symbol, "price": price, "change": change, "signal": signal,
-            "confidence": confidence, "combined": combined, "obi20": f["obi_20"]}
+            "confidence": confidence, "combined": combined, "obi20": f["obi_20"],
+            "obi5": f["obi_5"], "obi10": f["obi_10"], "obi50": f["obi_50"],
+            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,
+            "ml_status": mlstat, "ml_features": feature_count}
 
 
 
@@ -627,13 +640,23 @@ def live_engine():
             auto_rows_map[f"{symbol_key}:{tf_key}"] = {"symbol": symbol_key, "timeframe": tf_key,
                 "price": snap["price"], "signal": signal, "confidence": confidence,
                 "entry_price": entry_price, "pnl_pct": pnl_pct, "remaining_sec": remaining,
-                "obi20": snap["obi20"]}
+                "obi20": snap["obi20"], "obi5": snap.get("obi5", 0.0),
+                "obi10": snap.get("obi10", 0.0), "obi50": snap.get("obi50", 0.0),
+                "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),
+                "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),
+                "ml_features": snap.get("ml_features", 0)}
             st.session_state.auto_scan_rows_map = auto_rows_map
             st.session_state.auto_scan_cursor = cursor + 1
             st.session_state.auto_scan_last = scan_clock
         except Exception:
             st.session_state.auto_scan_last = scan_clock
     auto_rows = list(st.session_state.get("auto_scan_rows_map", {}).values())
+    prices_live = live_prices()
+    for row in auto_rows:
+        current = prices_live.get(row.get("symbol"))
+        if current and row.get("signal") in ("LONG", "SHORT"):
+            row["price"] = current
+            row["pnl_pct"] = live_signal_pnl(row.get("entry_price", 0.0), current, row.get("signal"))
 
     df, source, cstat, _ = candles(symbol, TFS[tf], 650)
     bids, asks, bsrc, bstat, _ = orderbook(symbol)
@@ -704,6 +727,10 @@ def live_engine():
     cls = "signal-long" if signal == "LONG" else "signal-short" if signal == "SHORT" else "signal-wait"
     sigcolor = "good" if signal == "LONG" else "bad" if signal == "SHORT" else "amber"
     mltext = f"{prob * 100:.2f}%" if prob is not None else "—"
+    selected_rec = latest_saved_signal(symbol, tf) if signal in ("LONG", "SHORT") else None
+    selected_entry = selected_rec["entry_price"] if selected_rec else 0.0
+    live_pnl_pct = live_signal_pnl(selected_entry, price, signal) if selected_entry else 0.0
+    live_pnl_text = f"{live_pnl_pct:+.2f}%" if selected_entry else "—"
 
     # Visible countdown for the locked signal. The fragment refreshes every
     # second, so this timer counts down live without changing the signal.
@@ -723,7 +750,7 @@ def live_engine():
 
     st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'
                 f'<div class="signal-main {sigcolor}">{signal}</div>'
-                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div>'
+                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} ({mlstat}) • OBI5 {f["obi_5"]:+.3f} • OBI20 {f["obi_20"]:+.3f} • OBI50 {f["obi_50"]:+.3f} • OFI {f["taker_flow_ratio"]:+.3f} • LIVE P&L {live_pnl_text} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div>'
                 f'<div class="signal-timer {timer_class}">{timer_text}</div></div>',
                 unsafe_allow_html=True)
 
@@ -733,6 +760,8 @@ def live_engine():
         ("ML", mltext, mlstat, "violet"),
         ("OBI 20", f"{f['obi_20']:+.3f}", "top 20 depth", "good" if f['obi_20'] >= 0 else "bad"),
         ("OBI 50", f"{f['obi_50']:+.3f}", "top 50 depth", "good" if f['obi_50'] >= 0 else "bad"),
+        ("OFI", f"{f['taker_flow_ratio']:+.3f}", "live taker flow", "good" if f['taker_flow_ratio'] >= 0 else "bad"),
+        ("LIVE P&L", live_pnl_text, "mark-to-market from signal entry", "good" if live_pnl_pct >= 0 else "bad"),
         ("DATA", source, f"book {bsrc}", "cyan"),
     ])
 
@@ -859,7 +888,9 @@ def live_engine():
                 f'<div style="width:13%">${r["price"]:,.4f}</div>'
                 f'<div style="width:13%" class="{pnl_cls}">{r["pnl_pct"]:+.2f}% P&L</div>'
                 f'<div style="width:12%">OBI {r["obi20"]:+.3f}</div>'
-                f'<div style="width:14%">conf {r["confidence"]:.1f}%</div>'
+                f'<div style="width:12%">OFI {r.get("ofi", 0.0):+.3f}</div>'
+                f'<div style="width:16%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'
+                f'<div style="width:12%">conf {r["confidence"]:.1f}%</div>'
                 f'<div style="width:10%">lock {timer}</div>'
                 f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
                 f'</div>', unsafe_allow_html=True)
