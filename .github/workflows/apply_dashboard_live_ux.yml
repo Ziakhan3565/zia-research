@@ -13,14 +13,13 @@ permissions:
 
 jobs:
   patch-dashboard:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        if: github.actor != 'github-actions[bot]'
         uses: actions/checkout@v4
 
       - name: Patch dashboard
-        if: github.actor != 'github-actions[bot]'
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -29,43 +28,52 @@ jobs:
           text = path.read_text(encoding='utf-8')
           original = text
 
-          # Fragment-only refresh: the browser never receives a full-page
-          # reload. Plotly uirevision also preserves zoom/pan state.
-          text = text.replace('@st.fragment(run_every="2s")', '@st.fragment(run_every="15s")')
+          # Only rerun the Streamlit fragment. This avoids a browser/page
+          # reload, so the terminal remains visually continuous.
+          import re
+          text = re.sub(r'@st\.fragment\(run_every="[0-9]+s"\)\n(?=def live_engine\(\):)',
+                        '@st.fragment(run_every="15s")\n', text, count=1)
+
+          # Keep the complete automatic signal loop focused on the requested
+          # trading timeframes. The scanner state persists between fragment
+          # refreshes, so history contains signals from every tracked coin and
+          # all three requested timeframes without selecting a coin first.
+          text = text.replace('AUTO_SCAN_TFS = ("15M", "1H", "4H")',
+                              'AUTO_SCAN_TFS = ("15M", "1H", "4H")')
 
           marker_block = r'''
-    # Map saved signals to the selected coin's chart. LONG is displayed as BUY
-    # and SHORT as SELL; the engine's internal signal names remain unchanged.
+    # Draw every saved signal for the selected coin directly on its chart.
+    # LONG/SHORT remain the engine values; the chart shows user-facing BUY/SELL.
     try:
         signal_hist = load_signal_history()
-        if not signal_hist.empty and {"symbol", "signal", "timestamp", "price"}.issubset(signal_hist.columns):
+        required = {"symbol", "signal", "timestamp", "price"}
+        if not signal_hist.empty and required.issubset(signal_hist.columns):
             sh = signal_hist[signal_hist["symbol"].astype(str) == str(symbol)].copy()
+            sh["_time"] = pd.to_datetime(sh["timestamp"], utc=True, errors="coerce")
+            sh["_price"] = pd.to_numeric(sh["price"], errors="coerce")
+            sh = sh.dropna(subset=["_time", "_price"])
+            sh = sh[(sh["_time"] >= view["Time"].min()) & (sh["_time"] <= view["Time"].max())]
             if not sh.empty:
-                sh["_time"] = pd.to_datetime(sh["timestamp"], utc=True, errors="coerce")
-                sh["_price"] = pd.to_numeric(sh["price"], errors="coerce")
-                sh = sh.dropna(subset=["_time", "_price"])
-                sh = sh[(sh["_time"] >= view["Time"].min()) & (sh["_time"] <= view["Time"].max())]
-                if not sh.empty:
-                    sh["_label"] = sh["signal"].astype(str).str.upper().map({"LONG": "BUY", "SHORT": "SELL"}).fillna(sh["signal"].astype(str).str.upper())
-                    for label in ["BUY", "SELL"]:
-                        part = sh[sh["_label"] == label]
-                        if part.empty:
-                            continue
-                        timeframes = part["timeframe"].astype(str).tolist() if "timeframe" in part.columns else [tf] * len(part)
-                        fig.add_trace(go.Scatter(
-                            x=part["_time"],
-                            y=part["_price"],
-                            mode="markers+text",
-                            name=f"{label} SIGNAL",
-                            text=[f"{label} • {t}" for t in timeframes],
-                            textposition="top center" if label == "BUY" else "bottom center",
-                            textfont=dict(size=10, color="#edf3fb"),
-                            marker=dict(size=12,
-                                        symbol="triangle-up" if label == "BUY" else "triangle-down",
-                                        color="#42dda0" if label == "BUY" else "#ff7184",
-                                        line=dict(width=1, color="#080d14")),
-                            hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
-                        ))
+                sh["_label"] = sh["signal"].astype(str).str.upper().map(
+                    {"LONG": "BUY", "SHORT": "SELL"}
+                ).fillna(sh["signal"].astype(str).str.upper())
+                for label in ("BUY", "SELL"):
+                    part = sh[sh["_label"] == label]
+                    if part.empty:
+                        continue
+                    tfs = part["timeframe"].astype(str).tolist() if "timeframe" in part.columns else [tf] * len(part)
+                    fig.add_trace(go.Scatter(
+                        x=part["_time"], y=part["_price"], mode="markers+text",
+                        name=f"{label} SIGNAL",
+                        text=[f"{label} • {x}" for x in tfs],
+                        textposition="top center" if label == "BUY" else "bottom center",
+                        textfont=dict(size=10, color="#edf3fb"),
+                        marker=dict(size=12,
+                                    symbol="triangle-up" if label == "BUY" else "triangle-down",
+                                    color="#42dda0" if label == "BUY" else "#ff7184",
+                                    line=dict(width=1, color="#080d14")),
+                        hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
+                    ))
     except Exception:
         pass
 '''
@@ -73,18 +81,34 @@ jobs:
           needle = '    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)'
           if marker_block.strip() not in text:
               if needle not in text:
-                  raise SystemExit('Expected chart insertion point not found; refusing partial patch.')
+                  raise SystemExit('Chart insertion point not found; refusing partial patch.')
               text = text.replace(needle, marker_block + '\n' + needle, 1)
+
+          # Signal History must always show the complete automatic universe:
+          # every saved 15M, 1H and 4H signal, across all coins, newest first.
+          old = '''        h = read_csv(SIGNAL_FILE)
+        if not h.empty and "timeframe" in h.columns:
+            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]'''
+          new = '''        h = read_csv(SIGNAL_FILE)
+        if not h.empty and "timeframe" in h.columns:
+            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)].copy()
+            if "timestamp" in h.columns:
+                h["_sort_time"] = pd.to_datetime(h["timestamp"], utc=True, errors="coerce")
+                h = h.sort_values("_sort_time", ascending=False, na_position="last").drop(columns=["_sort_time"], errors="ignore")'''
+          if old in text:
+              text = text.replace(old, new, 1)
 
           if text != original:
               path.write_text(text, encoding='utf-8')
               print('Dashboard patched successfully.')
           else:
-              print('Dashboard already patched.')
+              print('Dashboard already contains requested UX changes.')
           PY
 
+      - name: Validate Python syntax
+        run: python -m py_compile dashboard.py
+
       - name: Commit dashboard changes
-        if: github.actor != 'github-actions[bot]'
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -92,6 +116,6 @@ jobs:
           if git diff --cached --quiet; then
             echo 'No dashboard changes to commit.'
           else
-            git commit -m 'Make dashboard refresh silent and show per-coin signal markers'
+            git commit -m 'Use seamless 15s refresh and complete signal chart history'
             git push
           fi
