@@ -1,0 +1,97 @@
+name: Apply Dashboard Live UX
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard.py'
+      - '.github/workflows/apply_dashboard_live_ux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-dashboard:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch dashboard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('dashboard.py')
+          text = path.read_text(encoding='utf-8')
+          original = text
+
+          # Keep Streamlit on a fragment-only refresh. The page itself is never
+          # hard-refreshed, and Plotly's uirevision keeps chart zoom/pan state.
+          text = text.replace('@st.fragment(run_every="2s")', '@st.fragment(run_every="15s")')
+
+          marker_block = r'''
+    # Signal markers are mapped to the selected coin. A BTC signal is therefore
+    # drawn only on BTC charts, XRP only on XRP charts, etc. The label uses the
+    # user-facing BUY/SELL terminology while the engine continues to store
+    # LONG/SHORT internally.
+    try:
+        signal_hist = load_signal_history()
+        if not signal_hist.empty and {"symbol", "signal", "timestamp", "price"}.issubset(signal_hist.columns):
+            sh = signal_hist[signal_hist["symbol"].astype(str) == str(symbol)].copy()
+            if not sh.empty:
+                sh["_time"] = pd.to_datetime(sh["timestamp"], utc=True, errors="coerce")
+                sh["_price"] = pd.to_numeric(sh["price"], errors="coerce")
+                sh = sh.dropna(subset=["_time", "_price"])
+                sh = sh[(sh["_time"] >= view["Time"].min()) & (sh["_time"] <= view["Time"].max())]
+                if not sh.empty:
+                    sh["_label"] = sh["signal"].astype(str).str.upper().map({"LONG": "BUY", "SHORT": "SELL"}).fillna(sh["signal"].astype(str).str.upper())
+                    sh["_color"] = sh["_label"].map({"BUY": "#42dda0", "SELL": "#ff7184"}).fillna("#f3c86a")
+                    sh["_symbol"] = sh["_label"].map({"BUY": "triangle-up", "SELL": "triangle-down"}).fillna("circle")
+                    for label in ["BUY", "SELL"]:
+                        part = sh[sh["_label"] == label]
+                        if part.empty:
+                            continue
+                        fig.add_trace(go.Scatter(
+                            x=part["_time"],
+                            y=part["_price"],
+                            mode="markers+text",
+                            name=f"{label} SIGNAL",
+                            text=[f"{label} • {t}" for t in part.get("timeframe", pd.Series([tf] * len(part)))],
+                            textposition="top center" if label == "BUY" else "bottom center",
+                            textfont=dict(size=10, color="#edf3fb"),
+                            marker=dict(size=12, symbol="triangle-up" if label == "BUY" else "triangle-down",
+                                        color="#42dda0" if label == "BUY" else "#ff7184",
+                                        line=dict(width=1, color="#080d14")),
+                            hovertemplate=f"{label} SIGNAL<br>Price: %{{y:,.6f}}<br>Time: %{{x}}<extra></extra>",
+                        ))
+    except Exception:
+        pass
+'''
+
+          needle = '    step = view.Time.iloc[-1] - view.Time.iloc[-2] if len(view) > 1 else pd.Timedelta(minutes=5)'
+          if marker_block.strip() not in text:
+              if needle not in text:
+                  raise SystemExit('Expected chart insertion point not found; refusing partial patch.')
+              text = text.replace(needle, marker_block + '\n' + needle, 1)
+
+          if text == original:
+              print('Dashboard already contains the requested live UX changes.')
+          else:
+              path.write_text(text, encoding='utf-8')
+              print('Dashboard patched successfully.')
+          PY
+
+      - name: Commit dashboard changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dashboard.py
+          if git diff --cached --quiet; then
+            echo 'No dashboard changes to commit.'
+          else
+            git commit -m 'Make dashboard refresh silent and show per-coin signal markers'
+            git push
+          fi
