@@ -1,0 +1,64 @@
+name: Fix history and smooth refresh
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fix-history-smooth-refresh.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch dashboard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('dashboard.py')
+          s = p.read_text(encoding='utf-8')
+
+          old = '@st.fragment(run_every="1s")\ndef live_engine():'
+          new = '@st.fragment(run_every="2s")\ndef live_engine():'
+          if old not in s:
+              raise SystemExit('live_engine decorator not found')
+          s = s.replace(old, new, 1)
+
+          old = '<div class="live"><span class="dot"></span>LIVE • SILENT 1S</div>'
+          new = '<div class="live"><span class="dot"></span>LIVE • SILENT</div>'
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          old = 'st.write(f"Engine: `{elapsed:.0f} ms` • silent 1s cycle")'
+          new = 'st.write(f"Engine: `{elapsed:.0f} ms` • silent live cycle")'
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          old = '''    with tabs[5]:\n        if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):\n            save_signal(symbol, tf, price, signal, confidence, prob, f, rscore)\n            st.success("Signal saved")\n        h = read_csv(SIGNAL_FILE)'''
+          new = '''    with tabs[5]:\n        hcol1, hcol2 = st.columns([3, 1])\n        with hcol1:\n            if st.button("💾 SAVE CURRENT SIGNAL", use_container_width=True, key="save_signal_btn"):\n                save_signal(symbol, tf, price, signal, confidence, prob, f, rscore, mlstat, pred, mlscore)\n                st.success("Signal saved")\n        with hcol2:\n            if st.button("🗑 CLEAR HISTORY", use_container_width=True, key="clear_signal_history_btn"):\n                try:\n                    if SIGNAL_FILE.exists():\n                        SIGNAL_FILE.unlink()\n                    st.session_state.auto_scan_rows_map = {}\n                    st.session_state.auto_scan_cursor = 0\n                    st.session_state.active_signal = None\n                    st.session_state.active_signal_started = None\n                    st.session_state.active_signal_key = None\n                    st.session_state.active_signal_confidence = None\n                    st.session_state.active_signal_combined = None\n                    st.success("Signal history cleared")\n                except Exception as exc:\n                    st.error(f"Could not clear signal history: {exc}")\n        h = read_csv(SIGNAL_FILE)'''
+          if old not in s:
+              raise SystemExit('signal history UI block not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Validate Python syntax
+        run: python -m py_compile dashboard.py
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.py
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add clear signal history and smoother silent refresh"
+            git push
+          fi
