@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import time
 
@@ -229,11 +229,23 @@ def research(f):
     return scores, weights, float(sum(scores[k] * weights[k] for k in scores))
 
 
-def final_state(f, p, pr, threshold=0.45):
+def final_state(f, p, pr, threshold=0.45, strict=False):
     scores, weights, rscore = research(f)
     mlscore = (pr - .5) * 2 if pr is not None else (1 if p == 1 else -1 if p == 0 else 0)
     combined = .6 * rscore + .4 * mlscore if p is not None else rscore
-    signal = "LONG" if combined >= threshold else "SHORT" if combined <= -threshold else "WAIT"
+    effective_threshold = max(float(threshold), 0.35) if strict else float(threshold)
+    signal = "LONG" if combined >= effective_threshold else "SHORT" if combined <= -effective_threshold else "WAIT"
+
+    # Accuracy gate for the 15M engine: do not emit a directional signal
+    # when ML and the Research composite disagree materially.
+    if strict and p is not None:
+        research_dir = 1 if rscore > 0 else -1 if rscore < 0 else 0
+        ml_dir = 1 if mlscore > 0 else -1 if mlscore < 0 else 0
+        probability_ok = pr is not None and max(pr, 1.0 - pr) >= 0.60
+        agreement_ok = research_dir == ml_dir and research_dir != 0
+        if signal != "WAIT" and not (agreement_ok and probability_ok):
+            signal = "WAIT"
+
     confidence = float(np.clip(50 + abs(combined) * 49, 1, 99))
     return signal, confidence, combined, scores, weights, rscore, mlscore
 
@@ -323,7 +335,8 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
     bids, asks, *_ = orderbook(symbol)
     f = features(df, bids, asks)
     pred, prob, _, _ = ml_predict(f)
-    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold)
+    strict = tf_key == "15M"
+    signal, confidence, combined, *_ = final_state(f, pred, prob, threshold, strict=strict)
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
@@ -342,6 +355,16 @@ if "future" not in st.session_state:
     st.session_state.future = 30
 if "threshold" not in st.session_state:
     st.session_state.threshold = 0.20
+if "active_signal" not in st.session_state:
+    st.session_state.active_signal = None
+if "active_signal_started" not in st.session_state:
+    st.session_state.active_signal_started = None
+if "active_signal_key" not in st.session_state:
+    st.session_state.active_signal_key = None
+if "active_signal_confidence" not in st.session_state:
+    st.session_state.active_signal_confidence = None
+if "active_signal_combined" not in st.session_state:
+    st.session_state.active_signal_combined = None
 
 st.markdown('<div class="hero"><div><div class="brand">ZIA <b>RESEARCH</b></div>'
             '<div class="micro">QUANT MARKET INTELLIGENCE • LIVE ML • ORDER FLOW • MULTI-MARKET SCANNER</div></div>'
@@ -375,7 +398,51 @@ def live_engine():
     bids, asks, bsrc, bstat, _ = orderbook(symbol)
     f = features(df, bids, asks)
     pred, prob, mlstat, feature_count = ml_predict(f)
-    signal, confidence, combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold)
+
+    # 15M is intentionally more selective: ML probability and Research
+    # direction must agree before a fresh directional signal is accepted.
+    strict_15m = tf == "15M"
+    raw_signal, raw_confidence, raw_combined, rs, rw, rscore, mlscore = final_state(
+        f, pred, prob, threshold, strict=strict_15m
+    )
+
+    now = datetime.now(timezone.utc)
+    signal = raw_signal
+    confidence = raw_confidence
+    combined = raw_combined
+
+    # A 15M signal is locked for 30 minutes from the moment it is accepted.
+    # Live 1-second recalculation continues, but the displayed directional
+    # signal does not flip on every microstructure update during the window.
+    if strict_15m:
+        key = f"{symbol}:15M"
+        started_at = st.session_state.active_signal_started
+        active = st.session_state.active_signal
+        same_key = st.session_state.active_signal_key == key
+        expired = started_at is None or (now - started_at) >= timedelta(minutes=30)
+
+        if not same_key or expired:
+            st.session_state.active_signal = None
+            st.session_state.active_signal_started = None
+            st.session_state.active_signal_key = key
+            st.session_state.active_signal_confidence = None
+            st.session_state.active_signal_combined = None
+            active = None
+
+        if active in ("LONG", "SHORT") and not expired and same_key:
+            signal = active
+            confidence = float(st.session_state.active_signal_confidence or raw_confidence)
+            combined = float(st.session_state.active_signal_combined or raw_combined)
+        elif raw_signal in ("LONG", "SHORT"):
+            st.session_state.active_signal = raw_signal
+            st.session_state.active_signal_started = now
+            st.session_state.active_signal_key = key
+            st.session_state.active_signal_confidence = raw_confidence
+            st.session_state.active_signal_combined = raw_combined
+            signal = raw_signal
+            confidence = raw_confidence
+            combined = raw_combined
+
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
