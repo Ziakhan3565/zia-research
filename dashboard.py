@@ -581,7 +581,7 @@ st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
 
 @st.fragment(run_every="1s")
 def live_engine():
-    started = time.perf_counter()
+    cycle_started = time.perf_counter()
 
     # Keep the main dashboard responsive: never scan all 36 symbol/timeframe
     # combinations in one render. One pair is scanned per 1s live cycle and
@@ -700,7 +700,7 @@ def live_engine():
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
-    elapsed = (time.perf_counter() - started) * 1000
+    elapsed = (time.perf_counter() - cycle_started) * 1000
     cls = "signal-long" if signal == "LONG" else "signal-short" if signal == "SHORT" else "signal-wait"
     sigcolor = "good" if signal == "LONG" else "bad" if signal == "SHORT" else "amber"
     mltext = f"{prob * 100:.2f}%" if prob is not None else "—"
