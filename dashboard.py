@@ -583,16 +583,57 @@ st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
 def live_engine():
     started = time.perf_counter()
 
-    # Automatic multi-market scanner: all tracked coins, ONLY 15M / 1H / 4H.
+    # Keep the main dashboard responsive: never scan all 36 symbol/timeframe
+    # combinations in one render. One pair is scanned per 1s live cycle and
+    # the results accumulate into the automatic scanner list.
     scan_clock = time.time()
-    last_scan = st.session_state.get("auto_scan_last", 0.0)
-    if scan_clock - last_scan >= AUTO_SCAN_INTERVAL_SECONDS:
+    auto_rows_map = st.session_state.get("auto_scan_rows_map", {})
+    cursor = int(st.session_state.get("auto_scan_cursor", 0))
+    if not auto_rows_map:
+        st.session_state.auto_scan_rows_map = {}
+    if not st.session_state.get("auto_scan_initialized", False):
+        st.session_state.auto_scan_initialized = True
+        st.session_state.auto_scan_last = scan_clock
+    elif scan_clock - st.session_state.get("auto_scan_last", 0.0) >= 1.0:
         try:
-            st.session_state.auto_scan_rows = auto_scan_once(threshold)
+            pairs = [(tf_key, symbol_key) for tf_key in AUTO_SCAN_TFS for symbol_key in SYMBOLS]
+            tf_key, symbol_key = pairs[cursor % len(pairs)]
+            snap = scan_symbol(symbol_key, tf_key, threshold)
+            active = recover_active_signal(symbol_key, tf_key)
+            if active:
+                signal = active["signal"]
+                confidence = active["confidence"]
+                started = active["started"]
+                rec = latest_saved_signal(symbol_key, tf_key)
+                entry_price = rec["entry_price"] if rec else snap["price"]
+            elif snap["signal"] in ("LONG", "SHORT"):
+                signal = snap["signal"]
+                confidence = snap["confidence"]
+                started = datetime.now(timezone.utc)
+                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, None,
+                            {"obi_20": snap["obi20"], "obi_50": 0.0, "taker_flow_ratio": 0.0}, 0.0)
+                rec = latest_saved_signal(symbol_key, tf_key)
+                entry_price = rec["entry_price"] if rec else snap["price"]
+            else:
+                signal = "WAIT"
+                confidence = snap["confidence"]
+                started = None
+                entry_price = 0.0
+            pnl_pct = live_signal_pnl(entry_price, snap["price"], signal)
+            validity = signal_validity_minutes(tf_key)
+            remaining = 0
+            if started and validity:
+                remaining = max(0, int((started + timedelta(minutes=validity) - datetime.now(timezone.utc)).total_seconds()))
+            auto_rows_map[f"{symbol_key}:{tf_key}"] = {"symbol": symbol_key, "timeframe": tf_key,
+                "price": snap["price"], "signal": signal, "confidence": confidence,
+                "entry_price": entry_price, "pnl_pct": pnl_pct, "remaining_sec": remaining,
+                "obi20": snap["obi20"]}
+            st.session_state.auto_scan_rows_map = auto_rows_map
+            st.session_state.auto_scan_cursor = cursor + 1
             st.session_state.auto_scan_last = scan_clock
         except Exception:
-            st.session_state.auto_scan_rows = st.session_state.get("auto_scan_rows", [])
-    auto_rows = st.session_state.get("auto_scan_rows", [])
+            st.session_state.auto_scan_last = scan_clock
+    auto_rows = list(st.session_state.get("auto_scan_rows_map", {}).values())
 
     df, source, cstat, _ = candles(symbol, TFS[tf], 650)
     bids, asks, bsrc, bstat, _ = orderbook(symbol)
