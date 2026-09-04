@@ -551,7 +551,7 @@ tri_text = " + ".join(x[0] for x in visible) if visible else "NONE"
 st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div><div class="tri-chip">CHART <span>{tf}</span></div><div class="tri-chip">DISPLAY <span>{tri_text}</span></div><div class="tri-chip">ZOOM <span>ON</span></div><div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
 
 
-@st.fragment(run_every="5s")
+@st.fragment(run_every="10s")
 def live_engine():
     cycle_started = time.perf_counter()
 
