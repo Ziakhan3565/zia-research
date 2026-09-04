@@ -252,9 +252,6 @@ def final_state(f, p, pr, threshold=0.45, strict=False):
     combined = .6 * rscore + .4 * mlscore if p is not None else rscore
     effective_threshold = max(float(threshold), 0.35) if strict else float(threshold)
     signal = "LONG" if combined >= effective_threshold else "SHORT" if combined <= -effective_threshold else "WAIT"
-
-    # Accuracy gate for the 15M engine: do not emit a directional signal
-    # when ML and the Research composite disagree materially.
     if strict and p is not None:
         research_dir = 1 if rscore > 0 else -1 if rscore < 0 else 0
         ml_dir = 1 if mlscore > 0 else -1 if mlscore < 0 else 0
@@ -262,7 +259,6 @@ def final_state(f, p, pr, threshold=0.45, strict=False):
         agreement_ok = research_dir == ml_dir and research_dir != 0
         if signal != "WAIT" and not (agreement_ok and probability_ok):
             signal = "WAIT"
-
     confidence = float(np.clip(50 + abs(combined) * 49, 1, 99))
     return signal, confidence, combined, scores, weights, rscore, mlscore
 
@@ -379,26 +375,14 @@ def save_signal(symbol, tf, price, sig, conf, pr, f, rs, ml_status="", ml_pred=N
 
 
 def trade_pnl_stats(t):
-    """Return closed-trade P&L percentages for the Overview dashboard.
-
-    Prefer an existing percentage P&L column. If it is not present, derive
-    percentage return from entry/exit prices and the trade direction.
-    """
     if t is None or t.empty or "result" not in t.columns:
         return {"wins": 0, "losses": 0, "win_pnl": 0.0, "loss_pnl": 0.0, "net_pnl": 0.0}
-
     df = t.copy()
     result = df["result"].astype(str).str.upper().str.strip()
-
-    pct_col = next((c for c in [
-        "pnl_pct", "pnl_percent", "profit_pct", "profit_percent",
-        "return_pct", "pnl_percentage", "P&L %", "P&L%"
-    ] if c in df.columns), None)
-
+    pct_col = next((c for c in ["pnl_pct", "pnl_percent", "profit_pct", "profit_percent", "return_pct", "pnl_percentage", "P&L %", "P&L%"] if c in df.columns), None)
     pct = pd.Series(np.nan, index=df.index, dtype=float)
     if pct_col:
         pct = pd.to_numeric(df[pct_col], errors="coerce")
-        # Some journals store decimal returns (0.012 = 1.2%).
         if pct.abs().dropna().median() <= 1.0:
             pct = pct * 100.0
     else:
@@ -415,21 +399,12 @@ def trade_pnl_stats(t):
                 pct = pd.Series(pct, index=df.index, dtype=float)
             else:
                 pct = raw
-
-    # Normalize by result so wins are positive and losses negative even if
-    # the source journal stores absolute P&L percentages.
     pct = pd.to_numeric(pct, errors="coerce")
     win_mask = result.eq("WIN") & pct.notna()
     loss_mask = result.eq("LOSS") & pct.notna()
     win_pnl = float(pct[win_mask].abs().sum())
     loss_pnl = -float(pct[loss_mask].abs().sum())
-    return {
-        "wins": int(result.eq("WIN").sum()),
-        "losses": int(result.eq("LOSS").sum()),
-        "win_pnl": win_pnl,
-        "loss_pnl": loss_pnl,
-        "net_pnl": win_pnl + loss_pnl,
-    }
+    return {"wins": int(result.eq("WIN").sum()), "losses": int(result.eq("LOSS").sum()), "win_pnl": win_pnl, "loss_pnl": loss_pnl, "net_pnl": win_pnl + loss_pnl}
 
 
 def recover_active_signal(symbol, tf):
@@ -451,8 +426,7 @@ def recover_active_signal(symbol, tf):
             return None
         age = datetime.now(timezone.utc) - ts.to_pydatetime()
         if age < timedelta(minutes=validity):
-            return {"signal": row["signal"], "started": ts.to_pydatetime(),
-                    "confidence": num(row.get("confidence"), 0), "combined": 0.0}
+            return {"signal": row["signal"], "started": ts.to_pydatetime(), "confidence": num(row.get("confidence"), 0), "combined": 0.0}
     except Exception:
         return None
     return None
@@ -460,7 +434,6 @@ def recover_active_signal(symbol, tf):
 
 @st.cache_data(ttl=3.0, show_spinner=False)
 def scan_symbol(symbol, tf_key, threshold=0.20):
-    """One-shot signal snapshot for the multi-market scanner."""
     df, source, _, _ = candles(symbol, TFS[tf_key], 120)
     bids, asks, *_ = orderbook(symbol)
     f = features(df, bids, asks)
@@ -470,17 +443,13 @@ def scan_symbol(symbol, tf_key, threshold=0.20):
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
     change = (price / prev - 1) * 100 if prev else 0
-    return {"symbol": symbol, "price": price, "change": change, "signal": signal,
-            "confidence": confidence, "combined": combined, "obi20": f["obi_20"],
-            "obi5": f["obi_5"], "obi10": f["obi_10"], "obi50": f["obi_50"],
-            "ofi": f["taker_flow_ratio"], "ml_pred": pred, "ml_probability": prob,
-            "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,
+    return {"symbol": symbol, "price": price, "change": change, "signal": signal, "confidence": confidence, "combined": combined,
+            "obi20": f["obi_20"], "obi5": f["obi_5"], "obi10": f["obi_10"], "obi50": f["obi_50"], "ofi": f["taker_flow_ratio"],
+            "ml_pred": pred, "ml_probability": prob, "ml_status": mlstat, "ml_features": feature_count, "research_score": rscore,
             "ml_score": mlscore, "research_scores": rs, "features": f}
 
 
-
 def latest_saved_signal(symbol, tf):
-    """Return the latest saved LONG/SHORT signal for a symbol/timeframe."""
     hist = load_signal_history()
     if hist.empty:
         return None
@@ -494,14 +463,12 @@ def latest_saved_signal(symbol, tf):
         ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
         if pd.isna(ts):
             return None
-        return {"signal": str(row.get("signal")), "entry_price": num(row.get("price")),
-                "started": ts.to_pydatetime(), "confidence": num(row.get("confidence"))}
+        return {"signal": str(row.get("signal")), "entry_price": num(row.get("price")), "started": ts.to_pydatetime(), "confidence": num(row.get("confidence"))}
     except Exception:
         return None
 
 
 def live_signal_pnl(entry_price, current_price, signal):
-    """Mark-to-market P&L percentage for an active LONG/SHORT signal."""
     entry = num(entry_price)
     current = num(current_price)
     if entry <= 0 or current <= 0 or signal not in ("LONG", "SHORT"):
@@ -511,7 +478,6 @@ def live_signal_pnl(entry_price, current_price, signal):
 
 
 def auto_scan_once(threshold=0.20):
-    """Scan every tracked coin on 15M/1H/4H and auto-journal new signals."""
     rows = []
     for tf_key in AUTO_SCAN_TFS:
         for symbol_key in SYMBOLS:
@@ -527,9 +493,7 @@ def auto_scan_once(threshold=0.20):
                 signal = snap["signal"]
                 confidence = snap["confidence"]
                 started = datetime.now(timezone.utc)
-                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),
-                            snap["features"], snap.get("research_score", 0.0),
-                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
+                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"), snap["features"], snap.get("research_score", 0.0), snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
                 rec = latest_saved_signal(symbol_key, tf_key)
                 entry_price = rec["entry_price"] if rec else snap["price"]
             else:
@@ -537,15 +501,12 @@ def auto_scan_once(threshold=0.20):
                 confidence = snap["confidence"]
                 started = None
                 entry_price = 0.0
-
             pnl_pct = live_signal_pnl(entry_price, snap["price"], signal)
             validity = signal_validity_minutes(tf_key)
             remaining = 0
             if started and validity:
                 remaining = max(0, int((started + timedelta(minutes=validity) - datetime.now(timezone.utc)).total_seconds()))
-            rows.append({"symbol": symbol_key, "timeframe": tf_key, "price": snap["price"],
-                         "signal": signal, "confidence": confidence, "entry_price": entry_price,
-                         "pnl_pct": pnl_pct, "remaining_sec": remaining, "obi20": snap["obi20"]})
+            rows.append({"symbol": symbol_key, "timeframe": tf_key, "price": snap["price"], "signal": signal, "confidence": confidence, "entry_price": entry_price, "pnl_pct": pnl_pct, "remaining_sec": remaining, "obi20": snap["obi20"]})
     return rows
 
 
@@ -583,26 +544,17 @@ with c2:
 with c3:
     future = st.selectbox("FUTURE SPACE", [12, 20, 30, 45, 60], index=2, key="future", format_func=lambda x: f"{x} bars")
 with c4:
-    threshold = st.slider("SIGNAL SENSITIVITY", min_value=0.10, max_value=0.60, step=0.05,
-                          value=st.session_state.threshold, key="threshold",
-                          help="Lower = more LONG/SHORT signals (less strict). Higher = fewer, stronger-conviction signals.")
+    threshold = st.slider("SIGNAL SENSITIVITY", min_value=0.10, max_value=0.60, step=0.05, value=st.session_state.threshold, key="threshold", help="Lower = more LONG/SHORT signals (less strict). Higher = fewer, stronger-conviction signals.")
 
 visible = visible_tri_timeframes(tf)
 tri_text = " + ".join(x[0] for x in visible) if visible else "NONE"
-st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div>'
-            f'<div class="tri-chip">CHART <span>{tf}</span></div>'
-            f'<div class="tri-chip">DISPLAY <span>{tri_text}</span></div>'
-            f'<div class="tri-chip">ZOOM <span>ON</span></div>'
-            f'<div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="tri-strip"><div class="tri-chip">AUTO TRI</div><div class="tri-chip">CHART <span>{tf}</span></div><div class="tri-chip">DISPLAY <span>{tri_text}</span></div><div class="tri-chip">ZOOM <span>ON</span></div><div class="tri-chip">PAN <span>ON</span></div></div>', unsafe_allow_html=True)
 
 
-@st.fragment(run_every="2s")
+@st.fragment(run_every="5s")
 def live_engine():
     cycle_started = time.perf_counter()
 
-    # Keep the main dashboard responsive: never scan all 36 symbol/timeframe
-    # combinations in one render. One pair is scanned per 1s live cycle and
-    # the results accumulate into the automatic scanner list.
     scan_clock = time.time()
     auto_rows_map = st.session_state.get("auto_scan_rows_map", {})
     cursor = int(st.session_state.get("auto_scan_cursor", 0))
@@ -627,9 +579,7 @@ def live_engine():
                 signal = snap["signal"]
                 confidence = snap["confidence"]
                 started = datetime.now(timezone.utc)
-                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"),
-                            snap["features"], snap.get("research_score", 0.0),
-                            snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
+                save_signal(symbol_key, tf_key, snap["price"], signal, confidence, snap.get("ml_probability"), snap["features"], snap.get("research_score", 0.0), snap.get("ml_status", ""), snap.get("ml_pred"), snap.get("ml_score", 0.0))
                 rec = latest_saved_signal(symbol_key, tf_key)
                 entry_price = rec["entry_price"] if rec else snap["price"]
             else:
@@ -642,15 +592,7 @@ def live_engine():
             remaining = 0
             if started and validity:
                 remaining = max(0, int((started + timedelta(minutes=validity) - datetime.now(timezone.utc)).total_seconds()))
-            auto_rows_map[f"{symbol_key}:{tf_key}"] = {"symbol": symbol_key, "timeframe": tf_key,
-                "price": snap["price"], "signal": signal, "confidence": confidence,
-                "entry_price": entry_price, "pnl_pct": pnl_pct, "remaining_sec": remaining,
-                "obi20": snap["obi20"], "obi5": snap.get("obi5", 0.0),
-                "obi10": snap.get("obi10", 0.0), "obi50": snap.get("obi50", 0.0),
-                "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"),
-                "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"),
-                "ml_features": snap.get("ml_features", 0), "research_score": snap.get("research_score", 0.0),
-                "ml_score": snap.get("ml_score", 0.0)}
+            auto_rows_map[f"{symbol_key}:{tf_key}"] = {"symbol": symbol_key, "timeframe": tf_key, "price": snap["price"], "signal": signal, "confidence": confidence, "entry_price": entry_price, "pnl_pct": pnl_pct, "remaining_sec": remaining, "obi20": snap["obi20"], "obi5": snap.get("obi5", 0.0), "obi10": snap.get("obi10", 0.0), "obi50": snap.get("obi50", 0.0), "ofi": snap.get("ofi", 0.0), "ml_pred": snap.get("ml_pred"), "ml_probability": snap.get("ml_probability"), "ml_status": snap.get("ml_status", "—"), "ml_features": snap.get("ml_features", 0), "research_score": snap.get("research_score", 0.0), "ml_score": snap.get("ml_score", 0.0)}
             st.session_state.auto_scan_rows_map = auto_rows_map
             st.session_state.auto_scan_cursor = cursor + 1
             st.session_state.auto_scan_last = scan_clock
@@ -668,13 +610,8 @@ def live_engine():
     bids, asks, bsrc, bstat, _ = orderbook(symbol)
     f = features(df, bids, asks)
     pred, prob, mlstat, feature_count = ml_predict(f)
-
-    # 15M is intentionally more selective: ML probability and Research
-    # direction must agree before a fresh directional signal is accepted.
     strict_15m = tf == "15M"
-    raw_signal, raw_confidence, raw_combined, rs, rw, rscore, mlscore = final_state(
-        f, pred, prob, threshold, strict=strict_15m
-    )
+    raw_signal, raw_confidence, raw_combined, rs, rw, rscore, mlscore = final_state(f, pred, prob, threshold, strict=strict_15m)
 
     now = datetime.now(timezone.utc)
     signal = raw_signal
@@ -688,7 +625,6 @@ def live_engine():
         active = st.session_state.get("active_signal")
         same_key = st.session_state.get("active_signal_key") == key
         expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))
-
         if not same_key:
             recovered = recover_active_signal(symbol, tf)
             if recovered:
@@ -703,12 +639,10 @@ def live_engine():
             st.session_state.active_signal = active
             st.session_state.active_signal_started = started_at
             expired = (not started_at) or ((now - started_at) >= timedelta(minutes=validity))
-
         if expired:
             active = None
             st.session_state.active_signal = None
             st.session_state.active_signal_started = None
-
         if active in ("LONG", "SHORT") and not expired:
             signal = active
             confidence = float(st.session_state.get("active_signal_confidence") or raw_confidence)
@@ -722,9 +656,7 @@ def live_engine():
             signal = raw_signal
             confidence = raw_confidence
             combined = raw_combined
-
-        save_signal(symbol, tf, num(df.Close.iloc[-1]) if not df.empty else 0,
-                    signal, confidence, prob, f, rscore)
+        save_signal(symbol, tf, num(df.Close.iloc[-1]) if not df.empty else 0, signal, confidence, prob, f, rscore)
 
     price = num(df.Close.iloc[-1]) if not df.empty else 0
     prev = num(df.Close.iloc[-2]) if len(df) > 1 else price
@@ -738,8 +670,6 @@ def live_engine():
     live_pnl_pct = live_signal_pnl(selected_entry, price, signal) if selected_entry else 0.0
     live_pnl_text = f"{live_pnl_pct:+.2f}%" if selected_entry else "—"
 
-    # Visible countdown for the locked signal. The fragment refreshes every
-    # second, so this timer counts down live without changing the signal.
     lock_started = st.session_state.get("active_signal_started")
     lock_remaining = 0
     timer_text = "NO ACTIVE TIMER"
@@ -754,33 +684,22 @@ def live_engine():
     elif validity:
         timer_text = f"⏱ NO ACTIVE LOCK • NEXT SIGNAL WINDOW {validity} MIN"
 
-    st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div>'
-                f'<div class="signal-main {sigcolor}">{signal}</div>'
-                f'<div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} ({mlstat}) • OBI5 {f["obi_5"]:+.3f} • OBI20 {f["obi_20"]:+.3f} • OBI50 {f["obi_50"]:+.3f} • OFI {f["taker_flow_ratio"]:+.3f} • LIVE P&L {live_pnl_text} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div>'
-                f'<div class="signal-timer {timer_class}">{timer_text}</div></div>',
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="signalbox {cls}"><div class="label">MAIN AI + RESEARCH SIGNAL</div><div class="signal-main {sigcolor}">{signal}</div><div class="signal-meta">CONFIDENCE {confidence:.1f}% • ML {mltext} ({mlstat}) • OBI5 {f["obi_5"]:+.3f} • OBI20 {f["obi_20"]:+.3f} • OBI50 {f["obi_50"]:+.3f} • OFI {f["taker_flow_ratio"]:+.3f} • LIVE P&L {live_pnl_text} • RESEARCH {rscore:+.3f} • COMPOSITE {combined:+.3f}</div><div class="signal-timer {timer_class}">{timer_text}</div></div>', unsafe_allow_html=True)
 
-    cards([
-        ("PRICE", f"${price:,.2f}", f"{change:+.2f}% • {tf}", "good" if change >= 0 else "bad"),
-        ("SIGNAL", signal, f"strength {confidence:.1f}%", sigcolor),
-        ("ML", mltext, mlstat, "violet"),
-        ("OBI 20", f"{f['obi_20']:+.3f}", "top 20 depth", "good" if f['obi_20'] >= 0 else "bad"),
-        ("OBI 50", f"{f['obi_50']:+.3f}", "top 50 depth", "good" if f['obi_50'] >= 0 else "bad"),
-        ("OFI", f"{f['taker_flow_ratio']:+.3f}", "live taker flow", "good" if f['taker_flow_ratio'] >= 0 else "bad"),
-        ("LIVE P&L", live_pnl_text, "mark-to-market from signal entry", "good" if live_pnl_pct >= 0 else "bad"),
-        ("DATA", source, f"book {bsrc}", "cyan"),
-    ])
+    cards([("PRICE", f"${price:,.2f}", f"{change:+.2f}% • {tf}", "good" if change >= 0 else "bad"),
+           ("SIGNAL", signal, f"strength {confidence:.1f}%", sigcolor), ("ML", mltext, mlstat, "violet"),
+           ("OBI 20", f"{f['obi_20']:+.3f}", "top 20 depth", "good" if f['obi_20'] >= 0 else "bad"),
+           ("OBI 50", f"{f['obi_50']:+.3f}", "top 50 depth", "good" if f['obi_50'] >= 0 else "bad"),
+           ("OFI", f"{f['taker_flow_ratio']:+.3f}", "live taker flow", "good" if f['taker_flow_ratio'] >= 0 else "bad"),
+           ("LIVE P&L", live_pnl_text, "mark-to-market from signal entry", "good" if live_pnl_pct >= 0 else "bad"),
+           ("DATA", source, f"book {bsrc}", "cyan")])
 
-    # P&L summary is calculated from the closed trades journal and refreshed
-    # with the live dashboard. Winning P&L is positive, losing P&L negative.
     trade_df = read_csv(TRADE_FILE)
     pnl = trade_pnl_stats(trade_df)
-    cards([
-        ("WIN P&L", f"+{pnl['win_pnl']:.2f}%", f"{pnl['wins']} winning trades", "good"),
-        ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", f"{pnl['losses']} losing trades", "bad"),
-        ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "closed trades total", "good" if pnl['net_pnl'] >= 0 else "bad"),
-        ("CLOSED", str(pnl['wins'] + pnl['losses']), "resolved trades", "cyan"),
-    ])
+    cards([("WIN P&L", f"+{pnl['win_pnl']:.2f}%", f"{pnl['wins']} winning trades", "good"),
+           ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", f"{pnl['losses']} losing trades", "bad"),
+           ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "closed trades total", "good" if pnl['net_pnl'] >= 0 else "bad"),
+           ("CLOSED", str(pnl['wins'] + pnl['losses']), "resolved trades", "cyan")])
 
     tabs = st.tabs(["⌂ OVERVIEW", "◈ CHART", "◌ ORDER FLOW", "🧠 ML LAB", "🔬 RESEARCH LAB", "▣ SIGNALS", "⌖ SCANNER"])
 
@@ -803,43 +722,25 @@ def live_engine():
             st.markdown('</div>', unsafe_allow_html=True)
 
     with tabs[1]:
-        st.markdown(f'<div class="panel"><b>TRADINGVIEW-STYLE MARKET CHART</b>'
-                    f'<div class="section-sub">Automatic TRI only • {tf} → {tri_text} • scroll zoom • mouse pan • crosshair • future space</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(make_chart(df, symbol, tf, future), use_container_width=True,
-                         config={"scrollZoom": True, "displaylogo": False, "responsive": True,
-                                 "doubleClick": "reset", "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
-                         key="main_market_chart")
+        st.markdown(f'<div class="panel"><b>TRADINGVIEW-STYLE MARKET CHART</b><div class="section-sub">Automatic TRI only • {tf} → {tri_text} • scroll zoom • mouse pan • crosshair • future space</div>', unsafe_allow_html=True)
+        st.plotly_chart(make_chart(df, symbol, tf, future), use_container_width=True, config={"scrollZoom": True, "displaylogo": False, "responsive": True, "doubleClick": "reset", "modeBarButtonsToRemove": ["lasso2d", "select2d"]}, key="main_market_chart")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tabs[2]:
         vals = [obi(bids, asks, k) for k in (5, 10, 20, 50)]
-        cards([(f"OBI {k}", f"{v[0]:+.3f}", f"B {v[1]:,.1f} / A {v[2]:,.1f}", "good" if v[0] >= 0 else "bad")
-               for k, v in zip((5, 10, 20, 50), vals)])
+        cards([(f"OBI {k}", f"{v[0]:+.3f}", f"B {v[1]:,.1f} / A {v[2]:,.1f}", "good" if v[0] >= 0 else "bad") for k, v in zip((5, 10, 20, 50), vals)])
         l, r = st.columns(2)
         l.dataframe(pd.DataFrame(bids[:20], columns=["Bid Price", "Bid Qty"]), use_container_width=True, hide_index=True)
         r.dataframe(pd.DataFrame(asks[:20], columns=["Ask Price", "Ask Qty"]), use_container_width=True, hide_index=True)
 
     with tabs[3]:
-        cards([
-            ("MODEL", mlstat, "xgboost_obi_model.pkl", "violet"),
-            ("PREDICTION", "LONG" if pred == 1 else "SHORT" if pred == 0 else "—", f"class {pred}",
-             "good" if pred == 1 else "bad" if pred == 0 else "amber"),
-            ("PROBABILITY", mltext, "model probability", "violet"),
-            ("FEATURES", str(feature_count), "supplied to model", "cyan"),
-        ])
+        cards([("MODEL", mlstat, "xgboost_obi_model.pkl", "violet"), ("PREDICTION", "LONG" if pred == 1 else "SHORT" if pred == 0 else "—", f"class {pred}", "good" if pred == 1 else "bad" if pred == 0 else "amber"), ("PROBABILITY", mltext, "model probability", "violet"), ("FEATURES", str(feature_count), "supplied to model", "cyan")])
         st.markdown('<div class="panel"><b>LIVE MODEL INPUTS</b>', unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame({
-            "Feature": ["OBI 5", "OBI 10", "OBI 20", "OBI 50", "Spread", "Taker Flow", "Trend/SMA", "Volatility"],
-            "Value": [f["obi_5"], f["obi_10"], f["obi_20"], f["obi_50"], f["spread"], f["taker_flow_ratio"], f["sma_distance"], f["realized_volatility"]],
-        }), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame({"Feature": ["OBI 5", "OBI 10", "OBI 20", "OBI 50", "Spread", "Taker Flow", "Trend/SMA", "Volatility"], "Value": [f["obi_5"], f["obi_10"], f["obi_20"], f["obi_50"], f["spread"], f["taker_flow_ratio"], f["sma_distance"], f["realized_volatility"]]}), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tabs[4]:
-        rd = pd.DataFrame([{"Formula": k, "Live Score": round(float(v), 4), "Weight %": round(rw[k] * 100, 1),
-                             "Contribution": round(float(v * rw[k]), 4),
-                             "Direction": "BULL" if v > 0 else "BEAR" if v < 0 else "NEUTRAL"}
-                            for k, v in rs.items()]).sort_values("Contribution", ascending=False)
+        rd = pd.DataFrame([{"Formula": k, "Live Score": round(float(v), 4), "Weight %": round(rw[k] * 100, 1), "Contribution": round(float(v * rw[k]), 4), "Direction": "BULL" if v > 0 else "BEAR" if v < 0 else "NEUTRAL"} for k, v in rs.items()]).sort_values("Contribution", ascending=False)
         st.markdown('<div class="panel"><b>RESEARCH FORMULA SCOREBOARD</b>', unsafe_allow_html=True)
         st.dataframe(rd, use_container_width=True, hide_index=True)
         st.write(f"Strongest contributor: **{rd.iloc[0]['Formula'] if not rd.empty else '—'}** • Composite **{rscore:+.3f}**")
@@ -854,8 +755,7 @@ def live_engine():
         with hcol2:
             if st.button("🗑 CLEAR HISTORY", use_container_width=True, key="clear_signal_history_btn"):
                 try:
-                    if SIGNAL_FILE.exists():
-                        SIGNAL_FILE.unlink()
+                    if SIGNAL_FILE.exists(): SIGNAL_FILE.unlink()
                     st.session_state.auto_scan_rows_map = {}
                     st.session_state.auto_scan_cursor = 0
                     st.session_state.active_signal = None
@@ -867,58 +767,33 @@ def live_engine():
                 except Exception as exc:
                     st.error(f"Could not clear signal history: {exc}")
         h = read_csv(SIGNAL_FILE)
-        if not h.empty and "timeframe" in h.columns:
-            h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]
+        if not h.empty and "timeframe" in h.columns: h = h[h["timeframe"].astype(str).isin(AUTO_SCAN_TFS)]
         t = read_csv(TRADE_FILE)
         if not h.empty:
             st.dataframe(h.tail(80).iloc[::-1], use_container_width=True, hide_index=True)
             st.download_button("⬇ Download Signal Journal", h.to_csv(index=False), "zia_saved_signals.csv", "text/csv", use_container_width=True)
-        else:
-            st.info("No saved signals yet.")
+        else: st.info("No saved signals yet.")
         if not t.empty and "result" in t.columns:
-            rr = t.result.astype(str).str.upper()
-            wins = pnl["wins"]
-            losses = pnl["losses"]
+            wins, losses = pnl["wins"], pnl["losses"]
             total = wins + losses
             wr = wins / total * 100 if total else 0
-            cards([("CLOSED", str(total), "resolved trades", "cyan"), ("WINS", str(wins), "winning trades", "good"),
-                   ("LOSSES", str(losses), "losing trades", "bad"), ("WIN RATE", f"{wr:.1f}%", "closed trade rate", "violet")])
-            cards([("WIN P&L", f"+{pnl['win_pnl']:.2f}%", "sum of winning trade P&L", "good"),
-                   ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", "sum of losing trade P&L", "bad"),
-                   ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "wins + losses", "good" if pnl['net_pnl'] >= 0 else "bad")])
+            cards([("CLOSED", str(total), "resolved trades", "cyan"), ("WINS", str(wins), "winning trades", "good"), ("LOSSES", str(losses), "losing trades", "bad"), ("WIN RATE", f"{wr:.1f}%", "closed trade rate", "violet")])
+            cards([("WIN P&L", f"+{pnl['win_pnl']:.2f}%", "sum of winning trade P&L", "good"), ("LOSS P&L", f"{pnl['loss_pnl']:.2f}%", "sum of losing trade P&L", "bad"), ("NET P&L", f"{pnl['net_pnl']:+.2f}%", "wins + losses", "good" if pnl['net_pnl'] >= 0 else "bad")])
 
     with tabs[6]:
-        st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b>'
-                    '<div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • signals are saved automatically • live P&L</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="panel"><b>MULTI-MARKET SCANNER</b><div class="section-sub">Automatic all-coin scanner • ONLY 15M / 1H / 4H • signals are saved automatically • live P&L</div>', unsafe_allow_html=True)
         rows = list(auto_rows)
         rows.sort(key=lambda r: (r["signal"] not in ("LONG", "SHORT"), -r["pnl_pct"]))
         longs = sum(1 for r in rows if r["signal"] == "LONG")
         shorts = sum(1 for r in rows if r["signal"] == "SHORT")
-        cards([("LONG SIGNALS", str(longs), "active across all coins", "good"),
-               ("SHORT SIGNALS", str(shorts), "active across all coins", "bad"),
-               ("ACTIVE", str(len(rows)), "automatic signals", "cyan")])
+        cards([("LONG SIGNALS", str(longs), "active across all coins", "good"), ("SHORT SIGNALS", str(shorts), "active across all coins", "bad"), ("ACTIVE", str(len(rows)), "automatic signals", "cyan")])
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         for r in rows:
             pill_cls = "pill-long" if r["signal"] == "LONG" else "pill-short" if r["signal"] == "SHORT" else ""
             pnl_cls = "good" if r["pnl_pct"] >= 0 else "bad"
             mins, secs = divmod(max(0, int(r["remaining_sec"])), 60)
             timer = f"{mins:02d}:{secs:02d}" if mins < 60 else f"{mins // 60:02d}:{mins % 60:02d}"
-            st.markdown(
-                f'<div class="scan-row">'
-                f'<div style="width:13%;font-weight:900">{r["symbol"]}</div>'
-                f'<div style="width:9%;font-weight:900">{r["timeframe"]}</div>'
-                f'<div style="width:13%">${r["price"]:,.4f}</div>'
-                f'<div style="width:13%" class="{pnl_cls}">{r["pnl_pct"]:+.2f}% P&L</div>'
-                f'<div style="width:10%">OBI20 {r["obi20"]:+.3f}</div>'
-                f'<div style="width:10%">OBI50 {r.get("obi50", 0.0):+.3f}</div>'
-                f'<div style="width:10%">OFI {r.get("ofi", 0.0):+.3f}</div>'
-                f'<div style="width:19%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div>'
-                f'<div style="width:13%">RESEARCH {r.get("research_score", 0.0):+.3f}</div>'
-                f'<div style="width:10%">conf {r["confidence"]:.1f}%</div>'
-                f'<div style="width:9%">lock {timer}</div>'
-                f'<div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div>'
-                f'</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="scan-row"><div style="width:13%;font-weight:900">{r["symbol"]}</div><div style="width:9%;font-weight:900">{r["timeframe"]}</div><div style="width:13%">${r["price"]:,.4f}</div><div style="width:13%" class="{pnl_cls}">{r["pnl_pct"]:+.2f}% P&L</div><div style="width:10%">OBI20 {r["obi20"]:+.3f}</div><div style="width:10%">OBI50 {r.get("obi50", 0.0):+.3f}</div><div style="width:10%">OFI {r.get("ofi", 0.0):+.3f}</div><div style="width:19%">ML {((r.get("ml_probability") or 0) * 100):.1f}% • {r.get("ml_status", "—")}</div><div style="width:13%">RESEARCH {r.get("research_score", 0.0):+.3f}</div><div style="width:10%">conf {r["confidence"]:.1f}%</div><div style="width:9%">lock {timer}</div><div style="width:13%;text-align:right"><span class="pill {pill_cls}">{r["signal"]}</span></div></div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
         st.caption("Every scanner row is live: ML probability/status, OBI20/OBI50, OFI, Research score, confidence and signal lock. WAIT rows are also shown so every tracked coin/timeframe is visible.")
 
